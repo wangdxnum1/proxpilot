@@ -139,6 +139,7 @@ proxpilot watch --interval 180
 ```
 
 - **初筛与实测是两回事**：延迟探测只要收到任何 HTTP 响应就算成功（403 也算）；真实验证由本机经代理发起 HTTPS 请求（curl / schannel TLS，指纹贴近真实浏览器），两次 200 才算"能访问"。
+- **双信号判定**：`chatgpt.com` 返回 403 时会追加检查 `api.openai.com/v1/models`（纯 API 端点，无浏览器指纹人机验证）——401 = IP 正常，浏览器可访问（403 只是命令行 curl 的 TLS 指纹被 Cloudflare 拦截，判定为通过）；403 = IP 真被 OpenAI 风控（判定失败）。超时（000）直接判失败。
 - 实测用系统 `curl.exe`（Windows 10 1803+ 自带），不依赖第三方 TLS 指纹。
 - 节点来源完全是你机场订阅在内核中的实时状态，ProxPilot 不保存、不解析订阅。
 
@@ -146,6 +147,9 @@ proxpilot watch --interval 180
 
 **Q：节点测速是绿的，为什么 ChatGPT 还是打不开？**
 测速链接只证明隧道连通。ChatGPT 靠 IP 信誉拦截，机场共享 IP 常被 OpenAI/Cloudflare 风控（返回 403 或人机验证），此时测速照样绿。用 `fix` 换到实测 200 的节点即可。
+
+**Q：check 显示 403，但浏览器明明能打开？**
+那是命令行 curl 的 TLS 指纹被 Cloudflare 拦截，不代表浏览器被拦。ProxPilot 会用 `api.openai.com` 交叉验证 IP 信誉（401 = IP 正常），此时判定为"可访问（IP 检查通过）"，与你浏览器的体验一致。
 
 **Q：fix 提示"全部候选无法打开网页"？**
 说明这批 IP 整体被风控了。换个 `--group`/地区再试、过几小时重跑，或问机场哪些节点支持 AI。

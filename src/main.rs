@@ -185,12 +185,17 @@ fn cmd_check(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
                 let now = g.now.clone().unwrap_or_else(|| "未知".into());
                 ui::info(&format!("当前组「{}」→ {}", args.group, now));
             }
-            match checker::curl_avg(&be.proxy, &args.url, args.samples) {
-                Ok(t) => {
+            match checker::verify_access(&be.proxy, &args.url, args.samples) {
+                checker::Verdict::Pass(t) => {
                     ui::ok(&format!("{} 可访问（平均 {:.2}s）", args.url, t));
                     0
                 }
-                Err(c) => {
+                checker::Verdict::PassIpOnly => {
+                    ui::ok(&format!("{} 可访问（IP 检查通过）", args.url));
+                    ui::dim("说明：命令行请求被 Cloudflare 指纹拦截（HTTP 403），浏览器访问不受影响");
+                    0
+                }
+                checker::Verdict::Fail(c) => {
                     let cs = if c == 0 { "超时".to_string() } else { format!("HTTP {}", c) };
                     ui::fail(&format!(
                         "{} 不可访问（{}）—— 运行 proxpilot fix 自动优选切换",
@@ -274,9 +279,16 @@ fn cmd_fix(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
     println!();
     match checker::fix_flow(be, agent, args) {
         Ok(_) => {
-            match checker::curl_avg(&be.proxy, &args.url, 1) {
-                Ok(t) => ui::ok(&format!("最终确认：{} → HTTP 200（{:.2}s）", args.url, t)),
-                Err(c) => ui::warn(&format!("最终确认异常（HTTP {}），可重跑 proxpilot fix", c)),
+            match checker::verify_access(&be.proxy, &args.url, 1) {
+                checker::Verdict::Pass(t) => {
+                    ui::ok(&format!("最终确认：{} → HTTP 200（{:.2}s）", args.url, t))
+                }
+                checker::Verdict::PassIpOnly => {
+                    ui::ok(&format!("最终确认：{} 可访问（IP 检查通过）", args.url))
+                }
+                checker::Verdict::Fail(c) => {
+                    ui::warn(&format!("最终确认异常（HTTP {}），可重跑 proxpilot fix", c))
+                }
             }
             0
         }
@@ -295,12 +307,16 @@ fn cmd_use(be: &Backend, agent: &ureq::Agent, args: &Args, node: &str) -> i32 {
     match mihomo::switch_group(be, agent, &args.group, node) {
         Ok(()) => {
             ui::ok(&format!("已切换 {} → {}", args.group, node.green().bold()));
-            match checker::curl_avg(&be.proxy, &args.url, args.samples) {
-                Ok(t) => {
+            match checker::verify_access(&be.proxy, &args.url, args.samples) {
+                checker::Verdict::Pass(t) => {
                     ui::ok(&format!("验证通过：{} 平均 {:.2}s", args.url, t));
                     0
                 }
-                Err(c) => {
+                checker::Verdict::PassIpOnly => {
+                    ui::ok(&format!("验证通过：{} IP 检查通过（浏览器可访问）", args.url));
+                    0
+                }
+                checker::Verdict::Fail(c) => {
                     ui::warn(&format!(
                         "切换成功但 {} 未通过验证（HTTP {}）",
                         args.url, c
@@ -334,17 +350,25 @@ fn cmd_watch(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
             ui::warn("系统代理被关闭，自动重新打开");
             let _ = sysproxy::enable();
         }
-        let (code, _) = checker::curl_test(&be.proxy, &args.url);
-        let mut broken = code != 200;
+        let v1 = checker::verify_access(&be.proxy, &args.url, 1);
+        let mut broken = !v1.is_ok();
+        let mut last_code = match &v1 {
+            checker::Verdict::Fail(c) => *c,
+            _ => 200,
+        };
         if broken {
-            // 5 秒后复测一次，避免 Cloudflare 偶发误报
+            // 5 秒后复测一次，避免偶发误报
             thread::sleep(Duration::from_secs(5));
-            broken = checker::curl_test(&be.proxy, &args.url).0 != 200;
+            let v2 = checker::verify_access(&be.proxy, &args.url, 1);
+            broken = !v2.is_ok();
+            if let checker::Verdict::Fail(c) = v2 {
+                last_code = c;
+            }
         }
         let due = last_opt.elapsed().as_secs() >= args.reopt;
         if broken || due {
             let reason = if broken {
-                format!("检测到 {} 不可访问（HTTP {}）", args.url, code)
+                format!("检测到 {} 不可访问（HTTP {}）", args.url, last_code)
             } else {
                 "到达定时优选时间".to_string()
             };

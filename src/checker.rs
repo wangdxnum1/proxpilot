@@ -139,6 +139,15 @@ pub fn verify_access(proxy: &str, url: &str, samples: usize) -> Verdict {
     if is_openai_url(url) && last_code == 403 && !saw_timeout {
         spinner.set_text("chatgpt.com 返回 403，交叉验证 IP（api.openai.com）...");
         if openai_ip_status(proxy) == 401 {
+            // IP 正常，但还要确认隧道稳定（UDP 节点可能抖动：小包探测能过、
+            // 真实握手时断时续）。再测两次，任何一次断连/超时都判失败。
+            for k in 0..2 {
+                spinner.set_text(format!("IP 正常，复测隧道稳定性（{}/2）...", k + 1));
+                let (code, _) = curl_test(proxy, url);
+                if code == 0 {
+                    return Verdict::Fail(0);
+                }
+            }
             return Verdict::PassIpOnly;
         }
     }
@@ -246,7 +255,8 @@ pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String
                     "{} · 探测 {}ms · IP 检查通过（命令行指纹 403，浏览器可访问）",
                     name, d
                 ));
-                verified.push((2.0, name.clone(), true));
+                // 信任级低于真实 200：排序永远排在实测通过节点之后
+                verified.push((f64::MAX, name.clone(), true));
             }
             Verdict::Fail(code) => {
                 last_code = code;

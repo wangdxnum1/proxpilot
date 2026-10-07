@@ -307,6 +307,7 @@ fn cmd_use(be: &Backend, agent: &ureq::Agent, args: &Args, node: &str) -> i32 {
     match mihomo::switch_group(be, agent, &args.group, node) {
         Ok(()) => {
             ui::ok(&format!("已切换 {} → {}", args.group, node));
+            ui::dim("提示：客户端界面可能仍显示旧节点（它记自己的账）；如需界面同步，在界面里手动点选上面这个节点");
             match checker::verify_access(&be.proxy, &args.url, args.samples) {
                 checker::Verdict::Pass(t) => {
                     ui::ok(&format!("验证通过：{} 平均 {:.2}s", args.url, t));

@@ -1,7 +1,6 @@
 //! 节点探测、真实访问验证与优选切换。
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,8 +13,6 @@ use crate::mihomo::{self, ProxyInfo};
 use crate::ui;
 use crate::Args;
 
-const CURL: &str = r"C:\Windows\System32\curl.exe";
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 /// 机场放在节点列表里的假节点（套餐信息占位）
 const FAKE_NODES: [&str; 6] = ["剩余流量", "套餐到期", "到期", "剩余", "官网", "流量"];
 /// 组类型（不是真实节点）
@@ -53,41 +50,15 @@ pub fn core_alive(proxy: &str) -> bool {
     }
 }
 
-/// 用 curl（schannel TLS 指纹，贴近真实浏览器）经代理实测网址，返回 (HTTP 码, 耗时秒)
-pub fn curl_test(proxy: &str, url: &str) -> (u16, f64) {
-    let out = Command::new(CURL)
-        .args([
-            "-x", proxy, "-A", UA, "-s", "-o", "NUL", "-w", "%{http_code} %{time_total}",
-            "--max-time", "12", url,
-        ])
-        .output();
-    match out {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let mut it = s.trim().split_whitespace();
-            let code = it
-                .next()
-                .and_then(|v| v.parse::<u16>().ok())
-                .unwrap_or(0);
-            let t = it
-                .next()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(99.0);
-            (code, t)
-        }
-        Err(_) => (0, 99.0),
-    }
-}
-
 /// 访问判定结果
 #[derive(Debug, Clone)]
 pub enum Verdict {
     /// 全部 200，平均耗时（秒）
     Pass(f64),
     /// chatgpt.com 返回 403，但 api.openai.com IP 检查通过（401）：
-    /// 浏览器可访问，403 只是命令行 curl 的 TLS 指纹被 Cloudflare 拦截
+    /// 仅作为备选信号，不能保证浏览器通过 Cloudflare 验证
     PassIpOnly,
-    /// 不可访问（HTTP 码，0 = 超时）
+    /// 不可访问（HTTP 码，0 = 连接或传输失败）
     Fail(u16),
 }
 
@@ -101,15 +72,25 @@ fn is_openai_url(url: &str) -> bool {
     url.contains("chatgpt.com") || url.contains("openai.com")
 }
 
-/// api.openai.com 的裸 API 不做浏览器指纹验证：401 = IP 正常，403 = IP 被 OpenAI 拉黑
-fn openai_ip_status(proxy: &str) -> u16 {
-    curl_test(proxy, "https://api.openai.com/v1/models").0
+/// 未授权 API 返回 401 是备选信号，不保证网页可通过 Cloudflare 验证。
+fn openai_ip_status(probe: &crate::http::BrowserProbe) -> u16 {
+    probe
+        .test("https://api.openai.com/v1/models")
+        .map(|r| r.0)
+        .unwrap_or(0)
 }
 
 /// 访问判定：samples 次全部 200 → Pass；
 /// OpenAI 域名遇 403 时用 api.openai.com 交叉验证 IP 信誉（401 → PassIpOnly）；
 /// 否则 Fail
 pub fn verify_access(proxy: &str, url: &str, samples: usize) -> Verdict {
+    let probe = match crate::http::BrowserProbe::new(proxy) {
+        Ok(p) => p,
+        Err(e) => {
+            ui::fail(&format!("实测客户端初始化失败：{}", e));
+            return Verdict::Fail(0);
+        }
+    };
     let n = samples.max(1);
     let spinner = ui::Spinner::start(&format!("实测 {}（第 1/{} 次）", url, n));
     let mut total = 0.0;
@@ -120,7 +101,7 @@ pub fn verify_access(proxy: &str, url: &str, samples: usize) -> Verdict {
         if s > 0 {
             spinner.set_text(format!("实测 {}（第 {}/{} 次）", url, s + 1, n));
         }
-        let (code, t) = curl_test(proxy, url);
+        let (code, t) = probe.test(url).unwrap_or((0, 99.0));
         match code {
             200 => {
                 total += t;
@@ -138,12 +119,12 @@ pub fn verify_access(proxy: &str, url: &str, samples: usize) -> Verdict {
     }
     if is_openai_url(url) && last_code == 403 && !saw_timeout {
         spinner.set_text("chatgpt.com 返回 403，交叉验证 IP（api.openai.com）...");
-        if openai_ip_status(proxy) == 401 {
+        if openai_ip_status(&probe) == 401 {
             // IP 正常，但还要确认隧道稳定（UDP 节点可能抖动：小包探测能过、
             // 真实握手时断时续）。再测两次，任何一次断连/超时都判失败。
             for k in 0..2 {
                 spinner.set_text(format!("IP 正常，复测隧道稳定性（{}/2）...", k + 1));
-                let (code, _) = curl_test(proxy, url);
+                let (code, _) = probe.test(url).unwrap_or((0, 99.0));
                 if code == 0 {
                     return Verdict::Fail(0);
                 }
@@ -161,7 +142,7 @@ pub fn is_real_node(info: &ProxyInfo, name: &str) -> bool {
 /// 并发（8 路）探测节点可达性，返回 (探测延迟, 节点名) 升序
 pub fn scan_reachable(
     be: &Backend,
-    agent: &ureq::Agent,
+    agent: &reqwest::blocking::Client,
     members: &[String],
     url: &str,
 ) -> Vec<(i64, String)> {
@@ -192,7 +173,11 @@ pub fn scan_reachable(
 }
 
 /// 完整优选：探测 → 逐个切换实测 → 停在实测最快的节点。全部失败则恢复原节点。
-pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String, String> {
+pub fn fix_flow(
+    be: &Backend,
+    agent: &reqwest::blocking::Client,
+    args: &Args,
+) -> Result<String, String> {
     let proxies = mihomo::get_proxies(be, agent)?;
     let group = proxies
         .get(&args.group)
@@ -222,10 +207,7 @@ pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String
             90_000
         }
     });
-    ui::info(&format!(
-        "组内真实节点 {} 个，8 路并发探测可达性...",
-        total
-    ));
+    ui::info(&format!("组内真实节点 {} 个，8 路并发探测可达性...", total));
 
     let reachable = scan_reachable(be, agent, &members, &args.url);
     ui::info(&format!("探测完成：可达 {}/{}", reachable.len(), total));
@@ -252,7 +234,7 @@ pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String
             }
             Verdict::PassIpOnly => {
                 ui::ok(&format!(
-                    "{} · 探测 {}ms · IP 检查通过（命令行指纹 403，浏览器可访问）",
+                    "{} · 探测 {}ms · IP 检查通过（网页 HTTP 403，浏览器访问仍需确认）",
                     name, d
                 ));
                 // 信任级低于真实 200：排序永远排在实测通过节点之后
@@ -296,12 +278,19 @@ pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String
     }
     println!();
     if best_name == orig {
-        ui::ok(&format!("当前节点即最优：{}，未改动", best_name.green().bold()));
+        ui::ok(&format!(
+            "当前节点即最优：{}，未改动",
+            best_name.green().bold()
+        ));
     } else {
-        ui::ok(&format!("已切换 {} → {}", args.group, best_name.green().bold()));
+        ui::ok(&format!(
+            "已切换 {} → {}",
+            args.group,
+            best_name.green().bold()
+        ));
     }
     if best_soft {
-        ui::dim("该节点 IP 检查通过；chatgpt.com 对命令行 403 属 Cloudflare 指纹拦截，浏览器正常");
+        ui::dim("该节点 IP 检查通过，但网页仍返回 HTTP 403；浏览器访问需实际确认");
     } else {
         ui::dim(&format!("最优实测延迟 {:.2}s", best_t));
     }

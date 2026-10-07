@@ -22,7 +22,7 @@ const COMMON_PORTS: [u16; 6] = [9090, 9097, 9091, 9094, 19090, 28090];
 /// 多客户端同时在线时优先使用的客户端（暂定 CuteCloud）
 const PREFERRED: &str = "CuteCloud";
 
-pub fn detect(agent: &ureq::Agent, args: &Args) -> Result<Backend, String> {
+pub fn detect(agent: &reqwest::blocking::Client, args: &Args) -> Result<Backend, String> {
     let (api, client, source, alternatives) = if let Some(a) = &args.api {
         let a = a.trim_end_matches('/').to_string();
         let port = crate::checker::parse_addr(&a).1;
@@ -44,24 +44,24 @@ pub fn detect(agent: &ureq::Agent, args: &Args) -> Result<Backend, String> {
             spinner.set_text(format!("探测 127.0.0.1:{} ...", port));
             let base = format!("http://127.0.0.1:{}", port);
             let mut req = agent
-                .get(&format!("{}/version", base))
+                .get(format!("{}/version", base))
                 .timeout(Duration::from_secs(2));
             if let Some(s) = &args.secret {
-                req = req.set("Authorization", &format!("Bearer {}", s));
+                req = req.bearer_auth(s);
             }
-            match req.call() {
-                Ok(r) => {
-                    let body = r.into_string().unwrap_or_default();
+            match req.send() {
+                Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    let info = procinfo::identify_client(port);
+                    need_secret.push((port, info.name));
+                }
+                Ok(r) if r.status().is_success() => {
+                    let body = r.text().unwrap_or_default();
                     if body.contains("version") || body.contains("meta") {
                         let info = procinfo::identify_client(port);
                         responders.push((port, info.name));
                     }
                 }
-                Err(ureq::Error::Status(401, _)) => {
-                    let info = procinfo::identify_client(port);
-                    need_secret.push((port, info.name));
-                }
-                Err(_) => {}
+                _ => {}
             }
         }
         if responders.is_empty() {
@@ -80,7 +80,11 @@ pub fn detect(agent: &ureq::Agent, args: &Args) -> Result<Backend, String> {
         // 默认优先 CuteCloud，其余按端口顺序
         responders.sort_by_key(|(port, name)| {
             (
-                if name.eq_ignore_ascii_case(PREFERRED) { 0 } else { 1 },
+                if name.eq_ignore_ascii_case(PREFERRED) {
+                    0
+                } else {
+                    1
+                },
                 *port,
             )
         });

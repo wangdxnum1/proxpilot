@@ -1,11 +1,18 @@
 [package]
 name = "proxpilot"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
+rust-version = "1.98"
 description = "代理领航员：节点检测、智能优选、自动切换、全时守护（支持 Clash/mihomo 系客户端）"
 
 [dependencies]
-ureq = "2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "http2", "json", "gzip", "brotli", "deflate", "cookies", "socks"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+wreq = { version = "0.16", default-features = false, features = ["webpki-roots", "tokio-rt", "cookies", "gzip", "brotli", "deflate", "zstd", "socks"] }
+wreq-util = { version = "0.2", default-features = false, features = ["emulation"] }
+tokio = { version = "1", features = ["rt", "time", "net"] }
+http-body-util = "0.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_System_Console", "Win32_Networking_WinInet"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 colored = "2"

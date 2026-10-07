@@ -1,12 +1,10 @@
+use windows_sys::Win32::Networking::WinInet::{
+    InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+};
 use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE};
 use winreg::RegKey;
 
 const INET_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-
-#[link(name = "wininet")]
-extern "system" {
-    fn InternetSetOptionW(h: isize, opt: u32, buf: *mut std::os::raw::c_void, len: u32) -> i32;
-}
 
 pub fn proxy_enabled() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -19,7 +17,9 @@ pub fn proxy_enabled() -> bool {
 /// 读取注册表里记录的代理服务器地址（如 127.0.0.1:7890），不带协议前缀
 pub fn registry_proxy_server() -> Option<String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let k = hkcu.open_subkey_with_flags(INET_KEY, KEY_QUERY_VALUE).ok()?;
+    let k = hkcu
+        .open_subkey_with_flags(INET_KEY, KEY_QUERY_VALUE)
+        .ok()?;
     let v: String = k.get_value("ProxyServer").ok()?;
     let v = v.trim().to_string();
     if v.is_empty() {
@@ -38,8 +38,18 @@ pub fn enable() -> Result<(), String> {
     k.set_value("ProxyEnable", &1u32)
         .map_err(|e| format!("写入注册表失败: {}", e))?;
     unsafe {
-        InternetSetOptionW(0, 39, std::ptr::null_mut(), 0); // INTERNET_OPTION_SETTINGS_CHANGED
-        InternetSetOptionW(0, 37, std::ptr::null_mut(), 0); // INTERNET_OPTION_REFRESH
+        InternetSetOptionW(
+            std::ptr::null(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null(),
+            0,
+        );
+        InternetSetOptionW(
+            std::ptr::null(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null(),
+            0,
+        );
     }
     Ok(())
 }

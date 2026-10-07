@@ -1,6 +1,7 @@
 mod appstate;
 mod checker;
 mod detect;
+mod http;
 mod mihomo;
 mod procinfo;
 mod sysproxy;
@@ -102,7 +103,12 @@ fn parse_args() -> Args {
 }
 
 fn print_help() {
-    println!("{}", format!("ProxPilot · 代理领航员 v{}", env!("CARGO_PKG_VERSION")).cyan().bold());
+    println!(
+        "{}",
+        format!("ProxPilot · 代理领航员 v{}", env!("CARGO_PKG_VERSION"))
+            .cyan()
+            .bold()
+    );
     println!();
     println!("用法: proxpilot <命令> [选项]");
     println!();
@@ -116,7 +122,7 @@ fn print_help() {
     println!("选项:");
     println!("  --group <名称>   策略组名称（默认 AI服务）");
     println!("  --url <地址>     测试网址（默认 https://chatgpt.com/）");
-    println!("  --api <地址>     内核 API（默认自动探测 9090/9097 等常见端口）");
+    println!("  --api <地址>     内核 API（默认 http://127.0.0.1:9090；加 --detect 探测）");
     println!("  --secret <值>    内核 API 的 secret");
     println!("  --proxy <地址>   代理出口（默认读系统代理，如 http://127.0.0.1:7890）");
     println!("  --top <N>        优选时验证前 N 个候选（默认 12）");
@@ -124,7 +130,9 @@ fn print_help() {
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
     println!("  --reopt <秒>     watch 定时优选间隔（默认 7200）");
     println!("  --dry-run        只探测报告，不切换");
-    println!("  --detect         自动探测本机客户端与端口（默认不探测、直接使用 CuteCloud，速度更快）");
+    println!(
+        "  --detect         自动探测本机客户端与端口（默认不探测、直接使用 CuteCloud，速度更快）"
+    );
     println!();
     println!("客户端识别:");
     println!("  默认直接使用 CuteCloud；加 --detect 探测本机运行的 Clash/mihomo 系客户端，");
@@ -138,10 +146,11 @@ fn print_help() {
     println!("  proxpilot use \"香港 IEPL 01\"");
 }
 
-fn setup(args: &Args) -> Result<(Backend, ureq::Agent), i32> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(10))
-        .build();
+fn setup(args: &Args) -> Result<(Backend, reqwest::blocking::Client), i32> {
+    let agent = http::api_client().map_err(|e| {
+        ui::fail(&format!("HTTP 客户端初始化失败：{}", e));
+        1
+    })?;
     let be = match detect::detect(&agent, args) {
         Ok(b) => b,
         Err(e) => {
@@ -164,7 +173,7 @@ fn setup(args: &Args) -> Result<(Backend, ureq::Agent), i32> {
     Ok((be, agent))
 }
 
-fn cmd_check(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
+fn cmd_check(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
     if !checker::core_alive(&be.proxy) {
         ui::fail("内核代理端口不通，请确认客户端已启动；若使用的不是 CuteCloud，加 --detect 自动探测或用 --api 指定");
         return 1;
@@ -198,11 +207,15 @@ fn cmd_check(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
                 }
                 checker::Verdict::PassIpOnly => {
                     ui::ok(&format!("{} 可访问（IP 检查通过）", args.url));
-                    ui::dim("说明：命令行请求被 Cloudflare 指纹拦截（HTTP 403），浏览器访问不受影响");
+                    ui::dim("说明：网页返回 HTTP 403；API 检查通过，但浏览器访问仍需确认");
                     0
                 }
                 checker::Verdict::Fail(c) => {
-                    let cs = if c == 0 { "超时".to_string() } else { format!("HTTP {}", c) };
+                    let cs = if c == 0 {
+                        "连接或传输失败".to_string()
+                    } else {
+                        format!("HTTP {}", c)
+                    };
                     ui::fail(&format!(
                         "{} 不可访问（{}）—— 运行 proxpilot fix 自动优选切换",
                         args.url, cs
@@ -218,7 +231,7 @@ fn cmd_check(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
     }
 }
 
-fn cmd_scan(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
+fn cmd_scan(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
     let proxies = match mihomo::get_proxies(be, agent) {
         Ok(p) => p,
         Err(e) => {
@@ -264,7 +277,7 @@ fn cmd_scan(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
     0
 }
 
-fn cmd_fix(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
+fn cmd_fix(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
     if args.dry_run {
         ui::warn("dry-run 模式：只探测报告，不切换");
         return cmd_scan(be, agent, args);
@@ -305,7 +318,7 @@ fn cmd_fix(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
     }
 }
 
-fn cmd_use(be: &Backend, agent: &ureq::Agent, args: &Args, node: &str) -> i32 {
+fn cmd_use(be: &Backend, agent: &reqwest::blocking::Client, args: &Args, node: &str) -> i32 {
     if node.is_empty() {
         ui::fail("用法: proxpilot use <节点名>（节点名含空格请加引号）");
         return 1;
@@ -320,14 +333,14 @@ fn cmd_use(be: &Backend, agent: &ureq::Agent, args: &Args, node: &str) -> i32 {
                     0
                 }
                 checker::Verdict::PassIpOnly => {
-                    ui::ok(&format!("验证通过：{} IP 检查通过（浏览器可访问）", args.url));
+                    ui::ok(&format!(
+                        "验证通过：{} IP 检查通过（浏览器访问仍需确认）",
+                        args.url
+                    ));
                     0
                 }
                 checker::Verdict::Fail(c) => {
-                    ui::warn(&format!(
-                        "切换成功但 {} 未通过验证（HTTP {}）",
-                        args.url, c
-                    ));
+                    ui::warn(&format!("切换成功但 {} 未通过验证（HTTP {}）", args.url, c));
                     2
                 }
             }
@@ -339,7 +352,7 @@ fn cmd_use(be: &Backend, agent: &ureq::Agent, args: &Args, node: &str) -> i32 {
     }
 }
 
-fn cmd_watch(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
+fn cmd_watch(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
     ui::info(&format!(
         "守护模式：每 {} 秒检查一次，每 {} 秒重新优选，Ctrl+C 退出",
         args.interval, args.reopt
@@ -394,11 +407,7 @@ fn cmd_watch(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
 /// 控制台默认 GBK 代码页会显示乱码，切到 UTF-8（对 mintty 等无副作用）
 #[cfg(windows)]
 fn set_console_utf8() {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn SetConsoleOutputCP(cp: u32) -> i32;
-        fn SetConsoleCP(cp: u32) -> i32;
-    }
+    use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
     unsafe {
         SetConsoleOutputCP(65001);
         SetConsoleCP(65001);

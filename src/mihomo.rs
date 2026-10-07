@@ -32,23 +32,38 @@ struct ProxiesMap {
     proxies: HashMap<String, ProxyInfo>,
 }
 
-pub fn get_proxies(be: &Backend, agent: &ureq::Agent) -> Result<HashMap<String, ProxyInfo>, String> {
-    let mut req = agent.get(&format!("{}/proxies", be.api));
-    if let Some(s) = &be.secret {
-        req = req.set("Authorization", &format!("Bearer {}", s));
+fn api_response(
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<reqwest::blocking::Response, String> {
+    let response = req.send().map_err(|e| format!("API 请求失败: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("API 请求失败: HTTP {}", response.status()));
     }
-    let resp = req.call().map_err(|e| format!("API 请求失败: {}", e))?;
-    let body = resp.into_string().map_err(|e| e.to_string())?;
-    let parsed: ProxiesMap = serde_json::from_str(&body).map_err(|e| format!("JSON 解析失败: {}", e))?;
+    Ok(response)
+}
+
+pub fn get_proxies(
+    be: &Backend,
+    agent: &reqwest::blocking::Client,
+) -> Result<HashMap<String, ProxyInfo>, String> {
+    let mut req = agent.get(format!("{}/proxies", be.api));
+    if let Some(s) = &be.secret {
+        req = req.bearer_auth(s);
+    }
+    let resp = api_response(req)?;
+    let body = resp.text().map_err(|e| e.to_string())?;
+    let parsed: ProxiesMap =
+        serde_json::from_str(&body).map_err(|e| format!("JSON 解析失败: {}", e))?;
     Ok(parsed.proxies)
 }
 
-pub fn get_version(be: &Backend, agent: &ureq::Agent) -> Result<String, String> {
-    let resp = agent
-        .get(&format!("{}/version", be.api))
-        .call()
-        .map_err(|e| format!("API 请求失败: {}", e))?;
-    let body = resp.into_string().map_err(|e| e.to_string())?;
+pub fn get_version(be: &Backend, agent: &reqwest::blocking::Client) -> Result<String, String> {
+    let mut req = agent.get(format!("{}/version", be.api));
+    if let Some(s) = &be.secret {
+        req = req.bearer_auth(s);
+    }
+    let resp = api_response(req)?;
+    let body = resp.text().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     Ok(v.get("version")
         .and_then(|x| x.as_str())
@@ -57,7 +72,13 @@ pub fn get_version(be: &Backend, agent: &ureq::Agent) -> Result<String, String> 
 }
 
 /// 让内核对指定节点做一次延迟测试（任意 HTTP 响应都算成功，含 403）
-pub fn probe_delay(be: &Backend, agent: &ureq::Agent, node: &str, url: &str, timeout_ms: u32) -> Option<i64> {
+pub fn probe_delay(
+    be: &Backend,
+    agent: &reqwest::blocking::Client,
+    node: &str,
+    url: &str,
+    timeout_ms: u32,
+) -> Option<i64> {
     let u = format!(
         "{}/proxies/{}/delay?url={}&timeout={}",
         be.api,
@@ -67,10 +88,10 @@ pub fn probe_delay(be: &Backend, agent: &ureq::Agent, node: &str, url: &str, tim
     );
     let mut req = agent.get(&u);
     if let Some(s) = &be.secret {
-        req = req.set("Authorization", &format!("Bearer {}", s));
+        req = req.bearer_auth(s);
     }
-    let resp = req.call().ok()?;
-    let body = resp.into_string().ok()?;
+    let resp = api_response(req).ok()?;
+    let body = resp.text().ok()?;
     let v: Value = serde_json::from_str(&body).ok()?;
     let d = v.get("delay")?.as_i64()?;
     if d > 0 {
@@ -80,17 +101,20 @@ pub fn probe_delay(be: &Backend, agent: &ureq::Agent, node: &str, url: &str, tim
     }
 }
 
-pub fn switch_group(be: &Backend, agent: &ureq::Agent, group: &str, node: &str) -> Result<(), String> {
+pub fn switch_group(
+    be: &Backend,
+    agent: &reqwest::blocking::Client,
+    group: &str,
+    node: &str,
+) -> Result<(), String> {
     let u = format!("{}/proxies/{}", be.api, enc_path(group));
     let body = serde_json::json!({ "name": node }).to_string();
-    let mut req = agent
-        .put(&u)
-        .set("Content-Type", "application/json");
+    let mut req = agent.put(&u).header("Content-Type", "application/json");
     if let Some(s) = &be.secret {
-        req = req.set("Authorization", &format!("Bearer {}", s));
+        req = req.bearer_auth(s);
     }
-    let resp = req.send(body.as_bytes()).map_err(|e| format!("切换失败: {}", e))?;
-    let _ = resp.into_string();
+    let resp = api_response(req.body(body)).map_err(|e| format!("切换失败: {}", e))?;
+    let _ = resp.text();
     Ok(())
 }
 
@@ -116,4 +140,56 @@ fn enc_impl(s: &str, keep_slash: bool) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::{api_client, test_support::serve};
+
+    fn backend(api: String) -> Backend {
+        Backend {
+            client: "test".into(),
+            api,
+            secret: Some("test-secret".into()),
+            proxy: "http://127.0.0.1:1".into(),
+            source: "test".into(),
+            version: None,
+            alternatives: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn version_request_includes_api_authentication() {
+        let body = r#"{"version":"test-core"}"#;
+        let (url, server) = serve(vec![format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()]);
+        assert_eq!(
+            get_version(&backend(url), &api_client().unwrap()).unwrap(),
+            "test-core"
+        );
+        assert!(server.join().unwrap()[0]
+            .to_lowercase()
+            .contains("authorization: bearer test-secret"));
+    }
+
+    #[test]
+    fn rejected_switch_is_an_error() {
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        assert!(switch_group(&backend(url), &api_client().unwrap(), "AI服务", "node").is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redirected_switch_is_not_reported_as_success() {
+        let (url, server) = serve(vec![b"HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()]);
+        assert!(switch_group(&backend(url), &api_client().unwrap(), "AI服务", "node").is_err());
+        server.join().unwrap();
+    }
 }

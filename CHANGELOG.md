@@ -1,5 +1,13 @@
 # 更新日志
 
+## v0.2.2（2026-10-07）
+
+- 网站实测使用 `wreq + BoringSSL`，默认模拟 Windows Chrome 149 的 TLS、HTTP/2 和请求头指纹；遇到 Cloudflare 明确标记的 403 Challenge 时尝试 macOS Safari 26，成功后在同一次节点验证中优先使用该配置。两个配置的 Cookie 独立，每个采样整体超时 12 秒。内核 API 使用 `reqwest + rustls`。移除 curl 与 ureq，支持压缩、重定向和 Cookie，每次请求使用新连接并读取完整响应体计时。
+- 端口与进程识别改用 `windows-sys`，移除 netstat/tasklist，运行时不再启动外部程序。
+- 内核 API 明确直连，并为版本读取补齐 secret 鉴权；IP 检查提示不再保证浏览器可访问。
+- 增加本地代理、响应传输、连接隔离、TLS ClientHello GREASE/ALPN 与 Windows IPv4/IPv6 监听识别测试。
+- 构建要求 Rust 1.98+ 和 BoringSSL 构建工具（CMake、NASM、libclang）；工具仅在编译时使用。
+
 ## v0.2.1（2026-10-07）
 
 ### 新增

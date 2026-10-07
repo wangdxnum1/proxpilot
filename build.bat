@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+call build-env.bat
 
 echo [1/2] cargo build --release ...
 cargo build --release

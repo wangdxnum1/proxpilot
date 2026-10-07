@@ -17,6 +17,8 @@ ProxPilot 直接与本机运行的内核 API 通信：并发探测所有节点 �
 
 ## 编译
 
+构建需要 Rust 1.98+、MSVC C++ 工具链、CMake 3.22+、NASM 和 libclang（Visual Studio 的 LLVM 组件或独立 LLVM）。`build.bat` 会通过 `build-env.bat` 查找 libclang，也支持 `target/build-tools/nasm-2.16.03/nasm.exe` 中的便携 NASM。独立 LLVM 可通过 `LIBCLANG_PATH` 指定 DLL 所在目录。这些工具只用于构建；BoringSSL、SQLite 和 CRT 静态链接进 exe，使用者无需安装。
+
 ```
 build.bat
 ```
@@ -103,7 +105,7 @@ proxpilot watch --interval 180
 |------|--------|------|
 | `--group <名称>` | `AI服务` | 目标策略组。ChatGPT 的分流规则通常在 AI 服务组；换成 `流媒体`、`手动选择` 等可优选其他用途 |
 | `--url <地址>` | `https://chatgpt.com/` | 测试网址。优选流媒体可配 `--url https://www.youtube.com/`；只测连通性可用 `https://www.gstatic.com/generate_204` |
-| `--api <地址>` | 自动探测 | 内核 external-controller 地址，如 `http://127.0.0.1:9097`。多客户端在线时用它指定目标 |
+| `--api <地址>` | `http://127.0.0.1:9090` | 内核 external-controller 地址，如 `http://127.0.0.1:9097`。多客户端在线时用它指定目标 |
 | `--secret <值>` | 无 | 内核 API 的鉴权密钥（客户端设置了 `secret` 时必填） |
 | `--proxy <地址>` | 读注册表 | 实测流量走的代理出口，默认取系统代理注册表值（`127.0.0.1:7890`），无则用 `http://127.0.0.1:7890` |
 | `--top <N>` | `12` | `fix` 中参与真实验证的候选数量（从探测最快的开始取） |
@@ -111,13 +113,13 @@ proxpilot watch --interval 180
 | `--interval <秒>` | `300` | `watch` 的检查周期 |
 | `--reopt <秒>` | `7200` | `watch` 的定时重新优选间隔 |
 | `--dry-run` | 关 | 只探测报告、不切换不修复（`fix` 下等价于 `scan`；`check` 下不自动开系统代理） |
-| `--detect` | 关 | 自动探测本机客户端与端口（探测+进程识别约 10 秒）。默认关闭、直接使用 CuteCloud（毫秒级启动）；使用其他客户端时开启，或用 `--api` 直接指定 |
+| `--detect` | 关 | 自动探测本机客户端与端口，通过 Windows API 识别监听进程。默认关闭、直接使用 CuteCloud；使用其他客户端时开启，或用 `--api` 直接指定 |
 
 通用说明：所有涉及节点名/组名的参数都支持中文与 emoji，含空格时请加引号。
 
 ## 客户端识别
 
-启动时自动探测本机运行的 Clash/mihomo 系客户端，输出中会标明目标：
+启动时输出目标客户端；加 `--detect` 才探测本机运行的 Clash/mihomo 系客户端：
 
 ```
   目标客户端：CuteCloud
@@ -140,9 +142,11 @@ proxpilot watch --interval 180
             PUT /proxies/{组}          切换组内选中节点
 ```
 
-- **初筛与实测是两回事**：延迟探测只要收到任何 HTTP 响应就算成功（403 也算）；真实验证由本机经代理发起 HTTPS 请求（curl / schannel TLS，指纹贴近真实浏览器），两次 200 才算"能访问"。
-- **双信号判定**：`chatgpt.com` 返回 403 时会追加检查 `api.openai.com/v1/models`（纯 API 端点，无浏览器指纹人机验证）——401 = IP 正常，浏览器可访问（403 只是命令行 curl 的 TLS 指纹被 Cloudflare 拦截，判定为通过）；403 = IP 真被 OpenAI 风控（判定失败）。超时（000）直接判失败。
-- 实测用系统 `curl.exe`（Windows 10 1803+ 自带），不依赖第三方 TLS 指纹。
+- **初筛与实测是两回事**：延迟探测只要收到任何 HTTP 响应就算成功（403 也算）；真实验证使用 `wreq + BoringSSL` 经指定代理发起 HTTPS 请求，读取完整响应体并计时，两次 200 才算"能访问"。内核 API 保留 `reqwest + rustls`。
+- **浏览器指纹模拟**：`wreq-util` 默认使用 Windows Chrome 149 配置，统一生成 UA、Client Hints、TLS ClientHello 和 HTTP/2 设置。仅当收到 HTTP 403 且 `cf-mitigated: challenge` 时，尝试 macOS Safari 26 配置；候补返回 200 后，同一次节点验证的后续采样优先使用该配置。两个配置的 Cookie 独立，每个采样最多尝试两个配置，整体超时 12 秒，计时包含候补请求。支持 gzip/Brotli/deflate/zstd 解压和最多 10 次重定向。每次请求建立新连接，避免切换节点后复用旧隧道。内核 API 请求明确直连，不受系统或环境代理影响。
+- **双信号判定**：`chatgpt.com` 返回 403 时追加检查 `api.openai.com/v1/models`。401 被作为 IP 检查通过的备选信号，并复测隧道稳定性；403 或连接/传输失败判失败。仅 IP 通过的节点排在实测 200 节点之后。API 检查通过不能保证浏览器可访问，也不能证明网页 403 一定由指纹造成。
+- **模拟范围**：可模拟 Chrome 的网络协议特征，但不会执行 JavaScript 或人机验证，不能保证消除 Cloudflare 403。网站实测验证 HTTPS 证书，使用内置 WebPKI 根证书；内核 API 的 rustls 使用系统证书验证。网站实测不会自动信任企业自行添加的根证书。
+- **运行时依赖**：不调用 `curl.exe`、`netstat`、`tasklist` 或其他外部命令。HTTP/TLS、端口/进程识别、注册表和选择记录操作由 Rust 库完成；Windows API 与系统证书库仍由操作系统提供，代理内核仍需运行。SQLite 与 CRT 静态链接进 exe。构建需要 Rust/Cargo 与 MSVC 工具链；发版脚本还使用 Git 和 GitHub CLI（gh），这些不属于用户运行 exe 的依赖。
 - 节点来源完全是你机场订阅在内核中的实时状态，ProxPilot 不保存、不解析订阅。
 
 ## FAQ
@@ -151,7 +155,7 @@ proxpilot watch --interval 180
 测速链接只证明隧道连通。ChatGPT 靠 IP 信誉拦截，机场共享 IP 常被 OpenAI/Cloudflare 风控（返回 403 或人机验证），此时测速照样绿。用 `fix` 换到实测 200 的节点即可。
 
 **Q：check 显示 403，但浏览器明明能打开？**
-那是命令行 curl 的 TLS 指纹被 Cloudflare 拦截，不代表浏览器被拦。ProxPilot 会用 `api.openai.com` 交叉验证 IP 信誉（401 = IP 正常），此时判定为"可访问（IP 检查通过）"，与你浏览器的体验一致。
+HTTP 客户端和浏览器的 TLS 指纹、Cookie、JavaScript 执行能力不同，403 可能来自 Cloudflare 验证。ProxPilot 会用 `api.openai.com` 交叉检查，401 作为 IP 检查通过的备选信号，但浏览器访问仍需实际确认。
 
 **Q：fix 提示"全部候选无法打开网页"？**
 说明这批 IP 整体被风控了。换个 `--group`/地区再试、过几小时重跑，或问机场哪些节点支持 AI。
@@ -177,7 +181,9 @@ proxpilot/
     ├── detect.rs        客户端/后端自动探测
     ├── procinfo.rs      进程识别（端口 → PID → 客户端名）
     ├── mihomo.rs        Clash/mihomo API 客户端
+    ├── http.rs          reqwest 内核客户端与 wreq 浏览器指纹实测
     ├── checker.rs       节点探测、实测验证、优选切换
+    ├── appstate.rs      同步 CuteCloud 选择记录
     ├── sysproxy.rs      系统代理（注册表 + WinINET）
     └── ui.rs            彩色输出
 ```

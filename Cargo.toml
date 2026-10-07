@@ -1,6 +1,6 @@
 [package]
 name = "proxpilot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "代理领航员：节点检测、智能优选、自动切换、全时守护（支持 Clash/mihomo 系客户端）"
 

@@ -98,7 +98,7 @@ fn parse_args() -> Args {
 }
 
 fn print_help() {
-    println!("{}", "ProxPilot · 代理领航员 v0.1".cyan().bold());
+    println!("{}", format!("ProxPilot · 代理领航员 v{}", env!("CARGO_PKG_VERSION")).cyan().bold());
     println!();
     println!("用法: proxpilot <命令> [选项]");
     println!();

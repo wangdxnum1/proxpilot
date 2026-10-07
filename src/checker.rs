@@ -283,6 +283,7 @@ pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String
     let (best_t, best_name, best_soft) = verified[0].clone();
     // 验证过程把组切到了最后一个候选，最终停在最优节点上
     mihomo::switch_group(be, agent, &args.group, &best_name)?;
+    crate::appstate::sync_selection(&args.group, &best_name);
 
     println!();
     ui::info("实测通过的节点（按实测延迟排序）：");
@@ -298,7 +299,6 @@ pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String
         ui::ok(&format!("当前节点即最优：{}，未改动", best_name.green().bold()));
     } else {
         ui::ok(&format!("已切换 {} → {}", args.group, best_name.green().bold()));
-        ui::dim("提示：客户端界面可能仍显示旧节点（它记自己的账）；如需界面同步，在界面里手动点选上面这个节点");
     }
     if best_soft {
         ui::dim("该节点 IP 检查通过；chatgpt.com 对命令行 403 属 Cloudflare 指纹拦截，浏览器正常");

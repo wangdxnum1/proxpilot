@@ -1,4 +1,4 @@
-# ProxPilot · 代理辅助工具
+# ProxPilot · 代理领航员
 
 > 节点检测 · 优选切换 · 守护运行
 > 支持 Clash / mihomo 系客户端（CuteCloud、FlClash、Clash Verge、Clash for Windows 等）

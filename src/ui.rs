@@ -75,8 +75,8 @@ impl Drop for Spinner {
 }
 
 pub fn banner() {
-    println!("{}", "ProxPilot · 代理辅助工具 v0.1".cyan().bold());
-    println!("{}", "节点检测 · 优选切换 · 守护运行（Clash/mihomo 系）".dimmed());
+    println!("{}", "ProxPilot · 代理领航员 v0.1".cyan().bold());
+    println!("{}", "节点检测 · 智能优选 · 自动切换 · 全时守护（Clash/mihomo 系）".dimmed());
     println!();
 }
 

@@ -1,0 +1,17 @@
+[package]
+name = "proxpilot"
+version = "0.1.0"
+edition = "2021"
+description = "代理辅助工具：节点检测、优选切换、守护运行（支持 Clash/mihomo 系客户端）"
+
+[dependencies]
+ureq = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+colored = "2"
+winreg = "0.52"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

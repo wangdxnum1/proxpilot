@@ -238,14 +238,13 @@ pub fn fix_flow(be: &Backend, agent: &ureq::Agent, args: &Args) -> Result<String
         }
         match verify_access(&be.proxy, &args.url, args.samples) {
             Verdict::Pass(t) => {
-                ui::ok(&format!("{} · 探测 {}ms · 实测平均 {:.2}s", name.green(), d, t));
+                ui::ok(&format!("{} · 探测 {}ms · 实测平均 {:.2}s", name, d, t));
                 verified.push((t, name.clone(), false));
             }
             Verdict::PassIpOnly => {
                 ui::ok(&format!(
                     "{} · 探测 {}ms · IP 检查通过（命令行指纹 403，浏览器可访问）",
-                    name.green(),
-                    d
+                    name, d
                 ));
                 verified.push((2.0, name.clone(), true));
             }

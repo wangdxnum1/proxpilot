@@ -81,15 +81,15 @@ pub fn banner() {
 }
 
 pub fn ok(msg: &str) {
-    println!("  {} {}", "✔".green().bold(), msg);
+    println!("  {}", format!("✔ {}", msg).green());
 }
 
 pub fn fail(msg: &str) {
-    println!("  {} {}", "✘".red().bold(), msg);
+    println!("  {}", format!("✘ {}", msg).red());
 }
 
 pub fn warn(msg: &str) {
-    println!("  {} {}", "▲".yellow().bold(), msg);
+    println!("  {}", format!("▲ {}", msg).yellow());
 }
 
 pub fn info(msg: &str) {

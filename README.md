@@ -111,6 +111,7 @@ proxpilot watch --interval 180
 | `--interval <秒>` | `300` | `watch` 的检查周期 |
 | `--reopt <秒>` | `7200` | `watch` 的定时重新优选间隔 |
 | `--dry-run` | 关 | 只探测报告、不切换不修复（`fix` 下等价于 `scan`；`check` 下不自动开系统代理） |
+| `--detect` | 关 | 自动探测本机客户端与端口（探测+进程识别约 10 秒）。默认关闭、直接使用 CuteCloud（毫秒级启动）；使用其他客户端时开启，或用 `--api` 直接指定 |
 
 通用说明：所有涉及节点名/组名的参数都支持中文与 emoji，含空格时请加引号。
 
@@ -123,6 +124,7 @@ proxpilot watch --interval 180
   内核 API：http://127.0.0.1:9090（自动探测）
 ```
 
+- **默认不探测**，直接使用 CuteCloud（API 9090 / 代理 7890），启动毫秒级；加 `--detect` 才执行完整探测；
 - 探测端口：`9090`、`9097`、`9091`、`9094`、`19090`、`28090`；
 - 通过端口的监听进程路径识别客户端（CuteCloud / FlClash / Clash Verge / Clash for Windows / mihomo）；
 - **多个客户端同时在线时默认优先 CuteCloud**，其余在输出中列出，用 `--api` 可指定其他实例；

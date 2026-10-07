@@ -28,6 +28,14 @@ pub fn detect(agent: &ureq::Agent, args: &Args) -> Result<Backend, String> {
         let port = crate::checker::parse_addr(&a).1;
         let info = procinfo::identify_client(port);
         (a, info.name, "--api 参数".to_string(), Vec::new())
+    } else if !args.detect {
+        // 快速路径：不做任何探测，直接使用 CuteCloud 的默认地址
+        (
+            "http://127.0.0.1:9090".to_string(),
+            "CuteCloud".to_string(),
+            "默认".to_string(),
+            Vec::new(),
+        )
     } else {
         let spinner = crate::ui::Spinner::start("探测本机运行的客户端...");
         let mut responders: Vec<(u16, String)> = Vec::new();

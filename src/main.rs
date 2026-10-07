@@ -26,6 +26,7 @@ pub struct Args {
     pub dry_run: bool,
     pub interval: u64,
     pub reopt: u64,
+    pub detect: bool,
 }
 
 pub enum Cmd {
@@ -51,6 +52,7 @@ fn parse_args() -> Args {
     let mut dry_run = false;
     let mut interval = 300u64;
     let mut reopt = 7200u64;
+    let mut detect = false;
 
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -64,6 +66,7 @@ fn parse_args() -> Args {
             "--interval" => interval = it.next().and_then(|v| v.parse().ok()).unwrap_or(interval),
             "--reopt" => reopt = it.next().and_then(|v| v.parse().ok()).unwrap_or(reopt),
             "--dry-run" => dry_run = true,
+            "--detect" => detect = true,
             "-h" | "--help" => cmd = Cmd::Help,
             "check" | "scan" | "fix" | "watch" | "use" | "help" => {
                 if !got_pos {
@@ -94,6 +97,7 @@ fn parse_args() -> Args {
         dry_run,
         interval,
         reopt,
+        detect,
     }
 }
 
@@ -120,10 +124,11 @@ fn print_help() {
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
     println!("  --reopt <秒>     watch 定时优选间隔（默认 7200）");
     println!("  --dry-run        只探测报告，不切换");
+    println!("  --detect         自动探测本机客户端与端口（默认不探测、直接使用 CuteCloud，速度更快）");
     println!();
     println!("客户端识别:");
-    println!("  自动探测本机运行的 Clash/mihomo 系客户端并显示名称，");
-    println!("  多个同时在线时默认优先 CuteCloud，用 --api 可指定其他实例。");
+    println!("  默认直接使用 CuteCloud；加 --detect 探测本机运行的 Clash/mihomo 系客户端，");
+    println!("  多个同时在线时优先 CuteCloud，用 --api 可指定其他实例。");
     println!();
     println!("示例:");
     println!("  proxpilot check");
@@ -161,7 +166,7 @@ fn setup(args: &Args) -> Result<(Backend, ureq::Agent), i32> {
 
 fn cmd_check(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
     if !checker::core_alive(&be.proxy) {
-        ui::fail("内核代理端口不通，请确认客户端已启动");
+        ui::fail("内核代理端口不通，请确认客户端已启动；若使用的不是 CuteCloud，加 --detect 自动探测或用 --api 指定");
         return 1;
     }
     ui::ok("内核运行中，代理端口可用");
@@ -265,7 +270,7 @@ fn cmd_fix(be: &Backend, agent: &ureq::Agent, args: &Args) -> i32 {
         return cmd_scan(be, agent, args);
     }
     if !checker::core_alive(&be.proxy) {
-        ui::fail("内核代理端口不通，请确认客户端已启动");
+        ui::fail("内核代理端口不通，请确认客户端已启动；若使用的不是 CuteCloud，加 --detect 自动探测或用 --api 指定");
         return 1;
     }
     if sysproxy::proxy_enabled() {

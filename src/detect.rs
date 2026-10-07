@@ -29,9 +29,11 @@ pub fn detect(agent: &ureq::Agent, args: &Args) -> Result<Backend, String> {
         let info = procinfo::identify_client(port);
         (a, info.name, "--api 参数".to_string(), Vec::new())
     } else {
+        let spinner = crate::ui::Spinner::start("探测本机运行的客户端...");
         let mut responders: Vec<(u16, String)> = Vec::new();
         let mut need_secret: Vec<(u16, String)> = Vec::new();
         for port in COMMON_PORTS {
+            spinner.set_text(format!("探测 127.0.0.1:{} ...", port));
             let base = format!("http://127.0.0.1:{}", port);
             let mut req = agent
                 .get(&format!("{}/version", base))

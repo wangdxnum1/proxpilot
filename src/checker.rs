@@ -2,7 +2,8 @@
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -80,8 +81,12 @@ pub fn curl_test(proxy: &str, url: &str) -> (u16, f64) {
 
 /// 连续 samples 次全部 200 才算通过，返回平均耗时
 pub fn curl_avg(proxy: &str, url: &str, samples: usize) -> Result<f64, u16> {
+    let spinner = ui::Spinner::start(&format!("实测 {}（第 1/{} 次）", url, samples));
     let mut total = 0.0;
-    for _ in 0..samples {
+    for s in 0..samples {
+        if s > 0 {
+            spinner.set_text(format!("实测 {}（第 {}/{} 次）", url, s + 1, samples));
+        }
         let (code, t) = curl_test(proxy, url);
         if code != 200 {
             return Err(code);
@@ -102,19 +107,27 @@ pub fn scan_reachable(
     members: &[String],
     url: &str,
 ) -> Vec<(i64, String)> {
+    let total = members.len();
+    let done = Arc::new(AtomicUsize::new(0));
+    let spinner = ui::Spinner::start(&format!("并发探测 {} 个节点...", total));
     let reachable: Mutex<Vec<(i64, String)>> = Mutex::new(Vec::new());
     thread::scope(|s| {
         for chunk in members.chunks(8) {
             let reachable = &reachable;
+            let done = &done;
+            let spinner = &spinner;
             s.spawn(move || {
                 for name in chunk {
                     if let Some(d) = mihomo::probe_delay(be, agent, name, url, 4000) {
                         reachable.lock().unwrap().push((d, name.clone()));
                     }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    spinner.set_text(format!("并发探测节点... 已测 {}/{}", n, total));
                 }
             });
         }
     });
+    drop(spinner);
     let mut v = reachable.into_inner().unwrap();
     v.sort();
     v

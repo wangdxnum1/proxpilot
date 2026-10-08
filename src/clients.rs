@@ -355,6 +355,103 @@ pub fn proxy_matches(proxy: &str, registry: &str) -> bool {
                 .all(|v| normalized(v).as_ref() == Some(&target))
     })
 }
+fn active_proxy_owner(registry: &str) -> Option<String> {
+    let mut owners = std::collections::HashSet::new();
+    for entry in registry.split(';') {
+        let address = if registry.contains('=') {
+            let (protocol, address) = entry.split_once('=')?;
+            if !matches!(
+                protocol.trim().to_ascii_lowercase().as_str(),
+                "http" | "https"
+            ) {
+                continue;
+            }
+            address.trim()
+        } else {
+            entry.trim()
+        };
+        let value = if address.contains("://") {
+            address.to_string()
+        } else {
+            format!("http://{address}")
+        };
+        let url = reqwest::Url::parse(&value).ok()?;
+        let host = url.host_str()?.trim_matches(['[', ']']);
+        if host != "localhost"
+            && !host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        {
+            return None;
+        }
+        let pid = crate::procinfo::find_listener_pid_at(host, url.port_or_known_default()?);
+        let owner = crate::procinfo::identify_pid(pid).name;
+        if owner == "未知客户端" {
+            return None;
+        }
+        owners.insert(owner);
+    }
+    if owners.len() == 1 {
+        owners.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn cutecloud_managed_profile(paths: &DiscoveryPaths) -> Option<bool> {
+    let prefs: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(paths.cutecloud.join("shared_preferences.json")).ok()?,
+    )
+    .ok()?;
+    let cfg: serde_json::Value =
+        serde_json::from_str(prefs.get("flutter.config")?.as_str()?).ok()?;
+    let profile = cfg.get("currentProfileId")?.as_i64()?;
+    let db = rusqlite::Connection::open_with_flags(
+        paths.cutecloud.join("database.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    db.query_row(
+        "SELECT managed FROM profiles WHERE id = ?1",
+        [profile],
+        |row| row.get::<_, bool>(0),
+    )
+    .ok()
+}
+
+fn cutecloud_control_guidance(managed: Option<bool>) -> String {
+    let reason = match managed {
+        Some(true) => "\n  当前使用托管订阅，该模式会隐藏外部控制器并关闭控制 API。请在 CuteCloud 的“配置”页切换到普通（非托管）订阅。",
+        Some(false) => "\n  当前使用普通（非托管）配置，请检查外部控制器是否已开启。",
+        None => "\n  请检查 CuteCloud 当前配置：托管订阅模式可能隐藏外部控制器并关闭控制 API；如果没有开关，切换到普通（非托管）订阅后再检查。",
+    };
+    format!("{reason}\n  在普通配置下，打开“设置 → 基本配置 → 外部控制器”（默认端口 9090）；必要时重新启动内核。\n  运行 proxpilot.exe clients 确认可用，再运行 proxpilot.exe scan；扫描的是当前普通配置的节点。\n  如果改为扫描 Clash Verge，可运行 proxpilot.exe --client clash-verge scan（扫描的是 Clash Verge 节点）。")
+}
+
+fn unavailable_proxy_message(owner: Option<&str>) -> String {
+    let mut message = match owner {
+        Some(owner) => format!("系统代理当前由 {owner} 提供，但没有匹配的可用控制接口。"),
+        None => "系统代理已开启，但没有匹配的可用控制接口，且无法确认所属客户端。".into(),
+    };
+    match owner {
+        Some("CuteCloud") => {
+            let managed = DiscoveryPaths::current().ok().and_then(|paths| cutecloud_managed_profile(&paths));
+            message.push_str(&cutecloud_control_guidance(managed));
+        },
+        Some("FlClash") => message.push_str(
+            "\n  请打开客户端设置，找到“外部控制器（External controller）”并开启（通常在基本配置中，默认端口 9090）。\n  如果已开启仍不可用，请重新启动内核或客户端，让控制接口设置生效；不要只开启系统代理。\n  然后运行 proxpilot.exe clients 确认可用，再运行 proxpilot.exe scan。"
+        ),
+        Some("Clash Verge") => message.push_str(
+            "\n  请在 Clash Verge 设置中检查外部控制/API 配置，启用本机 HTTP 控制接口或命名管道，并重新启动内核。\n  然后运行 proxpilot.exe clients 确认可用，再运行 proxpilot.exe scan。"
+        ),
+        _ => message.push_str(
+            "\n  请在当前代理客户端中开启本机外部控制/API 接口，并重新启动内核；运行 proxpilot.exe clients 查看发现结果。"
+        ),
+    }
+    message.push_str("\n  如需选择其他客户端，用 --client 显式指定；已知控制地址时也可用 --api / --secret 指定接口。程序不会自动切换到其他客户端。");
+    message
+}
+
 pub fn select_auto(records: &[DiscoveryRecord], active: Option<&str>) -> Result<Backend, String> {
     let available: Vec<&Backend> = records.iter().filter_map(|r| r.backend.as_ref()).collect();
     if let Some(active) = active {
@@ -365,6 +462,13 @@ pub fn select_auto(records: &[DiscoveryRecord], active: Option<&str>) -> Result<
         if matched.len() == 1 {
             return Ok((*matched[0]).clone());
         }
+        return if matched.is_empty() {
+            Err(unavailable_proxy_message(
+                active_proxy_owner(active).as_deref(),
+            ))
+        } else {
+            Err("系统代理匹配多个可用内核，无法唯一选择；请用 clients 查看详情，或用 --client / --api 显式指定目标".into())
+        };
     }
     match available.as_slice() {
         [be] => Ok((*be).clone()),
@@ -448,7 +552,9 @@ pub fn resolve_backend(
         ClientSelection::Auto => {
             let records = discover_with_secret(api, paths, args.secret.as_deref());
             let active = if crate::sysproxy::proxy_enabled() {
-                crate::sysproxy::registry_proxy_server()
+                Some(crate::sysproxy::registry_proxy_server().ok_or(
+                    "系统代理已开启，但无法读取代理服务器地址；请检查系统代理设置，或用 --client / --api 显式指定目标",
+                )?)
             } else {
                 None
             };
@@ -632,6 +738,93 @@ mod tests {
             record(ClientKind::VvCloud, 7891),
         ];
         assert!(select_auto(&records, None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_does_not_fall_back_when_active_proxy_has_no_available_controller() {
+        let records = [
+            DiscoveryRecord {
+                name: "CuteCloud".into(),
+                backend: None,
+                error: Some("运行配置没有启用控制接口".into()),
+            },
+            record(ClientKind::ClashVerge, 7897),
+        ];
+        let error = select_auto(&records, Some("127.0.0.1:7890"))
+            .err()
+            .expect("must not scan Clash Verge while the system proxy points to CuteCloud");
+        assert!(error.contains("系统代理"));
+        assert!(error.contains("控制接口"));
+        assert!(error.contains("clients"));
+        assert!(error.contains("--client"));
+        assert_eq!(
+            select_auto(&records, None).unwrap().kind,
+            Some(ClientKind::ClashVerge)
+        );
+        assert_eq!(
+            select_explicit(&records, ClientKind::ClashVerge)
+                .unwrap()
+                .kind,
+            Some(ClientKind::ClashVerge)
+        );
+    }
+
+    #[test]
+    fn auto_requires_one_match_when_system_proxy_is_active() {
+        let records = [
+            record(ClientKind::CuteCloud, 7890),
+            record(ClientKind::ClashVerge, 7890),
+        ];
+        assert!(select_auto(&records, Some("127.0.0.1:7890")).is_err());
+        assert!(select_auto(&records, Some("127.0.0.1:8888")).is_err());
+        assert!(select_auto(&[], Some("127.0.0.1:7890")).is_err());
+    }
+
+    #[test]
+    fn unavailable_proxy_names_owner_and_explains_how_to_enable_control() {
+        let message = unavailable_proxy_message(Some("CuteCloud"));
+        assert!(message.contains("CuteCloud"));
+        assert!(message.contains("普通"));
+        assert!(message.contains("外部控制器"));
+        assert!(message.contains("--client clash-verge scan"));
+        assert!(message.contains("proxpilot.exe scan"));
+        let unknown = unavailable_proxy_message(None);
+        assert!(unknown.contains("无法确认"));
+        assert!(!unknown.contains("CuteCloud"));
+        assert!(unavailable_proxy_message(Some("Clash Verge")).contains("Clash Verge"));
+    }
+
+    #[test]
+    fn cutecloud_managed_profile_gets_specific_control_guidance() {
+        let root = std::env::temp_dir().join(format!(
+            "proxpilot-managed-controller-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = DiscoveryPaths {
+            cutecloud: root.clone(),
+            clash_verge: root.join("verge"),
+            vvcloud: root.join("vv"),
+        };
+        let cfg = serde_json::json!({"flutter.config": "{\"currentProfileId\":42}"});
+        std::fs::write(root.join("shared_preferences.json"), cfg.to_string()).unwrap();
+        let db = rusqlite::Connection::open(root.join("database.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE profiles(id INTEGER PRIMARY KEY, managed INTEGER); INSERT INTO profiles VALUES(42,1);").unwrap();
+        assert_eq!(cutecloud_managed_profile(&paths), Some(true));
+        let message = cutecloud_control_guidance(Some(true));
+        assert!(message.contains("托管订阅"));
+        assert!(message.contains("普通"));
+        assert!(message.contains("外部控制器"));
+        assert!(message.contains("Clash Verge"));
+        db.execute("UPDATE profiles SET managed=0 WHERE id=42", [])
+            .unwrap();
+        assert_eq!(cutecloud_managed_profile(&paths), Some(false));
+        assert!(!cutecloud_control_guidance(Some(false)).contains("当前使用托管订阅"));
+        drop(db);
+        std::fs::remove_file(root.join("database.sqlite")).unwrap();
+        assert_eq!(cutecloud_managed_profile(&paths), None);
+        assert!(!root.join("database.sqlite").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

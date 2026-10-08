@@ -187,7 +187,7 @@ fn cmd_clients(supported: bool) -> Result<(), String> {
         println!("cutecloud    CuteCloud    HTTP API；支持选择记忆同步");
         println!("clash-verge  Clash Verge  命名管道 / HTTP API；仅同步当前内核选择");
         println!("vvcloud     VVCloud      HTTP API；支持选择记忆同步");
-        println!("auto         自动选择    优先匹配已开启的系统代理，否则要求唯一可用内核");
+        println!("auto         自动选择    系统代理开启时要求唯一匹配；关闭时要求唯一可用内核");
         return Ok(());
     }
     let api = core_api::CoreApi::new()?;
@@ -321,7 +321,7 @@ fn print_help() {
     println!("  --reopt <秒>     --optimize 的定时优选间隔（默认 7200）");
     println!("  --dry-run        只探测报告，不切换");
     println!("  --detect         自动探测（兼容 --client auto）");
-    println!("默认：未配置时使用 cutecloud；auto 优先匹配系统代理，多个可用内核时要求明确指定。");
+    println!("默认：未配置时使用 auto；系统代理开启时要求唯一匹配，关闭时要求唯一可用内核。");
     println!();
     println!("示例:");
     println!("  proxpilot check");
@@ -647,14 +647,14 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         .collect();
     println!();
     ui::info(&format!(
-        "一倍率可达节点：{} 个（按延迟排序，完整列出）",
+        "1倍率可达节点：{} 个（按延迟排序，完整列出）",
         economical.len()
     ));
     for (delay, name) in economical {
         print_scan_row(*delay, name, group.now.as_deref());
     }
     println!(
-        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称标注一倍率；{} = 当前选中节点",
+        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称标注1倍率；{} = 当前选中节点",
         "[低延迟]".cyan().bold(),
         "[1倍率·省流量]".green().bold(),
         "[当前]".yellow()

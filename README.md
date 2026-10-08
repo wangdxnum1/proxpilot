@@ -17,7 +17,9 @@ ProxPilot 直接与本机运行的内核 API 通信：并发探测所有节点 �
 
 ## 编译
 
-构建需要 Rust 1.98+、MSVC C++ 工具链、CMake 3.22+、NASM 和 libclang（Visual Studio 的 LLVM 组件或独立 LLVM）。`build.bat` 会通过 `build-env.bat` 查找 libclang，也支持 `target/build-tools/nasm-2.16.03/nasm.exe` 中的便携 NASM。独立 LLVM 可通过 `LIBCLANG_PATH` 指定 DLL 所在目录。这些工具只用于构建；BoringSSL、SQLite 和 CRT 静态链接进 exe，使用者无需安装。
+Windows x64 构建只需要 **Rust 1.98+ 和兼容的 MSVC C++ 工具链（含 Windows SDK）**，不需要安装 CMake、NASM、LLVM 或 libclang。项目内置匹配 `btls-sys 0.5.6` 的 BoringSSL 静态库与预生成 Rust 绑定，普通 `cargo build` 和 `cargo test` 会自动使用它们。预编译库由 MSVC 14.51（Visual Studio 2026）生成，目前验证该工具集；更旧的 MSVC 尚未验证，需使用兼容的链接器和运行库。依赖包随源码直接入库，不使用 Git LFS，也不需额外下载脚本。
+
+本地适配及依赖包来源见 [vendor/btls-sys/README.md](vendor/btls-sys/README.md)。浏览器指纹实测能力保留；BoringSSL、SQLite 和 CRT 静态链接进 exe，使用者无需安装。
 
 ```
 build.bat
@@ -25,7 +27,7 @@ build.bat
 
 脚本会执行 `cargo build --release`，并把产物拷贝到 **`bin\proxpilot.exe`**（兼容自定义 target triple 的产物路径）。 exe 为静态链接 CRT 的单文件，拷到任何 Windows 10/11 机器可直接运行，无需 VC++ 运行库。
 
-手动编译：`cargo build --release`（项目级 `.cargo/config.toml` 已配置 crt-static）。
+手动编译：`cargo build --release --locked`（项目级 `.cargo/config.toml` 已配置 crt-static）。
 
 ## 快速开始
 

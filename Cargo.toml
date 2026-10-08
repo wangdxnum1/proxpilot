@@ -6,6 +6,8 @@ rust-version = "1.98"
 description = "代理优选助手：节点检测、智能优选、自动切换、全时守护（支持 Clash/mihomo 系客户端）"
 
 [dependencies]
+# Pin the ABI of the bundled native libraries and pregenerated bindings.
+btls-sys = "=0.5.6"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "http2", "json", "gzip", "brotli", "deflate", "cookies", "socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 wreq = { version = "0.16", default-features = false, features = ["webpki-roots", "tokio-rt", "cookies", "gzip", "brotli", "deflate", "zstd", "socks"] }
@@ -27,3 +29,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 strip = true
 lto = true
 codegen-units = 1
+
+[patch.crates-io]
+btls-sys = { path = "vendor/btls-sys" }

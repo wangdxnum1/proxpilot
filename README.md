@@ -62,6 +62,8 @@ proxpilot config unset default-client
 
 Clash Verge 的节点切换作用于当前内核；不修改由 GUI 缓存管理的 `profiles.yaml`，重启后的持久化由 Clash Verge 管理。CuteCloud 和 VVCloud 会按客户端隔离，同步已记录该策略组的 SQLite 选择记忆；客户端重启后的行为仍由其自身管理。`watch` 固定启动时选定的客户端，并在每个周期重新读取该客户端运行配置，以适应重启后命名管道变化。
 
+`scan` 独立显示扫描开始时的当前选择及本轮探测状态，不受前 30 条排行截断影响；探测未成功和未参与筛选后的探测会分别说明。
+
 `clients`、`scan`、`config show` 及 `check --dry-run` 不改变系统代理或当前节点。`use/fix/watch --dry-run` 也不切换节点。
 
 ## 子命令详解

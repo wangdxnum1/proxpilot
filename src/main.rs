@@ -607,6 +607,7 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
     nodeinfo::report_candidates(&selected, args.max_rate);
     let members = selected.names;
     if members.is_empty() {
+        ui::info(&scan_current_status(group.now.as_deref(), &members, &[]));
         ui::fail("没有符合条件的真实节点，请检查倍率限制或策略组");
         return 1;
     }
@@ -618,6 +619,11 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
     ));
     let reachable = checker::scan_reachable(be, agent, &members, &args.url);
     println!();
+    ui::info(&scan_current_status(
+        group.now.as_deref(),
+        &members,
+        &reachable,
+    ));
     if reachable.is_empty() {
         ui::fail("没有任何节点可达");
         return 2;
@@ -626,6 +632,11 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         "可达 {}/{}（注意：任何 HTTP 响应都算可达，IP 被风控的 403 也包含）",
         reachable.len(),
         members.len()
+    ));
+    ui::info(&format!(
+        "可达排行：显示前 {} / {} 个（按延迟排序）",
+        reachable.len().min(30),
+        reachable.len()
     ));
     for (d, n) in reachable.iter().take(30) {
         print_scan_row(*d, n, group.now.as_deref());
@@ -650,6 +661,53 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
     );
     ui::dim("提示：可达 ≠ 能打开网页，IP 是否被风控要用 proxpilot fix 实测验证");
     0
+}
+
+fn scan_current_status(
+    current: Option<&str>,
+    members: &[String],
+    reachable: &[(i64, String)],
+) -> String {
+    let Some(name) = current else {
+        return "[当前] 内核未提供当前选择".into();
+    };
+    let status = if let Some((rank, (delay, _))) =
+        reachable.iter().enumerate().find(|(_, (_, n))| n == name)
+    {
+        format!("{}ms · 可达排名 {}/{}", delay, rank + 1, reachable.len())
+    } else if members.iter().any(|n| n == name) {
+        "本轮探测未成功（超时或请求失败，不等于客户端一定不可用）".into()
+    } else {
+        "未参与本轮探测（不在筛选后的真实节点候选中）".into()
+    };
+    format!("[当前] {} · {}（扫描开始时的选择）", name, status)
+}
+
+#[cfg(test)]
+mod scan_current_tests {
+    use super::*;
+    #[test]
+    fn current_node_outside_top_thirty_is_still_visible() {
+        let mut reachable: Vec<_> = (0..30).map(|i| (i + 1, format!("node-{}", i))).collect();
+        reachable.push((900, "selected-3倍率".into()));
+        let members: Vec<_> = reachable.iter().map(|(_, n)| n.clone()).collect();
+        let text = scan_current_status(Some("selected-3倍率"), &members, &reachable);
+        assert!(text.contains("selected-3倍率"));
+        assert!(text.contains("900ms"));
+        assert!(text.contains("31/31"));
+    }
+    #[test]
+    fn failed_and_filtered_current_nodes_have_distinct_statuses() {
+        let members = vec!["selected-3倍率".into()];
+        let failed = scan_current_status(Some("selected-3倍率"), &members, &[]);
+        assert!(failed.contains("selected-3倍率"));
+        assert!(failed.contains("探测未成功"));
+        let filtered = scan_current_status(Some("selected-3倍率"), &[], &[]);
+        assert!(filtered.contains("selected-3倍率"));
+        assert!(filtered.contains("未参与"));
+        assert!(!filtered.contains("探测未成功"));
+        assert!(scan_current_status(None, &[], &[]).contains("未提供"));
+    }
 }
 
 fn is_one_rate(name: &str) -> bool {

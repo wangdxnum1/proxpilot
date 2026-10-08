@@ -18,6 +18,8 @@ pub struct ProxyInfo {
     pub all: Option<Vec<String>>,
     #[serde(default)]
     pub history: Vec<DelayRecord>,
+    #[serde(default)]
+    pub udp: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -220,4 +222,106 @@ pub fn missing_group(proxies: &HashMap<String, ProxyInfo>, name: &str) -> String
         name,
         groups.join("、")
     )
+}
+
+/// 从实时组引用图选择唯一顶层业务组；GLOBAL 是合成总览，不参与业务组引用。
+pub fn resolve_group(
+    proxies: &HashMap<String, ProxyInfo>,
+    explicit: &str,
+) -> Result<String, String> {
+    if !explicit.is_empty() {
+        return if proxies.get(explicit).is_some_and(|p| p.all.is_some()) {
+            Ok(explicit.into())
+        } else {
+            Err(missing_group(proxies, explicit))
+        };
+    }
+    let mut groups: Vec<&str> = proxies
+        .iter()
+        .filter(|(name, p)| name.as_str() != "GLOBAL" && p.all.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if groups.is_empty() {
+        return if proxies.get("GLOBAL").is_some_and(|p| p.all.is_some()) {
+            Ok("GLOBAL".into())
+        } else {
+            Err("目标客户端没有可用策略组，请检查运行配置".into())
+        };
+    }
+    groups.sort();
+    let referenced: std::collections::HashSet<&str> = groups
+        .iter()
+        .flat_map(|name| {
+            proxies[*name]
+                .all
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+        })
+        .collect();
+    let roots: Vec<&str> = groups
+        .iter()
+        .copied()
+        .filter(|name| !referenced.contains(name))
+        .collect();
+    match roots.as_slice() {
+        [name] => Ok((*name).into()),
+        _ => Err(format!(
+            "无法唯一确定目标策略组；可用组：{}。请用 --group 显式指定",
+            groups.join("、")
+        )),
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    fn groups(value: serde_json::Value) -> HashMap<String, ProxyInfo> {
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn unique_business_root_ignores_global_and_nested_groups() {
+        let proxies = groups(serde_json::json!({
+            "GLOBAL":{"type":"Selector","all":["VVCloud","自动选择","故障转移"]},
+            "VVCloud":{"type":"Selector","all":["自动选择","故障转移","日本 🛰"]},
+            "自动选择":{"type":"URLTest","all":["日本 🛰"]},
+            "故障转移":{"type":"Fallback","all":["日本 🛰"]},
+            "日本 🛰":{"type":"SS"}
+        }));
+        assert_eq!(resolve_group(&proxies, "").unwrap(), "VVCloud");
+        assert_eq!(resolve_group(&proxies, "自动选择").unwrap(), "自动选择");
+        assert!(resolve_group(&proxies, "日本 🛰").is_err());
+        assert!(resolve_group(&proxies, "AI服务").is_err());
+    }
+    #[test]
+    fn multiple_roots_or_cycles_require_explicit_choice() {
+        let mut proxies =
+            groups(serde_json::json!({"AI服务":{"all":["node"]},"流媒体":{"all":["node"]}}));
+        let error = resolve_group(&proxies, "").unwrap_err();
+        assert!(error.contains("AI服务") && error.contains("流媒体"));
+        assert_eq!(resolve_group(&proxies, "AI服务").unwrap(), "AI服务");
+        proxies = groups(serde_json::json!({"A":{"all":["B"]},"B":{"all":["A"]}}));
+        assert!(resolve_group(&proxies, "").is_err());
+    }
+    #[test]
+    fn no_groups_and_global_only_are_handled() {
+        assert!(resolve_group(&HashMap::new(), "").is_err());
+        assert_eq!(
+            resolve_group(
+                &groups(serde_json::json!({"GLOBAL":{"all":["DIRECT"]}})),
+                ""
+            )
+            .unwrap(),
+            "GLOBAL"
+        );
+    }
+    #[test]
+    fn topology_is_recomputed_after_runtime_changes() {
+        let first = groups(serde_json::json!({"Old":{"all":["node"]}}));
+        let second = groups(serde_json::json!({"New":{"all":["node"]}}));
+        assert_eq!(resolve_group(&first, "").unwrap(), "Old");
+        assert_eq!(resolve_group(&second, "").unwrap(), "New");
+        assert!(resolve_group(&second, "Old").is_err());
+    }
 }

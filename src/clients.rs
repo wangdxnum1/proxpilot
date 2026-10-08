@@ -18,7 +18,7 @@ impl DiscoveryPaths {
             clash_verge: base.join("io.github.clash-verge-rev.clash-verge-rev"),
         })
     }
-    fn runtime(&self, kind: ClientKind) -> PathBuf {
+    pub(crate) fn runtime(&self, kind: ClientKind) -> PathBuf {
         match kind {
             ClientKind::CuteCloud => self.cutecloud.join("config.yaml"),
             ClientKind::ClashVerge => {

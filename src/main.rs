@@ -6,6 +6,7 @@ mod core_api;
 mod detect;
 mod http;
 mod mihomo;
+mod nodeinfo;
 mod procinfo;
 mod sysproxy;
 mod ui;
@@ -18,6 +19,7 @@ use colored::Colorize;
 
 use detect::Backend;
 
+#[derive(Clone)]
 pub struct Args {
     pub client: Option<client_config::ClientSelection>,
     pub cmd: Cmd,
@@ -25,6 +27,7 @@ pub struct Args {
     pub secret: Option<String>,
     pub proxy: Option<String>,
     pub group: String,
+    pub max_rate: Option<f64>,
     pub url: String,
     pub top: usize,
     pub samples: usize,
@@ -35,6 +38,7 @@ pub struct Args {
     pub detect: bool,
 }
 
+#[derive(Clone)]
 pub enum Cmd {
     Check,
     Scan,
@@ -44,8 +48,11 @@ pub enum Cmd {
     Help,
     Clients(bool),
     Config(ConfigCommand),
+    Nodes,
+    Info(String),
 }
 
+#[derive(Clone)]
 pub enum ConfigCommand {
     Show,
     Set(client_config::ClientSelection),
@@ -61,7 +68,8 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         api: None,
         secret: None,
         proxy: None,
-        group: "AI服务".into(),
+        group: String::new(),
+        max_rate: None,
         url: "https://chatgpt.com/".into(),
         top: 12,
         samples: 2,
@@ -86,7 +94,21 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             "--api" => args.api = Some(value(&mut it, &arg)?),
             "--secret" => args.secret = Some(value(&mut it, &arg)?),
             "--proxy" => args.proxy = Some(value(&mut it, &arg)?),
-            "--group" => args.group = value(&mut it, &arg)?,
+            "--group" => {
+                args.group = value(&mut it, &arg)?;
+                if args.group.trim().is_empty() {
+                    return Err("--group 名称不能为空".into());
+                }
+            }
+            "--max-rate" => {
+                let limit: f64 = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--max-rate 必须为正数")?;
+                if !limit.is_finite() || limit <= 0.0 {
+                    return Err("--max-rate 必须为有限正数".into());
+                }
+                args.max_rate = Some(limit);
+            }
             "--url" => args.url = value(&mut it, &arg)?,
             "--top" => {
                 args.top = value(&mut it, &arg)?
@@ -116,9 +138,14 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 args.cmd = Cmd::Help;
                 return Ok(args);
             }
-            "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" if !command => {
+            "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" | "nodes"
+            | "info"
+                if !command =>
+            {
                 command = true;
                 args.cmd = match arg.as_str() {
+                    "nodes" => Cmd::Nodes,
+                    "info" => Cmd::Info(value(&mut it, "info")?),
                     "check" => Cmd::Check,
                     "scan" => Cmd::Scan,
                     "fix" => Cmd::Fix,
@@ -234,6 +261,22 @@ mod cli_tests {
         assert!(parse(&["check", "--client"]).is_err());
         assert!(parse(&["watch", "--interval", "0"]).is_err());
         assert!(parse(&["check", "--typo"]).is_err());
+        assert!(matches!(
+            parse(&["nodes", "--max-rate", "1"]).unwrap().cmd,
+            Cmd::Nodes
+        ));
+        assert!(matches!(
+            parse(&["info", "日本 🛰"]).unwrap().cmd,
+            Cmd::Info(_)
+        ));
+        assert_eq!(
+            parse(&["watch", "--max-rate", "0.5"]).unwrap().max_rate,
+            Some(0.5)
+        );
+        for value in ["0", "-1", "NaN", "inf", "invalid"] {
+            assert!(parse(&["scan", "--max-rate", value]).is_err());
+        }
+        assert!(parse(&["scan", "--max-rate"]).is_err());
         assert_eq!(
             parse(&["--client", "auto", "check"]).unwrap().client,
             Some(client_config::ClientSelection::Auto)
@@ -254,6 +297,8 @@ fn print_help() {
     println!("命令:");
     println!("  clients [--supported]  查看发现的客户端 / 支持的类型");
     println!("  config show | set default-client <类型> | unset default-client");
+    println!("  nodes          列出组内真实节点的协议、倍率和名称标签（不测速）");
+    println!("  info <节点>    查看节点配置详情及信息来源（不显示凭据）");
     println!("  check          体检：内核 / 系统代理 / 当前节点能否访问测试网址");
     println!("  scan           探测组内所有节点的可达性（不切换）");
     println!("  fix            优选：探测 → 真实验证 → 切到实测最快的节点");
@@ -261,12 +306,13 @@ fn print_help() {
     println!("  watch          守护模式：保持可用节点，坏了自动修；加 --optimize 主动优选");
     println!();
     println!("选项:");
-    println!("  --group <名称>   策略组名称（默认 AI服务）");
+    println!("  --group <名称>   策略组名称（未指定时从目标客户端实时识别）");
     println!("  --url <地址>     测试网址（默认 https://chatgpt.com/）");
     println!("  --client <类型>  cutecloud / clash-verge / auto；覆盖保存的默认客户端");
     println!("  --api <地址>     显式指定 HTTP 内核 API（优先级最高）");
     println!("  --secret <值>    内核 API 的 secret");
     println!("  --proxy <地址>   代理出口（默认读目标内核运行端口）");
+    println!("  --max-rate <N>  倍率上限；未知倍率排除，scan/fix/watch/nodes/use 生效");
     println!("  --top <N>        优选时验证前 N 个候选（默认 12）");
     println!("  --samples <N>    每个节点实测次数（默认 2，全部 200 才通过）");
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
@@ -310,6 +356,169 @@ fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
     ui::info(&format!("代理出口：{}", be.proxy));
     println!();
     Ok((be, agent))
+}
+
+fn runtime_group_args(be: &Backend, api: &core_api::CoreApi, args: &Args) -> Result<Args, String> {
+    let proxies = mihomo::get_proxies(be, api)?;
+    group_args_from_proxies(&proxies, args)
+}
+fn group_args_from_proxies(
+    proxies: &std::collections::HashMap<String, mihomo::ProxyInfo>,
+    args: &Args,
+) -> Result<Args, String> {
+    let mut resolved = args.clone();
+    resolved.group = mihomo::resolve_group(proxies, &args.group)?;
+    if args.group.is_empty() {
+        ui::info(&format!("实时识别策略组：{}", resolved.group));
+    }
+    Ok(resolved)
+}
+
+fn cmd_nodes(be: &Backend, api: &core_api::CoreApi, args: &Args) -> i32 {
+    let proxies = match mihomo::get_proxies(be, api) {
+        Ok(p) => p,
+        Err(e) => {
+            ui::fail(&e);
+            return 1;
+        }
+    };
+    let group = match proxies.get(&args.group) {
+        Some(p) => p,
+        None => {
+            ui::fail(&mihomo::missing_group(&proxies, &args.group));
+            return 1;
+        }
+    };
+    let selected = nodeinfo::candidates(
+        &proxies,
+        &group.all.clone().unwrap_or_default(),
+        args.max_rate,
+    );
+    nodeinfo::report_candidates(&selected, args.max_rate);
+    ui::info(&format!(
+        "组「{}」真实节点 {} 个（不测速）",
+        args.group,
+        selected.names.len()
+    ));
+    for name in &selected.names {
+        let info = &proxies[name];
+        println!(
+            "  {}  [{}]  {}  {}{}",
+            name,
+            info.ptype,
+            nodeinfo::rate_label(name),
+            nodeinfo::name_labels(name).join(" / "),
+            if group.now.as_deref() == Some(name) {
+                " [当前]"
+            } else {
+                ""
+            }
+        );
+    }
+    ui::dim("协议来自内核；倍率、专线、家宽和用途标签来自名称，未实测验证。");
+    if selected.names.is_empty() {
+        1
+    } else {
+        0
+    }
+}
+fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i32 {
+    let proxies = match mihomo::get_proxies(be, api) {
+        Ok(p) => p,
+        Err(e) => {
+            ui::fail(&e);
+            return 1;
+        }
+    };
+    let Some(live) = proxies.get(name).filter(|p| checker::is_real_node(p, name)) else {
+        ui::fail("未找到此真实节点；用 nodes 查看名称（含空格请加引号）");
+        return 1;
+    };
+    if !args.group.is_empty()
+        && !proxies
+            .get(&args.group)
+            .and_then(|p| p.all.as_ref())
+            .is_some_and(|members| members.iter().any(|n| n == name))
+    {
+        ui::fail("节点不属于指定策略组");
+        return 1;
+    }
+    let metadata = nodeinfo::load_metadata(be);
+    let record = metadata.nodes.get(name);
+    let config = record.map(|(config, _)| config);
+    ui::info(&format!("节点：{}", name));
+    println!("  协议：{}（内核 API）", live.ptype);
+    println!(
+        "  配置协议：{}",
+        config.and_then(|c| c.protocol.as_deref()).unwrap_or("未知")
+    );
+    println!(
+        "  入口服务器：{}",
+        config.and_then(|c| c.server.as_deref()).unwrap_or("未知")
+    );
+    println!(
+        "  入口端口：{}",
+        config
+            .and_then(|c| c.port)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "未知".into())
+    );
+    println!(
+        "  传输方式：{}",
+        config
+            .and_then(|c| c.network.as_deref())
+            .unwrap_or("未知/未显式配置")
+    );
+    println!("  TLS：{}", nodeinfo::bool_text(config.and_then(|c| c.tls)));
+    println!(
+        "  UDP 配置：{}",
+        nodeinfo::bool_text(config.and_then(|c| c.udp))
+    );
+    println!("  UDP 内核能力：{}", nodeinfo::bool_text(live.udp));
+    println!(
+        "  加密算法：{}",
+        config
+            .and_then(|c| c.cipher.as_deref())
+            .unwrap_or("未知/未显式配置")
+    );
+    println!(
+        "  TLS 服务名：{}",
+        config
+            .and_then(|c| c.sni.as_deref())
+            .unwrap_or("未知/未显式配置")
+    );
+    println!(
+        "  配置来源：{}",
+        record
+            .map(|(_, source)| source.as_str())
+            .unwrap_or("没有可关联的本机节点配置")
+    );
+    println!("  倍率：{}", nodeinfo::rate_label(name));
+    println!(
+        "  名称标签：{}（未验证）",
+        nodeinfo::name_labels(name).join(" / ")
+    );
+    let mut groups: Vec<_> = proxies
+        .iter()
+        .filter(|(_, p)| {
+            p.all
+                .as_ref()
+                .is_some_and(|members| members.iter().any(|n| n == name))
+        })
+        .map(|(n, _)| n.as_str())
+        .collect();
+    groups.sort();
+    println!("  所属策略组：{}（内核 API）", groups.join("、"));
+    if !nodeinfo::permitted(name, args.max_rate) {
+        ui::warn("此节点不符合指定倍率上限；详情命令仅展示，不切换");
+    }
+    for notice in metadata.notices {
+        ui::dim(&notice);
+    }
+    ui::dim(
+        "入口地址不等于最终出口 IP；本命令不测速、不切换，不显示密码、UUID、secret 或订阅 URL。",
+    );
+    0
 }
 
 fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
@@ -389,13 +598,16 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
             return 1;
         }
     };
-    let mut members: Vec<String> = Vec::new();
-    for name in group.all.clone().unwrap_or_default() {
-        if let Some(info) = proxies.get(&name) {
-            if checker::is_real_node(info, &name) {
-                members.push(name);
-            }
-        }
+    let selected = nodeinfo::candidates(
+        &proxies,
+        &group.all.clone().unwrap_or_default(),
+        args.max_rate,
+    );
+    nodeinfo::report_candidates(&selected, args.max_rate);
+    let members = selected.names;
+    if members.is_empty() {
+        ui::fail("没有符合条件的真实节点，请检查倍率限制或策略组");
+        return 1;
     }
     ui::info(&format!(
         "组「{}」共 {} 个真实节点，{} 路并发探测...",
@@ -414,34 +626,85 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         reachable.len(),
         members.len()
     ));
-    const LOW_LATENCY_MS: i64 = 200;
     for (d, n) in reachable.iter().take(30) {
-        let low_latency = *d <= LOW_LATENCY_MS;
-        let row = format!(
-            "      ✔ {:>5}ms  {}{}",
-            d,
-            n,
-            if low_latency { "  [低延迟]" } else { "" }
-        );
-        let row = if low_latency {
-            row.cyan().bold()
-        } else {
-            row.normal()
-        };
-        if group.now.as_deref() == Some(n.as_str()) {
-            println!("{}  {}", row, "[当前]".yellow());
-        } else {
-            println!("{}", row);
-        }
+        print_scan_row(*d, n, group.now.as_deref());
+    }
+    let economical: Vec<_> = reachable
+        .iter()
+        .filter(|(_, name)| is_one_rate(name))
+        .collect();
+    println!();
+    ui::info(&format!(
+        "一倍率可达节点：{} 个（按延迟排序，完整列出）",
+        economical.len()
+    ));
+    for (delay, name) in economical {
+        print_scan_row(*delay, name, group.now.as_deref());
     }
     println!(
-        "  标识：{} = 探测延迟 ≤ {}ms；{} = 当前选中节点",
+        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称标注一倍率；{} = 当前选中节点",
         "[低延迟]".cyan().bold(),
-        LOW_LATENCY_MS,
+        "[1倍率·省流量]".green().bold(),
         "[当前]".yellow()
     );
     ui::dim("提示：可达 ≠ 能打开网页，IP 是否被风控要用 proxpilot fix 实测验证");
     0
+}
+
+fn is_one_rate(name: &str) -> bool {
+    nodeinfo::rate_from_name(name) == Some(1.0)
+}
+
+fn print_scan_row(delay: i64, name: &str, current: Option<&str>) {
+    let row = format!(
+        "      ✔ {:>5}ms  {}{}",
+        delay,
+        name,
+        if delay <= 200 { "  [低延迟]" } else { "" }
+    );
+    let row = if delay <= 200 {
+        row.cyan().bold()
+    } else {
+        row.normal()
+    };
+    let economical = if is_one_rate(name) {
+        format!("  {}", "[1倍率·省流量]".green().bold())
+    } else {
+        String::new()
+    };
+    let selected = if current == Some(name) {
+        format!("  {}", "[当前]".yellow())
+    } else {
+        String::new()
+    };
+    println!("{}{}{}", row, economical, selected);
+}
+
+#[cfg(test)]
+mod rate_tests {
+    #[test]
+    fn recognizes_one_rate_without_numeric_suffix_false_positives() {
+        for name in [
+            "D越南1-家宽住宅IP-1倍率",
+            "D美国2-网页-视频浏览-1倍率",
+            "日本-1.0倍率",
+            "香港-一倍率",
+            "台湾-1 倍率",
+        ] {
+            assert!(super::is_one_rate(name), "{}", name);
+        }
+        for name in [
+            "日本-3倍率",
+            "美国-11倍率",
+            "香港-0.1倍率",
+            "台湾-1.5倍率",
+            "新加坡-十一倍率",
+            "日本1",
+            "续费网址:https://getvv.cloud",
+        ] {
+            assert!(!super::is_one_rate(name), "{}", name);
+        }
+    }
 }
 
 fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
@@ -488,6 +751,28 @@ fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
 fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &str) -> i32 {
     if node.is_empty() {
         ui::fail("用法: proxpilot use <节点名>（节点名含空格请加引号）");
+        return 1;
+    }
+    let proxies = match mihomo::get_proxies(be, agent) {
+        Ok(p) => p,
+        Err(e) => {
+            ui::fail(&e);
+            return 1;
+        }
+    };
+    if !proxies
+        .get(&args.group)
+        .and_then(|p| p.all.as_ref())
+        .is_some_and(|members| members.iter().any(|n| n == node))
+        || !proxies
+            .get(node)
+            .is_some_and(|p| checker::is_real_node(p, node))
+    {
+        ui::fail("指定节点不是该策略组中的真实节点");
+        return 1;
+    }
+    if !nodeinfo::permitted(node, args.max_rate) {
+        ui::fail("指定节点超过倍率上限或倍率未知；未切换");
         return 1;
     }
     if args.dry_run {
@@ -578,7 +863,13 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
         ));
     }
     if args.dry_run {
-        return cmd_scan(initial, agent, args);
+        return match runtime_group_args(initial, agent, args) {
+            Ok(resolved) => cmd_scan(initial, agent, &resolved),
+            Err(e) => {
+                ui::fail(&e);
+                1
+            }
+        };
     }
     let mut current = initial.clone();
     let mut last_opt: Option<Instant> = None;
@@ -594,10 +885,31 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             }
         }
         let be = &current;
+        let proxies = match mihomo::get_proxies(be, agent) {
+            Ok(proxies) => proxies,
+            Err(e) => {
+                ui::warn(&format!("读取实时策略组失败，等待重试：{}", e));
+                thread::sleep(Duration::from_secs(args.interval));
+                continue;
+            }
+        };
+        let cycle_args = match group_args_from_proxies(&proxies, args) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                ui::fail(&e);
+                return 1;
+            }
+        };
+        let args = &cycle_args;
         if !checker::core_alive(&be.proxy) {
             ui::warn("内核未运行，等待中...");
             thread::sleep(Duration::from_secs(args.interval));
             continue;
+        }
+        if let Some(current_node) = proxies.get(&args.group).and_then(|p| p.now.as_deref()) {
+            if !nodeinfo::permitted(current_node, args.max_rate) {
+                ui::warn("当前选择不符合倍率上限；默认保持可用节点，下次故障修复或主动优选只使用合规候选");
+            }
         }
         if !sysproxy::matches(&be.proxy) {
             ui::warn("系统代理被关闭或指向其他客户端，自动重新打开");
@@ -679,7 +991,17 @@ fn main() {
         Ok(x) => x,
         Err(c) => exit(c),
     };
+    let args = if matches!(args.cmd, Cmd::Watch | Cmd::Info(_)) {
+        args
+    } else {
+        runtime_group_args(&be, &agent, &args).unwrap_or_else(|e| {
+            ui::fail(&e);
+            exit(1)
+        })
+    };
     let code = match &args.cmd {
+        Cmd::Nodes => cmd_nodes(&be, &agent, &args),
+        Cmd::Info(name) => cmd_info(&be, &agent, &args, name),
         Cmd::Check => cmd_check(&be, &agent, &args),
         Cmd::Scan => cmd_scan(&be, &agent, &args),
         Cmd::Fix => cmd_fix(&be, &agent, &args),

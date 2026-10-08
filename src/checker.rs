@@ -14,7 +14,20 @@ use crate::ui;
 use crate::Args;
 
 /// 机场放在节点列表里的假节点（套餐信息占位）
-const FAKE_NODES: [&str; 6] = ["剩余流量", "套餐到期", "到期", "剩余", "官网", "流量"];
+const FAKE_NODES: [&str; 12] = [
+    "剩余流量",
+    "套餐到期",
+    "到期",
+    "剩余",
+    "官网",
+    "流量",
+    "续费",
+    "订阅地址",
+    "订阅网址",
+    "更新订阅",
+    "http://",
+    "https://",
+];
 /// 组类型（不是真实节点）
 const SKIP_TYPES: [&str; 7] = [
     "Selector",
@@ -143,7 +156,9 @@ pub fn verify_access(proxy: &str, url: &str, samples: usize) -> Verdict {
 }
 
 pub fn is_real_node(info: &ProxyInfo, name: &str) -> bool {
-    !SKIP_TYPES.contains(&info.ptype.as_str()) && !FAKE_NODES.iter().any(|f| name.contains(f))
+    info.all.is_none()
+        && !SKIP_TYPES.contains(&info.ptype.as_str())
+        && !FAKE_NODES.iter().any(|f| name.contains(f))
 }
 
 /// 可用逻辑 CPU 数量的两倍，线程数不超过待测节点数。
@@ -213,13 +228,15 @@ pub fn fix_flow(
     let orig = group.now.clone().unwrap_or_else(|| "未知".into());
     ui::info(&format!("当前组「{}」→ {}", args.group, orig));
 
-    let mut members: Vec<String> = Vec::new();
-    for name in group.all.clone().unwrap_or_default() {
-        if let Some(info) = proxies.get(&name) {
-            if is_real_node(info, &name) {
-                members.push(name);
-            }
-        }
+    let selected = crate::nodeinfo::candidates(
+        &proxies,
+        &group.all.clone().unwrap_or_default(),
+        args.max_rate,
+    );
+    crate::nodeinfo::report_candidates(&selected, args.max_rate);
+    let mut members = selected.names;
+    if members.is_empty() {
+        return Err("没有符合条件的真实节点；未进行节点切换，请检查倍率限制或策略组".into());
     }
     let total = members.len();
     // 按最近一次测速延迟排序，快的先测
@@ -412,5 +429,56 @@ mod tests {
                 );
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod rate_policy_tests {
+    use super::*;
+    use crate::http::test_support::{accept, listener, read_request};
+    use std::io::Write;
+    #[test]
+    fn no_compliant_candidates_never_probe_or_switch() {
+        let listener = listener();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut stream = accept(&listener);
+            let request = read_request(&mut stream);
+            let body=serde_json::json!({"proxies":{"test":{"type":"Selector","now":"expensive-3倍率","all":["expensive-3倍率","unknown","✅续费网址:https://example.com"]},"expensive-3倍率":{"type":"SS"},"unknown":{"type":"SS"},"✅续费网址:https://example.com":{"type":"SS"}}}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            drop(stream);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                listener.accept().is_err(),
+                "unexpected probe or switch after no eligible candidates"
+            );
+            request
+        });
+        let be = Backend {
+            kind: None,
+            client: "mock".into(),
+            api: url.into(),
+            secret: None,
+            proxy: "http://127.0.0.1:1".into(),
+            source: "test".into(),
+            version: None,
+            alternatives: vec![],
+        };
+        let args = crate::parse_args_from(
+            ["fix", "--group", "test", "--max-rate", "1"].map(str::to_string),
+        )
+        .unwrap();
+        assert!(
+            fix_flow(&be, &crate::core_api::CoreApi::new().unwrap(), &args)
+                .unwrap_err()
+                .contains("未进行节点切换")
+        );
+        assert!(server.join().unwrap().starts_with("GET /proxies "));
     }
 }

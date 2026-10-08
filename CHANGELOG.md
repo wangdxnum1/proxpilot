@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- 新增 --max-rate 共享倍率限制，scan/fix/watch/nodes/use 排除超限与未知倍率候选。
+- 新增 nodes/info 只读节点协议、配置详情及信息来源，隐藏凭据。
+- 节点筛选排除续费网址、订阅地址等占位条目。
+
+- scan 为名称标注一倍率的节点增加绿色省流量标签，并单独完整列出一倍率可达节点。
+
+- 取消固定的 AI服务 默认组；未传 --group 时从实时策略组引用图识别唯一顶层组，歧义时要求显式指定，watch 每轮重新获取。
+
 - 新增 Clash Verge 命名管道及 HTTP API 适配，支持运行配置 secret 和实际代理端口。
 - 新增 `--client cutecloud|clash-verge|auto`、`clients [--supported]` 与 `config show/set/unset default-client`。
 - 自动选择匹配已启用的系统代理，多实例不明确时提示显式选择；watch 固定客户端并刷新运行配置。

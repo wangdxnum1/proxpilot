@@ -22,52 +22,112 @@ fn db_path() -> Option<PathBuf> {
 }
 
 /// 把指定组在客户端记忆里的选中节点同步为 node（best-effort，失败不影响切换本身）
-pub fn sync_selection(group: &str, node: &str) {
+pub fn sync_selection(be: &crate::Backend, group: &str, node: &str) {
+    if be.kind != Some(crate::client_config::ClientKind::CuteCloud) {
+        if be.kind == Some(crate::client_config::ClientKind::ClashVerge) {
+            ui::dim(
+                "Clash Verge：当前内核选择已更新；重启后的持久化由客户端管理，不写 profiles.yaml",
+            );
+        }
+        return;
+    }
     let Some(path) = db_path() else {
         return; // 非 CuteCloud 客户端或未安装，静默跳过
     };
-    let res = (|| -> Result<(), String> {
-        let con = Connection::open(&path).map_err(|e| e.to_string())?;
-        con.busy_timeout(std::time::Duration::from_secs(2))
-            .map_err(|e| e.to_string())?;
-        let mut stmt = con
-            .prepare("SELECT id, selected_map FROM profiles")
-            .map_err(|e| e.to_string())?;
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-        for (id, sm) in rows {
-            let Ok(mut map) =
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&sm)
-            else {
-                continue;
-            };
-            // 只更新确实记录了这个组的 profile（定位到正确的订阅）
-            if !map.contains_key(group) {
-                continue;
-            }
-            map.insert(
-                group.to_string(),
-                serde_json::Value::String(node.to_string()),
-            );
-            let new_sm = serde_json::Value::Object(map).to_string();
-            con.execute(
-                "UPDATE profiles SET selected_map = ?1, current_group_name = ?2 WHERE id = ?3",
-                rusqlite::params![new_sm, group, id],
-            )
-            .map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-        Ok(())
-    })();
+    let res = sync_database(&path, group, node);
     match res {
-        Ok(()) => ui::dim(
+        Ok(true) => ui::dim(
             "已同步客户端的选择记忆；CuteCloud 重启后界面显示将与实际一致，且不会再用旧节点覆盖",
         ),
+        Ok(false) => ui::dim("未找到记录此策略组的 CuteCloud profile，未同步选择记忆"),
         Err(e) => ui::dim(&format!("同步客户端记忆失败（不影响切换本身）：{}", e)),
+    }
+}
+
+fn sync_database(path: &std::path::Path, group: &str, node: &str) -> Result<bool, String> {
+    let con = Connection::open(&path).map_err(|e| e.to_string())?;
+    con.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
+    let mut stmt = con
+        .prepare("SELECT id, selected_map FROM profiles")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    for (id, sm) in rows {
+        let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&sm)
+        else {
+            continue;
+        };
+        // 只更新确实记录了这个组的 profile（定位到正确的订阅）
+        if !map.contains_key(group) {
+            continue;
+        }
+        map.insert(
+            group.to_string(),
+            serde_json::Value::String(node.to_string()),
+        );
+        let new_sm = serde_json::Value::Object(map).to_string();
+        con.execute(
+            "UPDATE profiles SET selected_map = ?1, current_group_name = ?2 WHERE id = ?3",
+            rusqlite::params![new_sm, group, id],
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn updates_only_the_profile_with_matching_group() {
+        let path = std::env::temp_dir().join(format!(
+            "proxpilot-db-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let con = Connection::open(&path).unwrap();
+        con.execute_batch(
+            "CREATE TABLE profiles(id INTEGER,selected_map TEXT,current_group_name TEXT);",
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO profiles VALUES(1,?1,'x')",
+            [r#"{"Other":"old"}"#],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO profiles VALUES(2,?1,'x')",
+            [r#"{"VVCloud":"old"}"#],
+        )
+        .unwrap();
+        assert!(sync_database(&path, "VVCloud", "日本 🛰").unwrap());
+        assert!(!sync_database(&path, "Missing", "other").unwrap());
+        let values: Vec<String> = con
+            .prepare("SELECT selected_map FROM profiles ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(values[0], r#"{"Other":"old"}"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&values[1]).unwrap()["VVCloud"],
+            "日本 🛰"
+        );
+        drop(con);
+        std::fs::remove_file(path).unwrap();
     }
 }

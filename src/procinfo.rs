@@ -60,7 +60,43 @@ fn listener_table(family: u32) -> Option<Vec<u32>> {
 
 /// 找到监听指定端口的进程 PID
 pub fn find_listener_pid(port: u16) -> Option<u32> {
+    find_listener_for(port, None)
+}
+pub fn find_listener_pid_at(host: &str, port: u16) -> Option<u32> {
+    use std::net::ToSocketAddrs;
+    let targets: Vec<_> = (host.trim_matches(['[', ']']), port)
+        .to_socket_addrs()
+        .ok()?
+        .map(|a| a.ip())
+        .collect();
+    let found: std::collections::HashSet<_> = targets
+        .iter()
+        .filter_map(|ip| {
+            find_listener_for(port, Some(*ip)).or_else(|| {
+                // 没有匹配的 IPv4 监听时，IPv4 连接仅可能由 IPv6 wildcard 双栈监听接收。
+                // 后续直连 API 成功才视为可用，IPv6-only 接口的 IPv4 请求会失败。
+                if ip.is_ipv4() {
+                    find_listener_for(
+                        port,
+                        Some(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+                    )
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    if found.len() == 1 {
+        found.into_iter().next()
+    } else {
+        None
+    }
+}
+fn find_listener_for(port: u16, target: Option<std::net::IpAddr>) -> Option<u32> {
     for family in [AF_INET, AF_INET6] {
+        if target.is_some_and(|ip| ip.is_ipv4() != (family == AF_INET)) {
+            continue;
+        }
         let Some(table) = listener_table(family as u32) else {
             continue;
         };
@@ -80,16 +116,28 @@ pub fn find_listener_pid(port: u16) -> Option<u32> {
         for i in 0..count.min(available) {
             // 已校验缓冲区边界，表行均为 POD 整数；不创建未对齐引用。
             let row = unsafe { table.as_ptr().cast::<u8>().add(offset + i * row_size) };
-            let (local_port, pid) = unsafe {
+            let (local_port, pid, address) = unsafe {
                 if family == AF_INET {
                     let row = row.cast::<MIB_TCPROW_OWNER_PID>().read_unaligned();
-                    (row.dwLocalPort, row.dwOwningPid)
+                    (
+                        row.dwLocalPort,
+                        row.dwOwningPid,
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                            row.dwLocalAddr.to_le_bytes(),
+                        )),
+                    )
                 } else {
                     let row = row.cast::<MIB_TCP6ROW_OWNER_PID>().read_unaligned();
-                    (row.dwLocalPort, row.dwOwningPid)
+                    (
+                        row.dwLocalPort,
+                        row.dwOwningPid,
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(row.ucLocalAddr)),
+                    )
                 }
             };
-            if u16::from_be(local_port as u16) == port {
+            if u16::from_be(local_port as u16) == port
+                && target.is_none_or(|ip| address.is_unspecified() || address == ip)
+            {
                 return Some(pid);
             }
         }
@@ -116,7 +164,9 @@ fn image_path(pid: u32) -> Option<String> {
 
 /// 识别监听该端口的是哪家客户端
 pub fn identify_client(port: u16) -> ClientInfo {
-    let pid = find_listener_pid(port);
+    identify_pid(find_listener_pid(port))
+}
+pub fn identify_pid(pid: Option<u32>) -> ClientInfo {
     let (path, process) = match pid {
         Some(p) => {
             let path = image_path(p).unwrap_or_default();
@@ -186,5 +236,24 @@ mod tests {
             find_listener_pid(listener.local_addr().unwrap().port()),
             Some(std::process::id())
         );
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    #[test]
+    fn same_port_distinct_addresses_resolve_without_family_confusion() {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let _v6 = std::net::TcpListener::bind(("::1", port)).unwrap();
+        assert_eq!(
+            super::find_listener_pid_at("127.0.0.1", port),
+            Some(std::process::id())
+        );
+        assert_eq!(
+            super::find_listener_pid_at("::1", port),
+            Some(std::process::id())
+        );
+        assert_eq!(super::find_listener_pid_at("127.0.0.2", port), None);
     }
 }

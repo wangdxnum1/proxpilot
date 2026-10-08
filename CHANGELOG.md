@@ -1,5 +1,13 @@
 # 更新日志
 
+## Unreleased
+
+- 新增 Clash Verge 命名管道及 HTTP API 适配，支持运行配置 secret 和实际代理端口。
+- 新增 `--client cutecloud|clash-verge|auto`、`clients [--supported]` 与 `config show/set/unset default-client`。
+- 自动选择匹配已启用的系统代理，多实例不明确时提示显式选择；watch 固定客户端并刷新运行配置。
+- 系统代理修复绑定目标出口并保留绕过规则；Clash Verge 切换不写 CuteCloud 选择记录。
+
+
 ## 未发布
 
 - watch 默认保持当前可用节点，仅在故障复测确认后优选；新增 `--optimize`，开启后才在启动时及每隔 `--reopt` 主动优选。

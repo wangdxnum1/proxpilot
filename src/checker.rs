@@ -29,19 +29,26 @@ const SKIP_TYPES: [&str; 7] = [
 const MAX_VERIFY: usize = 5;
 
 pub fn parse_addr(addr: &str) -> (String, u16) {
-    let a = addr
-        .strip_prefix("http://")
-        .or_else(|| addr.strip_prefix("https://"))
-        .unwrap_or(addr);
-    let mut it = a.split(':');
-    let host = it.next().unwrap_or("127.0.0.1").to_string();
-    let port = it.next().and_then(|p| p.parse().ok()).unwrap_or(7890);
-    (host, port)
+    let value = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    };
+    match reqwest::Url::parse(&value) {
+        Ok(url) => (
+            url.host_str()
+                .unwrap_or("127.0.0.1")
+                .trim_matches(['[', ']'])
+                .to_string(),
+            url.port_or_known_default().unwrap_or(7890),
+        ),
+        Err(_) => ("127.0.0.1".into(), 7890),
+    }
 }
 
 pub fn core_alive(proxy: &str) -> bool {
     let (host, port) = parse_addr(proxy);
-    match format!("{}:{}", host, port).to_socket_addrs() {
+    match (host.as_str(), port).to_socket_addrs() {
         Ok(mut it) => match it.next() {
             Some(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(2)).is_ok(),
             None => false,
@@ -202,7 +209,7 @@ pub fn fix_flow(
     let proxies = mihomo::get_proxies(be, agent)?;
     let group = proxies
         .get(&args.group)
-        .ok_or_else(|| format!("找不到组「{}」", args.group))?;
+        .ok_or_else(|| mihomo::missing_group(&proxies, &args.group))?;
     let orig = group.now.clone().unwrap_or_else(|| "未知".into());
     ui::info(&format!("当前组「{}」→ {}", args.group, orig));
 
@@ -290,7 +297,7 @@ pub fn fix_flow(
     let (best_t, best_name, best_soft) = verified[0].clone();
     // 验证过程把组切到了最后一个候选，最终停在最优节点上
     mihomo::switch_group(be, agent, &args.group, &best_name)?;
-    crate::appstate::sync_selection(&args.group, &best_name);
+    crate::appstate::sync_selection(be, &args.group, &best_name);
 
     println!();
     ui::info("实测通过的节点（按实测延迟排序）：");

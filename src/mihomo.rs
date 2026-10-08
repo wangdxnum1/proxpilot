@@ -33,48 +33,106 @@ struct ProxiesMap {
 }
 
 fn api_json(be: &Backend, api: &crate::core_api::CoreApi, path: &str) -> Result<Value, String> {
-    let response = api.request(be, reqwest::Method::GET, path, None, std::time::Duration::from_secs(10))?;
+    let response = api.request(
+        be,
+        reqwest::Method::GET,
+        path,
+        None,
+        std::time::Duration::from_secs(10),
+    )?;
     serde_json::from_slice(&response.body).map_err(|_| "API JSON 解析失败".into())
 }
 
-pub fn get_proxies(be: &Backend, api: &crate::core_api::CoreApi) -> Result<HashMap<String, ProxyInfo>, String> {
-    let response = api.request(be, reqwest::Method::GET, "/proxies", None, std::time::Duration::from_secs(10))?;
-    let parsed: ProxiesMap = serde_json::from_slice(&response.body).map_err(|_| "节点 API JSON 解析失败".to_string())?;
+pub fn get_proxies(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+) -> Result<HashMap<String, ProxyInfo>, String> {
+    let response = api.request(
+        be,
+        reqwest::Method::GET,
+        "/proxies",
+        None,
+        std::time::Duration::from_secs(10),
+    )?;
+    let parsed: ProxiesMap =
+        serde_json::from_slice(&response.body).map_err(|_| "节点 API JSON 解析失败".to_string())?;
     Ok(parsed.proxies)
 }
 
 pub fn get_version(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
-    api_json(be, api, "/version")?.get("version").and_then(Value::as_str).map(str::to_string).ok_or_else(|| "响应不是有效的 mihomo 版本信息".into())
+    api_json(be, api, "/version")?
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "响应不是有效的 mihomo 版本信息".into())
 }
 
 pub fn get_runtime_proxy(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
     let value = api_json(be, api, "/configs")?;
-    for (name, scheme) in [("mixed-port", "http"), ("port", "http"), ("socks-port", "socks5h")] {
-        if let Some(port) = value.get(name).and_then(Value::as_u64).filter(|p| *p > 0 && *p <= 65535) {
+    for (name, scheme) in [
+        ("mixed-port", "http"),
+        ("port", "http"),
+        ("socks-port", "socks5h"),
+    ] {
+        if let Some(port) = value
+            .get(name)
+            .and_then(Value::as_u64)
+            .filter(|p| *p > 0 && *p <= 65535)
+        {
             return Ok(format!("{}://127.0.0.1:{}", scheme, port));
         }
     }
     Err("目标内核没有可用的 mixed/HTTP/SOCKS 代理端口，请用 --proxy 指定".into())
 }
 
-pub fn probe_delay(be: &Backend, api: &crate::core_api::CoreApi, node: &str, url: &str, timeout_ms: u32) -> Option<i64> {
-    let path = format!("/proxies/{}/delay?url={}&timeout={}", enc_path(node), enc(url), timeout_ms);
-    let response = api.request(be, reqwest::Method::GET, &path, None, std::time::Duration::from_millis(u64::from(timeout_ms) + 2000)).ok()?;
+pub fn probe_delay(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+    node: &str,
+    url: &str,
+    timeout_ms: u32,
+) -> Option<i64> {
+    let path = format!(
+        "/proxies/{}/delay?url={}&timeout={}",
+        enc_path(node),
+        enc(url),
+        timeout_ms
+    );
+    let response = api
+        .request(
+            be,
+            reqwest::Method::GET,
+            &path,
+            None,
+            std::time::Duration::from_millis(u64::from(timeout_ms) + 2000),
+        )
+        .ok()?;
     let value: Value = serde_json::from_slice(&response.body).ok()?;
     value.get("delay")?.as_i64().filter(|d| *d > 0)
 }
 
-pub fn switch_group(be: &Backend, api: &crate::core_api::CoreApi, group: &str, node: &str) -> Result<(), String> {
+pub fn switch_group(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+    group: &str,
+    node: &str,
+) -> Result<(), String> {
     let path = format!("/proxies/{}", enc_path(group));
     let body = serde_json::to_vec(&serde_json::json!({"name": node})).map_err(|e| e.to_string())?;
-    let response = api.request(be, reqwest::Method::PUT, &path, Some(body), std::time::Duration::from_secs(10))?;
+    let response = api.request(
+        be,
+        reqwest::Method::PUT,
+        &path,
+        Some(body),
+        std::time::Duration::from_secs(10),
+    )?;
     debug_assert!((200..300).contains(&response.status));
     Ok(())
 }
 
-/// 百分号编码（用于路径段，保留 /）
+/// 百分号编码（用于单个路径段）
 pub fn enc_path(s: &str) -> String {
-    enc_impl(s, true)
+    enc_impl(s, false)
 }
 
 /// 百分号编码（用于查询值，编码所有特殊字符）
@@ -99,8 +157,8 @@ fn enc_impl(s: &str, keep_slash: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::test_support::serve;
     use crate::core_api::CoreApi;
+    use crate::http::test_support::serve;
 
     fn backend(api: String) -> Backend {
         Backend {
@@ -148,4 +206,18 @@ mod tests {
         assert!(switch_group(&backend(url), &CoreApi::new().unwrap(), "AI服务", "node").is_err());
         server.join().unwrap();
     }
+}
+
+pub fn missing_group(proxies: &HashMap<String, ProxyInfo>, name: &str) -> String {
+    let mut groups: Vec<_> = proxies
+        .iter()
+        .filter(|(_, p)| p.all.is_some())
+        .map(|(n, _)| n.as_str())
+        .collect();
+    groups.sort();
+    format!(
+        "找不到组「{}」；可用组：{}。请用 --group 指定",
+        name,
+        groups.join("、")
+    )
 }

@@ -1,6 +1,7 @@
 mod appstate;
 mod checker;
 mod client_config;
+mod clients;
 mod core_api;
 mod detect;
 mod http;
@@ -18,6 +19,7 @@ use colored::Colorize;
 use detect::Backend;
 
 pub struct Args {
+    pub client: Option<client_config::ClientSelection>,
     pub cmd: Cmd,
     pub api: Option<String>,
     pub secret: Option<String>,
@@ -40,71 +42,202 @@ pub enum Cmd {
     Use(String),
     Watch,
     Help,
+    Clients(bool),
+    Config(ConfigCommand),
 }
 
-fn parse_args() -> Args {
-    let mut it = std::env::args().skip(1);
-    let mut cmd = Cmd::Help;
-    let mut got_pos = false;
-    let mut api = None;
-    let mut secret = None;
-    let mut proxy = None;
-    let mut group = "AI服务".to_string();
-    let mut url = "https://chatgpt.com/".to_string();
-    let mut top = 12usize;
-    let mut samples = 2usize;
-    let mut dry_run = false;
-    let mut interval = 300u64;
-    let mut reopt = 7200u64;
-    let mut optimize = false;
-    let mut detect = false;
+pub enum ConfigCommand {
+    Show,
+    Set(client_config::ClientSelection),
+    Unset,
+}
 
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--api" => api = it.next(),
-            "--secret" => secret = it.next(),
-            "--proxy" => proxy = it.next(),
-            "--group" => group = it.next().unwrap_or(group),
-            "--url" => url = it.next().unwrap_or(url),
-            "--top" => top = it.next().and_then(|v| v.parse().ok()).unwrap_or(top),
-            "--samples" => samples = it.next().and_then(|v| v.parse().ok()).unwrap_or(samples),
-            "--interval" => interval = it.next().and_then(|v| v.parse().ok()).unwrap_or(interval),
-            "--reopt" => reopt = it.next().and_then(|v| v.parse().ok()).unwrap_or(reopt),
-            "--optimize" => optimize = true,
-            "--dry-run" => dry_run = true,
-            "--detect" => detect = true,
-            "-h" | "--help" => cmd = Cmd::Help,
-            "check" | "scan" | "fix" | "watch" | "use" | "help" => {
-                if !got_pos {
-                    got_pos = true;
-                    cmd = match a.as_str() {
-                        "check" => Cmd::Check,
-                        "scan" => Cmd::Scan,
-                        "fix" => Cmd::Fix,
-                        "watch" => Cmd::Watch,
-                        "use" => Cmd::Use(it.next().unwrap_or_default()),
-                        _ => Cmd::Help,
-                    };
+fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    use client_config::ClientSelection;
+    let mut it = input.into_iter();
+    let mut args = Args {
+        client: None,
+        cmd: Cmd::Help,
+        api: None,
+        secret: None,
+        proxy: None,
+        group: "AI服务".into(),
+        url: "https://chatgpt.com/".into(),
+        top: 12,
+        samples: 2,
+        dry_run: false,
+        interval: 300,
+        reopt: 7200,
+        optimize: false,
+        detect: false,
+    };
+    let mut command = false;
+    let mut supported = false;
+    fn value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+        let v = it.next().ok_or_else(|| format!("{} 缺少参数值", flag))?;
+        if v.starts_with("--") {
+            return Err(format!("{} 缺少参数值", flag));
+        }
+        Ok(v)
+    }
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--client" => args.client = Some(ClientSelection::parse(&value(&mut it, &arg)?)?),
+            "--api" => args.api = Some(value(&mut it, &arg)?),
+            "--secret" => args.secret = Some(value(&mut it, &arg)?),
+            "--proxy" => args.proxy = Some(value(&mut it, &arg)?),
+            "--group" => args.group = value(&mut it, &arg)?,
+            "--url" => args.url = value(&mut it, &arg)?,
+            "--top" => {
+                args.top = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--top 必须为整数")?
+            }
+            "--samples" => {
+                args.samples = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--samples 必须为整数")?
+            }
+            "--interval" => {
+                args.interval = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--interval 必须为整数")?
+            }
+            "--reopt" => {
+                args.reopt = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--reopt 必须为整数")?
+            }
+            "--optimize" => args.optimize = true,
+            "--dry-run" => args.dry_run = true,
+            "--detect" => args.detect = true,
+            "--supported" => supported = true,
+            "--help" | "-h" | "help" => {
+                args.cmd = Cmd::Help;
+                return Ok(args);
+            }
+            "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" if !command => {
+                command = true;
+                args.cmd = match arg.as_str() {
+                    "check" => Cmd::Check,
+                    "scan" => Cmd::Scan,
+                    "fix" => Cmd::Fix,
+                    "watch" => Cmd::Watch,
+                    "use" => Cmd::Use(value(&mut it, "use")?),
+                    "clients" => Cmd::Clients(false),
+                    "config" => {
+                        let action = value(&mut it, "config")?;
+                        let action=match action.as_str() {
+                            "show"=>ConfigCommand::Show,
+                            "set"|"unset"=>{
+                                if value(&mut it,"config key")?!="default-client" {return Err("配置键仅支持 default-client".into());}
+                                if action=="set" {ConfigCommand::Set(ClientSelection::parse(&value(&mut it,"default-client")?)?)} else {ConfigCommand::Unset}
+                            },_=>return Err("用法：config show | set default-client <客户端> | unset default-client".into())
+                        };
+                        Cmd::Config(action)
+                    }
+                    _ => unreachable!(),
                 }
             }
-            _ => {}
+            _ => return Err(format!("未知命令或参数：{}", arg)),
         }
     }
+    if supported {
+        if matches!(args.cmd, Cmd::Clients(_)) {
+            args.cmd = Cmd::Clients(true);
+        } else {
+            return Err("--supported 仅用于 clients 命令".into());
+        }
+    }
+    if args.samples == 0 || args.interval == 0 || args.reopt == 0 {
+        return Err("samples、interval、reopt 必须大于 0".into());
+    }
+    Ok(args)
+}
 
-    Args {
-        cmd,
-        api,
-        secret,
-        proxy,
-        group,
-        url,
-        top,
-        samples,
-        dry_run,
-        interval,
-        reopt,
-        optimize,
-        detect,
+fn cmd_clients(supported: bool) -> Result<(), String> {
+    if supported {
+        println!("cutecloud    CuteCloud    HTTP API；支持选择记忆同步");
+        println!("clash-verge  Clash Verge  命名管道 / HTTP API；仅同步当前内核选择");
+        println!("auto         自动选择    优先匹配已开启的系统代理，否则要求唯一可用内核");
+        return Ok(());
+    }
+    let api = core_api::CoreApi::new()?;
+    let records = clients::discover(&api, &clients::DiscoveryPaths::current()?);
+    let active = if sysproxy::proxy_enabled() {
+        sysproxy::registry_proxy_server()
+    } else {
+        None
+    };
+    let mut available = false;
+    for record in records {
+        if let Some(be) = record.backend {
+            available = true;
+            println!(
+                "{} [{}]  API={}  出口={}  {}",
+                record.name,
+                be.kind.map(|k| k.name()).unwrap_or("mihomo"),
+                be.api,
+                be.proxy,
+                if active
+                    .as_deref()
+                    .is_some_and(|r| clients::proxy_matches(&be.proxy, r))
+                {
+                    "[系统代理]"
+                } else {
+                    ""
+                }
+            );
+        } else {
+            println!(
+                "{}：不可用 — {}",
+                record.name,
+                record.error.unwrap_or_default()
+            );
+        }
+    }
+    if available {
+        Ok(())
+    } else {
+        Err("未发现可用客户端".into())
+    }
+}
+fn cmd_config(command: &ConfigCommand) -> Result<(), String> {
+    let path = client_config::config_path()?;
+    match command {
+        ConfigCommand::Show => {}
+        ConfigCommand::Set(c) => client_config::save_default(&path, Some(*c))?,
+        ConfigCommand::Unset => client_config::save_default(&path, None)?,
+    }
+    println!("{}", client_config::show_config(&path)?);
+    Ok(())
+}
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    fn parse(values: &[&str]) -> Result<Args, String> {
+        parse_args_from(values.iter().map(|v| v.to_string()))
+    }
+    #[test]
+    fn client_commands_and_strict_errors() {
+        assert!(matches!(
+            parse(&["clients", "--supported"]).unwrap().cmd,
+            Cmd::Clients(true)
+        ));
+        assert!(matches!(
+            parse(&["config", "set", "default-client", "clash-verge"])
+                .unwrap()
+                .cmd,
+            Cmd::Config(ConfigCommand::Set(_))
+        ));
+        assert!(parse(&["check", "--client", "verge"]).is_err());
+        assert!(parse(&["check", "--client"]).is_err());
+        assert!(parse(&["watch", "--interval", "0"]).is_err());
+        assert!(parse(&["check", "--typo"]).is_err());
+        assert_eq!(
+            parse(&["--client", "auto", "check"]).unwrap().client,
+            Some(client_config::ClientSelection::Auto)
+        );
     }
 }
 
@@ -119,6 +252,8 @@ fn print_help() {
     println!("用法: proxpilot <命令> [选项]");
     println!();
     println!("命令:");
+    println!("  clients [--supported]  查看发现的客户端 / 支持的类型");
+    println!("  config show | set default-client <类型> | unset default-client");
     println!("  check          体检：内核 / 系统代理 / 当前节点能否访问测试网址");
     println!("  scan           探测组内所有节点的可达性（不切换）");
     println!("  fix            优选：探测 → 真实验证 → 切到实测最快的节点");
@@ -128,22 +263,18 @@ fn print_help() {
     println!("选项:");
     println!("  --group <名称>   策略组名称（默认 AI服务）");
     println!("  --url <地址>     测试网址（默认 https://chatgpt.com/）");
-    println!("  --api <地址>     内核 API（默认 http://127.0.0.1:9090；加 --detect 探测）");
+    println!("  --client <类型>  cutecloud / clash-verge / auto；覆盖保存的默认客户端");
+    println!("  --api <地址>     显式指定 HTTP 内核 API（优先级最高）");
     println!("  --secret <值>    内核 API 的 secret");
-    println!("  --proxy <地址>   代理出口（默认读系统代理，如 http://127.0.0.1:7890）");
+    println!("  --proxy <地址>   代理出口（默认读目标内核运行端口）");
     println!("  --top <N>        优选时验证前 N 个候选（默认 12）");
     println!("  --samples <N>    每个节点实测次数（默认 2，全部 200 才通过）");
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
     println!("  --optimize      watch 启动时及定时主动优选（默认关闭）");
     println!("  --reopt <秒>     --optimize 的定时优选间隔（默认 7200）");
     println!("  --dry-run        只探测报告，不切换");
-    println!(
-        "  --detect         自动探测本机客户端与端口（默认不探测、直接使用 CuteCloud，速度更快）"
-    );
-    println!();
-    println!("客户端识别:");
-    println!("  默认直接使用 CuteCloud；加 --detect 探测本机运行的 Clash/mihomo 系客户端，");
-    println!("  多个同时在线时优先 CuteCloud，用 --api 可指定其他实例。");
+    println!("  --detect         自动探测（兼容 --client auto）");
+    println!("默认：未配置时使用 cutecloud；auto 优先匹配系统代理，多个可用内核时要求明确指定。");
     println!();
     println!("示例:");
     println!("  proxpilot check");
@@ -188,14 +319,14 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
     }
     ui::ok("内核运行中，代理端口可用");
 
-    if sysproxy::proxy_enabled() {
+    if sysproxy::matches(&be.proxy) {
         ui::ok("系统代理已开启");
     } else {
-        ui::warn("系统代理未开启（浏览器不走代理）——其他代理软件退出时常干这事");
+        ui::warn("系统代理未开启或指向其他客户端（浏览器不走代理）——其他代理软件退出时常干这事");
         if args.dry_run {
             ui::dim("dry-run：不自动修复");
         } else {
-            match sysproxy::enable() {
+            match sysproxy::enable_for(&be.proxy) {
                 Ok(()) => ui::ok("已自动重新打开系统代理"),
                 Err(e) => ui::fail(&format!("自动打开失败：{}", e)),
             }
@@ -204,6 +335,10 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
 
     match mihomo::get_proxies(be, agent) {
         Ok(proxies) => {
+            if !proxies.contains_key(&args.group) {
+                ui::fail(&mihomo::missing_group(&proxies, &args.group));
+                return 1;
+            }
             if let Some(g) = proxies.get(&args.group) {
                 let now = g.now.clone().unwrap_or_else(|| "未知".into());
                 ui::info(&format!("当前组「{}」→ {}", args.group, now));
@@ -250,7 +385,7 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
     let group = match proxies.get(&args.group) {
         Some(g) => g,
         None => {
-            ui::fail(&format!("找不到组「{}」", args.group));
+            ui::fail(&mihomo::missing_group(&proxies, &args.group));
             return 1;
         }
     };
@@ -318,11 +453,11 @@ fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
         ui::fail("内核代理端口不通，请确认客户端已启动；若使用的不是 CuteCloud，加 --detect 自动探测或用 --api 指定");
         return 1;
     }
-    if sysproxy::proxy_enabled() {
+    if sysproxy::matches(&be.proxy) {
         ui::ok("系统代理已开启");
     } else {
-        ui::warn("系统代理未开启，自动重新打开");
-        match sysproxy::enable() {
+        ui::warn("系统代理未开启或指向其他客户端，自动重新打开");
+        match sysproxy::enable_for(&be.proxy) {
             Ok(()) => ui::ok("系统代理已开启"),
             Err(e) => ui::fail(&format!("打开失败：{}", e)),
         }
@@ -355,10 +490,14 @@ fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &s
         ui::fail("用法: proxpilot use <节点名>（节点名含空格请加引号）");
         return 1;
     }
+    if args.dry_run {
+        ui::info(&format!("dry-run：将切换 {} → {}", args.group, node));
+        return 0;
+    }
     match mihomo::switch_group(be, agent, &args.group, node) {
         Ok(()) => {
             ui::ok(&format!("已切换 {} → {}", args.group, node));
-            appstate::sync_selection(&args.group, node);
+            appstate::sync_selection(be, &args.group, node);
             match checker::verify_access(&be.proxy, &args.url, args.samples) {
                 checker::Verdict::Pass(t) => {
                     ui::ok(&format!("验证通过：{} 平均 {:.2}s", args.url, t));
@@ -394,7 +533,11 @@ mod watch_tests {
 
     #[test]
     fn default_watch_never_proactively_optimizes() {
-        for elapsed in [None, Some(Duration::ZERO), Some(Duration::from_secs(86_400))] {
+        for elapsed in [
+            None,
+            Some(Duration::ZERO),
+            Some(Duration::from_secs(86_400)),
+        ] {
             assert!(!reoptimization_due(false, elapsed, 7200));
             assert!(!reoptimization_due(false, elapsed, 0));
         }
@@ -404,13 +547,25 @@ mod watch_tests {
     fn enabled_watch_optimizes_at_startup_and_after_interval() {
         assert!(reoptimization_due(true, None, 7200));
         assert!(!reoptimization_due(true, Some(Duration::ZERO), 7200));
-        assert!(!reoptimization_due(true, Some(Duration::from_secs(7199)), 7200));
-        assert!(reoptimization_due(true, Some(Duration::from_secs(7200)), 7200));
-        assert!(reoptimization_due(true, Some(Duration::from_secs(7201)), 7200));
+        assert!(!reoptimization_due(
+            true,
+            Some(Duration::from_secs(7199)),
+            7200
+        ));
+        assert!(reoptimization_due(
+            true,
+            Some(Duration::from_secs(7200)),
+            7200
+        ));
+        assert!(reoptimization_due(
+            true,
+            Some(Duration::from_secs(7201)),
+            7200
+        ));
     }
 }
 
-fn cmd_watch(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
+fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     if args.optimize {
         ui::info(&format!(
             "守护模式：每 {} 秒检查一次，启动时及每 {} 秒主动优选，Ctrl+C 退出",
@@ -422,18 +577,31 @@ fn cmd_watch(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
             args.interval
         ));
     }
+    if args.dry_run {
+        return cmd_scan(initial, agent, args);
+    }
+    let mut current = initial.clone();
     let mut last_opt: Option<Instant> = None;
     let mut cycle: u64 = 0;
     loop {
         cycle += 1;
+        match clients::refresh(&current, args, agent) {
+            Ok(next) => current = next,
+            Err(e) => {
+                ui::warn(&format!("目标客户端暂不可用：{}", e));
+                thread::sleep(Duration::from_secs(args.interval));
+                continue;
+            }
+        }
+        let be = &current;
         if !checker::core_alive(&be.proxy) {
             ui::warn("内核未运行，等待中...");
             thread::sleep(Duration::from_secs(args.interval));
             continue;
         }
-        if !sysproxy::proxy_enabled() {
-            ui::warn("系统代理被关闭，自动重新打开");
-            let _ = sysproxy::enable();
+        if !sysproxy::matches(&be.proxy) {
+            ui::warn("系统代理被关闭或指向其他客户端，自动重新打开");
+            let _ = sysproxy::enable_for(&be.proxy);
         }
         let v1 = checker::verify_access(&be.proxy, &args.url, 1);
         let mut broken = !v1.is_ok();
@@ -486,7 +654,22 @@ fn set_console_utf8() {
 fn main() {
     #[cfg(windows)]
     set_console_utf8();
-    let args = parse_args();
+    let args = parse_args_from(std::env::args().skip(1)).unwrap_or_else(|e| {
+        ui::fail(&e);
+        exit(1)
+    });
+    let static_result = match &args.cmd {
+        Cmd::Clients(s) => Some(cmd_clients(*s)),
+        Cmd::Config(c) => Some(cmd_config(c)),
+        _ => None,
+    };
+    if let Some(result) = static_result {
+        if let Err(e) = result {
+            ui::fail(&e);
+            exit(1);
+        }
+        return;
+    }
     if matches!(&args.cmd, Cmd::Help) {
         print_help();
         return;
@@ -502,6 +685,7 @@ fn main() {
         Cmd::Fix => cmd_fix(&be, &agent, &args),
         Cmd::Use(n) => cmd_use(&be, &agent, &args, n),
         Cmd::Watch => cmd_watch(&be, &agent, &args),
+        Cmd::Clients(_) | Cmd::Config(_) => unreachable!(),
         Cmd::Help => {
             print_help();
             0

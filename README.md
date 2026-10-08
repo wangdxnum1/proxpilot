@@ -39,6 +39,29 @@ proxpilot watch     :: 守护模式：保持可用节点，坏了自动修
 
 ---
 
+## 客户端选择与配置
+
+内置适配 `cutecloud`、`clash-verge`，`auto` 是自动选择模式。Clash Verge 优先读取运行配置中的命名管道，支持带 secret 的控制接口。其他兼容内核可通过 `--api` 指定 HTTP 接口。
+
+```powershell
+proxpilot clients --supported
+proxpilot clients
+proxpilot check --client clash-verge --group VVCloud --dry-run
+proxpilot scan --client clash-verge --group VVCloud
+proxpilot config set default-client clash-verge
+proxpilot config show
+proxpilot config set default-client auto
+proxpilot config unset default-client
+```
+
+选择顺序：`--api` → `--client` → `--detect` → 保存的默认客户端 → `cutecloud`。`--detect` 等同于自动选择；优先匹配已开启的系统代理，否则只在唯一内核可用时选择，多个可用内核必须明确指定。显式参数可以绕过损坏的默认配置。配置保存在 `%APPDATA%\ProxPilot\config.json`，不保存 secret。
+
+`--secret` 覆盖目标客户端运行配置中的凭据；`--proxy` 覆盖目标内核提供的 mixed/HTTP/SOCKS 端口。修复系统代理时同时校正目标出口并保留绕过规则，SOCKS 出口不能作为 Windows HTTP 系统代理。客户端不存在 `AI服务` 组时会列出可用组，请通过 `--group` 指定。
+
+Clash Verge 的节点切换作用于当前内核；不修改由 GUI 缓存管理的 `profiles.yaml`，重启后的持久化由 Clash Verge 管理。CuteCloud 才会同步其 SQLite 选择记忆。`watch` 固定启动时选定的客户端，并在每个周期重新读取该客户端运行配置，以适应重启后命名管道变化。
+
+`clients`、`scan`、`config show` 及 `check --dry-run` 不改变系统代理或当前节点。`use/fix/watch --dry-run` 也不切换节点。
+
 ## 子命令详解
 
 ### `check` — 体检
@@ -114,33 +137,25 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 |------|--------|------|
 | `--group <名称>` | `AI服务` | 目标策略组。ChatGPT 的分流规则通常在 AI 服务组；换成 `流媒体`、`手动选择` 等可优选其他用途 |
 | `--url <地址>` | `https://chatgpt.com/` | 测试网址。优选流媒体可配 `--url https://www.youtube.com/`；只测连通性可用 `https://www.gstatic.com/generate_204` |
-| `--api <地址>` | `http://127.0.0.1:9090` | 内核 external-controller 地址，如 `http://127.0.0.1:9097`。多客户端在线时用它指定目标 |
+| `--client <类型>` | 保存值或 cutecloud | 明确指定 cutecloud、clash-verge 或 auto |
+| `--api <地址>` | 目标运行配置 | 内核 external-controller 地址，如 `http://127.0.0.1:9097`。多客户端在线时用它指定目标 |
 | `--secret <值>` | 无 | 内核 API 的鉴权密钥（客户端设置了 `secret` 时必填） |
-| `--proxy <地址>` | 读注册表 | 实测流量走的代理出口，默认取系统代理注册表值（`127.0.0.1:7890`），无则用 `http://127.0.0.1:7890` |
+| `--proxy <地址>` | 目标内核端口 | 实测流量走的代理出口，按 mixed / HTTP / SOCKS 优先级选择 |
 | `--top <N>` | `12` | `fix` 中参与真实验证的候选数量（从探测最快的开始取） |
 | `--samples <N>` | `2` | 每个节点实测次数。**全部 200 才算通过**，取平均延迟排序；加大可降低偶发误判 |
 | `--interval <秒>` | `300` | `watch` 的检查周期 |
 | `--optimize` | 关 | `watch` 启动时及定时主动优选；默认仅在当前节点故障确认后优选 |
 | `--reopt <秒>` | `7200` | `watch --optimize` 的定时重新优选间隔；单独设置不启用主动优选 |
 | `--dry-run` | 关 | 只探测报告、不切换不修复（`fix` 下等价于 `scan`；`check` 下不自动开系统代理） |
-| `--detect` | 关 | 自动探测本机客户端与端口，通过 Windows API 识别监听进程。默认关闭、直接使用 CuteCloud；使用其他客户端时开启，或用 `--api` 直接指定 |
+| `--detect` | 关 | 自动选择本机客户端，与 `--client auto` 等价；覆盖保存的默认值，但不覆盖显式 `--client` |
 
 通用说明：所有涉及节点名/组名的参数都支持中文与 emoji，含空格时请加引号。
 
 ## 客户端识别
 
-启动时输出目标客户端；加 `--detect` 才探测本机运行的 Clash/mihomo 系客户端：
+启动时输出客户端、运行配置来源、API、版本及代理出口。`clients` 读取两个适配客户端的运行配置，再扫描常见控制端口；只把 API 验证通过的内核作为可用候选，错误候选保留诊断。Clash Verge 的命名管道优先于陈旧的 TCP 配置。
 
-```
-  目标客户端：CuteCloud
-  内核 API：http://127.0.0.1:9090（自动探测）
-```
-
-- **默认不探测**，直接使用 CuteCloud（API 9090 / 代理 7890），启动毫秒级；加 `--detect` 才执行完整探测；
-- 探测端口：`9090`、`9097`、`9091`、`9094`、`19090`、`28090`；
-- 通过端口的监听进程路径识别客户端（CuteCloud / FlClash / Clash Verge / Clash for Windows / mihomo）；
-- **多个客户端同时在线时默认优先 CuteCloud**，其余在输出中列出，用 `--api` 可指定其他实例；
-- API 设置了 secret 的实例会提示需要 `--secret`。
+自动选择优先匹配已开启的系统代理，否则要求唯一可用内核，不固定偏向 CuteCloud。通过进程信息校验本机接口身份，具体 `--client` 与显式 `--api` 身份不符时拒绝操作。
 
 ## 工作原理
 

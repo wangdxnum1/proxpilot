@@ -368,7 +368,7 @@ pub fn select_auto(records: &[DiscoveryRecord], active: Option<&str>) -> Result<
     }
     match available.as_slice() {
         [be] => Ok((*be).clone()),
-        [] => Err("未发现可用内核；用 clients 查看详情".into()),
+        [] => Err("自动探测未发现可用内核；请确认客户端已启动，用 clients 查看详情，或用 --client / --api 指定".into()),
         _ => Err("多个客户端同时可用，无法唯一选择；请用 --client 或 --api 指定".into()),
     }
 }
@@ -398,8 +398,7 @@ pub fn choose_selection(
     if detect {
         return Ok(ClientSelection::Auto);
     }
-    Ok(client_config::load_default(path)?
-        .unwrap_or(ClientSelection::Explicit(ClientKind::CuteCloud)))
+    Ok(client_config::load_default(path)?.unwrap_or(ClientSelection::Auto))
 }
 pub fn resolve_backend(
     args: &Args,
@@ -584,6 +583,56 @@ mod tests {
         .is_err());
         assert!(validate_explicit_identity(Some(ClientKind::ClashVerge), false, None).is_err());
         assert!(validate_explicit_identity(None, false, None).is_ok());
+    }
+
+    #[test]
+    fn unset_default_uses_auto_without_persisting_a_client() {
+        let root = std::env::temp_dir().join(format!(
+            "proxpilot-default-auto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("config.json");
+        assert_eq!(
+            choose_selection(None, false, &path).unwrap(),
+            ClientSelection::Auto
+        );
+        assert!(!path.exists());
+        client_config::save_default(&path, Some(ClientSelection::Explicit(ClientKind::VvCloud)))
+            .unwrap();
+        assert_eq!(
+            choose_selection(None, false, &path).unwrap(),
+            ClientSelection::Explicit(ClientKind::VvCloud)
+        );
+        assert_eq!(
+            choose_selection(
+                Some(ClientSelection::Explicit(ClientKind::ClashVerge)),
+                false,
+                &path
+            )
+            .unwrap(),
+            ClientSelection::Explicit(ClientKind::ClashVerge)
+        );
+        assert_eq!(
+            choose_selection(None, true, &path).unwrap(),
+            ClientSelection::Auto
+        );
+        client_config::save_default(&path, None).unwrap();
+        assert_eq!(
+            choose_selection(None, false, &path).unwrap(),
+            ClientSelection::Auto
+        );
+        assert_eq!(client_config::load_default(&path).unwrap(), None);
+        assert!(select_auto(&[], None).err().unwrap().contains("--client"));
+        let records = [
+            record(ClientKind::CuteCloud, 7890),
+            record(ClientKind::VvCloud, 7891),
+        ];
+        assert!(select_auto(&records, None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -136,14 +136,14 @@ pub fn save_default(path: &Path, client: Option<ClientSelection>) -> Result<(), 
 pub fn show_config(path: &Path) -> Result<String, String> {
     let saved = load_default(path)?;
     Ok(format!(
-        "配置文件：{}\n保存的默认客户端：{}\n实际默认客户端：{}",
+        "配置文件：{}\n保存的默认客户端：{}\n运行时选择方式：{}",
         path.display(),
         saved
             .map(|v| v.to_string())
-            .unwrap_or_else(|| "未设置".into()),
+            .unwrap_or_else(|| "未设置（空）".into()),
         saved
             .map(|v| v.to_string())
-            .unwrap_or_else(|| "cutecloud（兼容默认值）".into())
+            .unwrap_or_else(|| "auto（未设置默认客户端，自动探测）".into())
     ))
 }
 
@@ -190,6 +190,10 @@ mod tests {
     fn config_round_trip_preserves_unknown_fields() {
         let p = temp_path();
         assert_eq!(load_default(&p).unwrap(), None);
+        let shown = show_config(&p).unwrap();
+        assert!(shown.contains("未设置（空）"));
+        assert!(shown.contains("auto"));
+        assert!(!shown.contains("cutecloud"));
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, r#"{"schema_version":1,"future":{"value":true}}"#).unwrap();
         save_default(&p, Some(ClientSelection::Explicit(ClientKind::ClashVerge))).unwrap();

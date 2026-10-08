@@ -288,7 +288,7 @@ mod cli_tests {
 fn print_help() {
     println!(
         "{}",
-        format!("ProxPilot · 代理领航员 v{}", env!("CARGO_PKG_VERSION"))
+        format!("ProxPilot · 代理优选助手 v{}", env!("CARGO_PKG_VERSION"))
             .cyan()
             .bold()
     );

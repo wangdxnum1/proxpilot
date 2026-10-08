@@ -1,9 +1,9 @@
 [package]
 name = "proxpilot"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.98"
-description = "代理领航员：节点检测、智能优选、自动切换、全时守护（支持 Clash/mihomo 系客户端）"
+description = "代理优选助手：节点检测、智能优选、自动切换、全时守护（支持 Clash/mihomo 系客户端）"
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "http2", "json", "gzip", "brotli", "deflate", "cookies", "socks"] }

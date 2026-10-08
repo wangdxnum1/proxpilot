@@ -41,6 +41,6 @@ git push origin v%VER% 2>&1 | findstr /v "warning:"
 
 echo [4/4] 创建 GitHub Release ...
 copy /y "bin\proxpilot.exe" "%TEMP%\proxpilot-v%VER%.exe" >nul
-gh release create v%VER% "%TEMP%\proxpilot-v%VER%.exe" --title "ProxPilot v%VER% · 代理领航员" --notes-file CHANGELOG.md
+gh release create v%VER% "%TEMP%\proxpilot-v%VER%.exe" --title "ProxPilot v%VER% · 代理优选助手" --notes-file CHANGELOG.md
 
 endlocal

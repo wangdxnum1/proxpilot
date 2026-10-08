@@ -1,4 +1,4 @@
-# ProxPilot · 代理领航员
+# ProxPilot · 代理优选助手
 
 > 节点检测 · 优选切换 · 守护运行
 > 支持 Clash / mihomo 系客户端（CuteCloud、VVCloud、FlClash、Clash Verge、Clash for Windows 等）
@@ -56,7 +56,7 @@ proxpilot config set default-client auto
 proxpilot config unset default-client
 ```
 
-选择顺序：`--api` → `--client` → `--detect` → 保存的默认客户端 → `cutecloud`。`--detect` 等同于自动选择；优先匹配已开启的系统代理，否则只在唯一内核可用时选择，多个可用内核必须明确指定。显式参数可以绕过损坏的默认配置。配置保存在 `%APPDATA%\ProxPilot\config.json`，不保存 secret。
+选择顺序：`--api` → `--client` → `--detect` → 保存的默认客户端 → `auto`（默认值为空时自动探测）。`--detect` 等同于自动选择；优先匹配已开启的系统代理，否则只在唯一内核可用时选择，多个可用内核必须明确指定。显式参数可以绕过损坏的默认配置。配置保存在 `%APPDATA%\ProxPilot\config.json`，不保存 secret。未配置或执行 `config unset default-client` 后，默认客户端保持为空，不写入 auto 或任何客户端类型；需要连接内核时自动探测，无法唯一确定可用客户端则报错，提示显式指定。
 
 `--secret` 覆盖目标客户端运行配置中的凭据；`--proxy` 覆盖目标内核提供的 mixed/HTTP/SOCKS 端口。修复系统代理时同时校正目标出口并保留绕过规则，SOCKS 出口不能作为 Windows HTTP 系统代理。策略组不设固定默认值，也不保存默认组。未传 `--group` 时实时读取 `/proxies`，忽略合成的 `GLOBAL` 总览，选择唯一未被其他业务组引用的顶层组；多个顶层组或循环引用时列出可选组，要求 `--group` 显式指定。仅有 `GLOBAL` 时使用它。`watch` 每轮重新读取，显式指定的组始终固定。
 
@@ -165,7 +165,7 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 | `--max-rate <N>` | 不限制 | 节点名称中的倍率上限，未知倍率排除；支持小数 |
 | `--group <名称>` | 实时识别 | 显式指定目标策略组；省略时选择唯一顶层业务组，歧义时列出可选组 |
 | `--url <地址>` | `https://chatgpt.com/` | 测试网址。优选流媒体可配 `--url https://www.youtube.com/`；只测连通性可用 `https://www.gstatic.com/generate_204` |
-| `--client <类型>` | 保存值或 cutecloud | 明确指定 cutecloud、clash-verge、vvcloud 或 auto |
+| `--client <类型>` | 保存值或 auto | 明确指定 cutecloud、clash-verge、vvcloud 或 auto |
 | `--api <地址>` | 目标运行配置 | 内核 external-controller 地址，如 `http://127.0.0.1:9097`。多客户端在线时用它指定目标 |
 | `--secret <值>` | 无 | 内核 API 的鉴权密钥（客户端设置了 `secret` 时必填） |
 | `--proxy <地址>` | 目标内核端口 | 实测流量走的代理出口，按 mixed / HTTP / SOCKS 优先级选择 |

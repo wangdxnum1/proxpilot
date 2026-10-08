@@ -1,6 +1,7 @@
 mod appstate;
 mod checker;
 mod client_config;
+mod core_api;
 mod detect;
 mod http;
 mod mihomo;
@@ -153,8 +154,8 @@ fn print_help() {
     println!("  proxpilot use \"香港 IEPL 01\"");
 }
 
-fn setup(args: &Args) -> Result<(Backend, reqwest::blocking::Client), i32> {
-    let agent = http::api_client().map_err(|e| {
+fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
+    let agent = core_api::CoreApi::new().map_err(|e| {
         ui::fail(&format!("HTTP 客户端初始化失败：{}", e));
         1
     })?;
@@ -180,7 +181,7 @@ fn setup(args: &Args) -> Result<(Backend, reqwest::blocking::Client), i32> {
     Ok((be, agent))
 }
 
-fn cmd_check(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
+fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     if !checker::core_alive(&be.proxy) {
         ui::fail("内核代理端口不通，请确认客户端已启动；若使用的不是 CuteCloud，加 --detect 自动探测或用 --api 指定");
         return 1;
@@ -238,7 +239,7 @@ fn cmd_check(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i3
     }
 }
 
-fn cmd_scan(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
+fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     let proxies = match mihomo::get_proxies(be, agent) {
         Ok(p) => p,
         Err(e) => {
@@ -308,7 +309,7 @@ fn cmd_scan(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32
     0
 }
 
-fn cmd_fix(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
+fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     if args.dry_run {
         ui::warn("dry-run 模式：只探测报告，不切换");
         return cmd_scan(be, agent, args);
@@ -349,7 +350,7 @@ fn cmd_fix(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 
     }
 }
 
-fn cmd_use(be: &Backend, agent: &reqwest::blocking::Client, args: &Args, node: &str) -> i32 {
+fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &str) -> i32 {
     if node.is_empty() {
         ui::fail("用法: proxpilot use <节点名>（节点名含空格请加引号）");
         return 1;
@@ -409,7 +410,7 @@ mod watch_tests {
     }
 }
 
-fn cmd_watch(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
+fn cmd_watch(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     if args.optimize {
         ui::info(&format!(
             "守护模式：每 {} 秒检查一次，启动时及每 {} 秒主动优选，Ctrl+C 退出",

@@ -151,7 +151,7 @@ pub fn scan_concurrency(node_count: usize) -> usize {
 /// 按 CPU 数量并发探测节点可达性，返回 (探测延迟, 节点名) 升序。
 pub fn scan_reachable(
     be: &Backend,
-    agent: &reqwest::blocking::Client,
+    agent: &crate::core_api::CoreApi,
     members: &[String],
     url: &str,
 ) -> Vec<(i64, String)> {
@@ -160,7 +160,7 @@ pub fn scan_reachable(
 
 fn scan_with_concurrency(
     be: &Backend,
-    agent: &reqwest::blocking::Client,
+    agent: &crate::core_api::CoreApi,
     members: &[String],
     url: &str,
     concurrency: usize,
@@ -196,7 +196,7 @@ fn scan_with_concurrency(
 /// 完整优选：探测 → 逐个切换实测 → 停在实测最快的节点。全部失败则恢复原节点。
 pub fn fix_flow(
     be: &Backend,
-    agent: &reqwest::blocking::Client,
+    agent: &crate::core_api::CoreApi,
     args: &Args,
 ) -> Result<String, String> {
     let proxies = mihomo::get_proxies(be, agent)?;
@@ -374,8 +374,9 @@ mod tests {
                 requests
             });
             let backend = Backend {
+                kind: None,
                 client: "test".into(),
-                api,
+                api: api.into(),
                 secret: None,
                 proxy: String::new(),
                 source: "test".into(),
@@ -385,7 +386,7 @@ mod tests {
             let members: Vec<_> = (0..5).map(|i| format!("node{i}")).collect();
             let results = scan_with_concurrency(
                 &backend,
-                &crate::http::api_client().unwrap(),
+                &crate::core_api::CoreApi::new().unwrap(),
                 &members,
                 "http://test.invalid/",
                 2,

@@ -1,5 +1,6 @@
 mod appstate;
 mod checker;
+mod client_config;
 mod detect;
 mod http;
 mod mihomo;

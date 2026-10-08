@@ -22,16 +22,16 @@
 
 ## 用户命令
 
-客户端标识第一期支持 cutecloud、verge、auto；输入不区分大小写，保存与输出使用规范标识。未知标识报错，不静默回退。
+客户端类型第一期支持 cutecloud、clash-verge；auto 为自动选择模式，不是具体客户端类型。输入不区分大小写，保存与输出使用规范标识。未知标识报错，不静默回退。
 
 ```powershell
 # 本次明确指定
-proxpilot check --client verge
-proxpilot scan --client verge --group "策略组名称"
-proxpilot watch --client verge --group "策略组名称"
+proxpilot check --client clash-verge
+proxpilot scan --client clash-verge --group "策略组名称"
+proxpilot watch --client clash-verge --group "策略组名称"
 
 # 保存、查看和清除默认值
-proxpilot config set default-client verge
+proxpilot config set default-client clash-verge
 proxpilot config show
 proxpilot config unset default-client
 
@@ -44,16 +44,19 @@ proxpilot check --detect
 
 # 列出客户端，不切换节点、不调整系统代理
 proxpilot clients
+
+# 显示程序支持的客户端类型及功能，不扫描本机
+proxpilot clients --supported
 ```
 
-config 命令只管理 ProxPilot 自身配置，不连接内核、不改变 CuteCloud/Verge 的设置。clients 是客户端扫描命令；scan 继续表示目标策略组内的节点扫描。
+config 命令只管理 ProxPilot 自身配置，不连接内核、不改变 CuteCloud/Verge 的设置。clients 是客户端扫描命令；clients --supported 从程序内置能力表列出 cutecloud、clash-verge 及各自支持的功能，并单独说明 auto 选择模式，不读取本机客户端配置或连接内核。scan 继续表示目标策略组内的节点扫描。
 
 ## 选择优先级与兼容
 
 普通客户端选择优先级：显式 --client > --detect 自动模式 > 保存的 default-client > CuteCloud 兼容默认值。
 
-- --client verge 与 --detect 同时给出时，显式 verge 生效，不扩大成自动选择。
-- 默认值 cutecloud/verge 是严格选择；目标不运行或不可连接时，给出明确错误，不换用另一客户端。
+- --client clash-verge 与 --detect 同时给出时，显式 clash-verge 生效，不扩大成自动选择。
+- 默认值 cutecloud/clash-verge 是严格选择；目标不运行或不可连接时，给出明确错误，不换用另一客户端。
 - --api 保留为直接指定 HTTP API 的入口，优先于默认目标和自动模式。若同时明确 --client，必须核实其与 API 监听进程相符；不符则报错。无法识别的远程 API 配合具体本机客户端标识时也报错，避免错误读取本机配置和选择记录。
 - --client auto 与 --api 同时给出时以显式 API 为连接目标，并标明识别结果。
 - --secret 优先于目标客户端本地运行配置中的鉴权信息。
@@ -67,7 +70,7 @@ config 命令只管理 ProxPilot 自身配置，不连接内核、不改变 Cute
 ```json
 {
   "schema_version": 1,
-  "default_client": "verge"
+  "default_client": "clash-verge"
 }
 ```
 
@@ -89,7 +92,7 @@ config 命令只管理 ProxPilot 自身配置，不连接内核、不改变 Cute
 6. 多个候选可用且不能唯一匹配时，列出候选并要求 --client 明确选择；不悄悄固定偏好某个客户端。
 7. 都不可用时报告各候选原因，不启动客户端，不改客户端配置。
 
-第一期具体适配 cutecloud/verge。其他 mihomo 客户端仍可通过 --api、--proxy 手动连接；clients 对常见端口的其他内核显示识别结果，但不将其保存为未实现的具体客户端标识。
+第一期具体适配 cutecloud/clash-verge。其他 mihomo 客户端仍可通过 --api、--proxy 手动连接；clients 对常见端口的其他内核显示识别结果，但不将其保存为未实现的具体客户端标识。
 
 ## API 与命名管道传输
 
@@ -136,7 +139,7 @@ config 命令只管理 ProxPilot 自身配置，不连接内核、不改变 Cute
 ## 验收与测试
 
 1. 配置测试：set/show/unset、默认回退、无效配置、不丢未知字段；测试目录不得使用真实 APPDATA 配置。
-2. 选择测试：参数/--detect/保存值优先级、显式目标失败不回退、两客户端同时运行的唯一匹配与歧义处理。
+2. 选择测试：参数/--detect/保存值优先级、显式目标失败不回退、两客户端同时运行的唯一匹配与歧义处理；clients --supported 在没有本机客户端及配置文件时仍能显示支持类型。
 3. API 测试：HTTP 和真实临时 Windows 管道的鉴权、完整/分块/截断响应、超时、空响应、非成功状态，以及中文节点切换请求。
 4. 端口测试：目标 Verge 7897 与系统 CuteCloud 7890 不一致时，实测仍选择 7897；覆盖 --proxy 覆盖、HTTP/SOCKS 回退。
 5. 状态隔离测试：目标 Verge 时不访问或写入 CuteCloud 数据库。

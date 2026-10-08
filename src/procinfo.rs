@@ -190,6 +190,8 @@ pub fn client_display_name(path: &str, process: &str) -> String {
     let l = format!("{} {}", path, process).to_lowercase();
     if l.contains("cutecloud") {
         "CuteCloud".into()
+    } else if l.contains("vvcloud") {
+        "VVCloud".into()
     } else if l.contains("flclash") {
         "FlClash".into()
     } else if l.contains("verge") {
@@ -211,6 +213,21 @@ pub fn client_display_name(path: &str, process: &str) -> String {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn identifies_vvcloud_core_before_generic_mihomo() {
+        assert_eq!(
+            client_display_name(
+                r"C:\Program Files\VVCloud\VVCloudCore.exe",
+                "VVCloudCore.exe"
+            ),
+            "VVCloud"
+        );
+        assert_eq!(
+            client_display_name(r"C:\Program Files\VVCloud\mihomo.exe", "mihomo.exe"),
+            "VVCloud"
+        );
+    }
 
     #[test]
     fn identifies_current_ipv4_listener_and_process_without_commands() {

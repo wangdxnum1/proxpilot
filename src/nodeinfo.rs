@@ -239,8 +239,21 @@ pub fn load_metadata(be: &Backend) -> Metadata {
             return result;
         }
     };
-    let path = paths.runtime(kind);
+    let path = if kind == crate::client_config::ClientKind::VvCloud {
+        // VVCloud 的托管订阅可能加密，不解密账户或凭据文件。
+        let runtime = paths.runtime(kind);
+        if runtime.exists() {
+            runtime
+        } else {
+            paths.vvcloud.join("profiles/-1.yaml")
+        }
+    } else {
+        paths.runtime(kind)
+    };
     load_from_path(&path, &mut result);
+    if kind == crate::client_config::ClientKind::VvCloud && result.nodes.is_empty() {
+        result.notices.push("VVCloud 未提供可读的明文节点配置（托管订阅可能加密）；仅展示内核信息，服务器等字段保持未知".into());
+    }
     result
 }
 fn load_from_path(path: &Path, result: &mut Metadata) {

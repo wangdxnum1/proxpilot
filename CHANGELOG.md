@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 新增 `--client vvcloud` 和默认客户端配置；支持 VVCloud 进程身份校验、自动发现、watch 固定目标及隔离的 SQLite 选择记录同步。加密订阅仅展示内核可读信息。
+
 - 新增 --max-rate 共享倍率限制，scan/fix/watch/nodes/use 排除超限与未知倍率候选。
 - 新增 nodes/info 只读节点协议、配置详情及信息来源，隐藏凭据。
 - 节点筛选排除续费网址、订阅地址等占位条目。

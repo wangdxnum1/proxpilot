@@ -186,6 +186,7 @@ fn cmd_clients(supported: bool) -> Result<(), String> {
     if supported {
         println!("cutecloud    CuteCloud    HTTP API；支持选择记忆同步");
         println!("clash-verge  Clash Verge  命名管道 / HTTP API；仅同步当前内核选择");
+        println!("vvcloud     VVCloud      HTTP API；支持选择记忆同步");
         println!("auto         自动选择    优先匹配已开启的系统代理，否则要求唯一可用内核");
         return Ok(());
     }
@@ -308,7 +309,7 @@ fn print_help() {
     println!("选项:");
     println!("  --group <名称>   策略组名称（未指定时从目标客户端实时识别）");
     println!("  --url <地址>     测试网址（默认 https://chatgpt.com/）");
-    println!("  --client <类型>  cutecloud / clash-verge / auto；覆盖保存的默认客户端");
+    println!("  --client <类型>  cutecloud / clash-verge / vvcloud / auto；覆盖保存的默认客户端");
     println!("  --api <地址>     显式指定 HTTP 内核 API（优先级最高）");
     println!("  --secret <值>    内核 API 的 secret");
     println!("  --proxy <地址>   代理出口（默认读目标内核运行端口）");

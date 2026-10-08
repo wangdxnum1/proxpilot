@@ -9,17 +9,20 @@ use std::path::{Path, PathBuf};
 pub struct DiscoveryPaths {
     pub cutecloud: PathBuf,
     pub clash_verge: PathBuf,
+    pub vvcloud: PathBuf,
 }
 impl DiscoveryPaths {
     pub fn current() -> Result<Self, String> {
         let base = PathBuf::from(std::env::var_os("APPDATA").ok_or("APPDATA 未设置")?);
         Ok(Self {
+            vvcloud: base.join("VVCloud/VVCloud"),
             cutecloud: base.join("CuteCloud/CuteCloud"),
             clash_verge: base.join("io.github.clash-verge-rev.clash-verge-rev"),
         })
     }
     pub(crate) fn runtime(&self, kind: ClientKind) -> PathBuf {
         match kind {
+            ClientKind::VvCloud => self.vvcloud.join("config.yaml"),
             ClientKind::CuteCloud => self.cutecloud.join("config.yaml"),
             ClientKind::ClashVerge => {
                 let runtime = self.clash_verge.join("clash-verge.yaml");
@@ -41,6 +44,7 @@ fn kind_of(info: crate::procinfo::ClientInfo) -> Option<ClientKind> {
     match info.name.as_str() {
         "CuteCloud" => Some(ClientKind::CuteCloud),
         "Clash Verge" => Some(ClientKind::ClashVerge),
+        "VVCloud" => Some(ClientKind::VvCloud),
         _ => None,
     }
 }
@@ -124,10 +128,59 @@ pub fn parse_runtime(kind: ClientKind, text: &str) -> Result<Backend, String> {
         alternatives: vec![],
     })
 }
+const CONTROLLER_PORTS: [u16; 6] = [9090, 9097, 9091, 9094, 19090, 28090];
+
+fn unique_controller(
+    kind: ClientKind,
+    candidates: &[(u16, Option<ClientKind>)],
+) -> Result<u16, String> {
+    let ports: Vec<_> = candidates
+        .iter()
+        .filter(|(_, actual)| *actual == Some(kind))
+        .map(|(port, _)| *port)
+        .collect();
+    match ports.as_slice() {
+        [port] => Ok(*port),
+        [] => Err(format!(
+            "未发现 {} 的控制接口；请确认启动或用 --api 指定",
+            kind.display_name()
+        )),
+        _ => Err(format!(
+            "{} 存在多个控制接口，请用 --api 指定",
+            kind.display_name()
+        )),
+    }
+}
+
 fn configured(kind: ClientKind, paths: &DiscoveryPaths) -> Result<Backend, String> {
     let path = paths.runtime(kind);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取 {} 失败：{}", path.display(), e))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if kind == ClientKind::VvCloud && e.kind() == std::io::ErrorKind::NotFound => {
+            // VVCloud 管理加密配置；只探测经进程身份确认的本机控制端口。
+            let candidates: Vec<_> = CONTROLLER_PORTS
+                .iter()
+                .map(|port| {
+                    (
+                        *port,
+                        identify_endpoint(&format!("http://127.0.0.1:{}", port)),
+                    )
+                })
+                .collect();
+            let port = unique_controller(kind, &candidates)?;
+            return Ok(Backend {
+                kind: Some(kind),
+                client: kind.display_name().into(),
+                api: format!("http://127.0.0.1:{}", port).into(),
+                secret: None,
+                proxy: String::new(),
+                source: "VVCloud 进程监听端口".into(),
+                version: None,
+                alternatives: vec![],
+            });
+        }
+        Err(e) => return Err(format!("读取 {} 失败：{}", path.display(), e)),
+    };
     let mut be = parse_runtime(kind, &text)?;
     be.source = path.display().to_string();
     Ok(be)
@@ -173,7 +226,11 @@ fn discover_with_secret(
     secret: Option<&str>,
 ) -> Vec<DiscoveryRecord> {
     let mut records = Vec::new();
-    for kind in [ClientKind::CuteCloud, ClientKind::ClashVerge] {
+    for kind in [
+        ClientKind::CuteCloud,
+        ClientKind::ClashVerge,
+        ClientKind::VvCloud,
+    ] {
         match configured(kind, paths).and_then(|mut be| {
             if let Some(secret) = secret {
                 be.secret = Some(secret.into());
@@ -192,11 +249,15 @@ fn discover_with_secret(
             }),
         }
     }
-    for port in [9090, 9097, 9091, 9094, 19090, 28090] {
+    for port in CONTROLLER_PORTS {
         if crate::procinfo::find_listener_pid(port).is_none() {
             continue;
         }
         let kind = identify(port);
+        // VVCloud 的正式发现已处理唯一性与配置错误，通用扫描不能绕过它。
+        if kind == Some(ClientKind::VvCloud) {
+            continue;
+        }
         if kind.is_some_and(|k| {
             records
                 .iter()
@@ -447,6 +508,42 @@ mod tests {
     }
 
     #[test]
+    fn vvcloud_controller_requires_unique_matching_identity() {
+        let candidates = [
+            (9090, Some(ClientKind::CuteCloud)),
+            (9091, Some(ClientKind::VvCloud)),
+            (9097, Some(ClientKind::ClashVerge)),
+        ];
+        assert_eq!(
+            unique_controller(ClientKind::VvCloud, &candidates).unwrap(),
+            9091
+        );
+        assert!(unique_controller(ClientKind::VvCloud, &candidates[..1]).is_err());
+        assert!(unique_controller(
+            ClientKind::VvCloud,
+            &[
+                (9090, Some(ClientKind::VvCloud)),
+                (9091, Some(ClientKind::VvCloud))
+            ]
+        )
+        .is_err());
+        assert!(validate_explicit_identity(
+            Some(ClientKind::VvCloud),
+            true,
+            Some(ClientKind::CuteCloud)
+        )
+        .is_err());
+        let records = vec![
+            record(ClientKind::VvCloud, 7890),
+            record(ClientKind::ClashVerge, 7897),
+        ];
+        assert_eq!(
+            select_auto(&records, Some("127.0.0.1:7890")).unwrap().kind,
+            Some(ClientKind::VvCloud)
+        );
+    }
+
+    #[test]
     fn verge_runtime_pipe_and_proxy_override_stale_tcp() {
         let be = parse_runtime(ClientKind::ClashVerge, "mixed-port: 7897\nexternal-controller: ''\nexternal-controller-pipe: '\\\\.\\pipe\\test-runtime'\nsecret: 'test-secret'\n").unwrap();
         assert_eq!(
@@ -572,6 +669,7 @@ mod refresh_tests {
                 .as_nanos()
         ));
         let paths = DiscoveryPaths {
+            vvcloud: root.join("vv"),
             cutecloud: root.join("cute"),
             clash_verge: root.join("verge"),
         };
@@ -594,6 +692,41 @@ mod refresh_tests {
         assert!(refresh_candidate(&pinned, &args, &paths).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn vvcloud_watch_refreshes_its_own_runtime_and_rejects_invalid_config() {
+        let root = std::env::temp_dir().join(format!(
+            "proxpilot-vv-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = DiscoveryPaths {
+            cutecloud: root.join("cute"),
+            clash_verge: root.join("verge"),
+            vvcloud: root.join("vv"),
+        };
+        std::fs::create_dir_all(&paths.vvcloud).unwrap();
+        let file = paths.runtime(ClientKind::VvCloud);
+        std::fs::write(&file, "external-controller: 127.0.0.1:19090\nsecret: old\n").unwrap();
+        let pinned = configured(ClientKind::VvCloud, &paths).unwrap();
+        let args = crate::parse_args_from([
+            "watch".to_string(),
+            "--secret".to_string(),
+            "override".to_string(),
+        ])
+        .unwrap();
+        std::fs::write(&file, "external-controller: 127.0.0.1:9091\nsecret: new\n").unwrap();
+        let next = refresh_candidate(&pinned, &args, &paths).unwrap();
+        assert_eq!(next.kind, Some(ClientKind::VvCloud));
+        assert_eq!(next.api, ApiEndpoint::Http("http://127.0.0.1:9091".into()));
+        assert_eq!(next.secret.as_deref(), Some("override"));
+        std::fs::write(&file, "external-controller: ''\n").unwrap();
+        assert!(refresh_candidate(&pinned, &args, &paths).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn loopback_addresses_are_distinct() {
         assert!(!proxy_matches("http://127.0.0.1:7897", "127.0.0.2:7897"));

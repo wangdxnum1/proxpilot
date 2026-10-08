@@ -1,7 +1,7 @@
 # ProxPilot · 代理领航员
 
 > 节点检测 · 优选切换 · 守护运行
-> 支持 Clash / mihomo 系客户端（CuteCloud、FlClash、Clash Verge、Clash for Windows 等）
+> 支持 Clash / mihomo 系客户端（CuteCloud、VVCloud、FlClash、Clash Verge、Clash for Windows 等）
 
 ProxPilot 是一个 Windows 命令行工具，用于解决 Clash 系代理客户端的常见痛点：
 
@@ -41,13 +41,15 @@ proxpilot watch     :: 守护模式：保持可用节点，坏了自动修
 
 ## 客户端选择与配置
 
-内置适配 `cutecloud`、`clash-verge`，`auto` 是自动选择模式。Clash Verge 优先读取运行配置中的命名管道，支持带 secret 的控制接口。其他兼容内核可通过 `--api` 指定 HTTP 接口。
+内置适配 `cutecloud`、`clash-verge`、`vvcloud`，`auto` 是自动选择模式。Clash Verge 优先读取运行配置中的命名管道，支持带 secret 的控制接口。VVCloud 没有明文运行配置时，校验进程身份后探测常见控制端口；自定义端口可用 `--api` 指定。托管订阅可能加密，节点详情仅使用可读的明文配置和内核信息，缺失字段保持未知。其他兼容内核可通过 `--api` 指定 HTTP 接口。
 
 ```powershell
 proxpilot clients --supported
 proxpilot clients
 proxpilot check --client clash-verge --group VVCloud --dry-run
 proxpilot scan --client clash-verge --group VVCloud
+proxpilot check --client vvcloud --dry-run
+proxpilot config set default-client vvcloud
 proxpilot config set default-client clash-verge
 proxpilot config show
 proxpilot config set default-client auto
@@ -58,7 +60,7 @@ proxpilot config unset default-client
 
 `--secret` 覆盖目标客户端运行配置中的凭据；`--proxy` 覆盖目标内核提供的 mixed/HTTP/SOCKS 端口。修复系统代理时同时校正目标出口并保留绕过规则，SOCKS 出口不能作为 Windows HTTP 系统代理。策略组不设固定默认值，也不保存默认组。未传 `--group` 时实时读取 `/proxies`，忽略合成的 `GLOBAL` 总览，选择唯一未被其他业务组引用的顶层组；多个顶层组或循环引用时列出可选组，要求 `--group` 显式指定。仅有 `GLOBAL` 时使用它。`watch` 每轮重新读取，显式指定的组始终固定。
 
-Clash Verge 的节点切换作用于当前内核；不修改由 GUI 缓存管理的 `profiles.yaml`，重启后的持久化由 Clash Verge 管理。CuteCloud 才会同步其 SQLite 选择记忆。`watch` 固定启动时选定的客户端，并在每个周期重新读取该客户端运行配置，以适应重启后命名管道变化。
+Clash Verge 的节点切换作用于当前内核；不修改由 GUI 缓存管理的 `profiles.yaml`，重启后的持久化由 Clash Verge 管理。CuteCloud 和 VVCloud 会按客户端隔离，同步已记录该策略组的 SQLite 选择记忆；客户端重启后的行为仍由其自身管理。`watch` 固定启动时选定的客户端，并在每个周期重新读取该客户端运行配置，以适应重启后命名管道变化。
 
 `clients`、`scan`、`config show` 及 `check --dry-run` 不改变系统代理或当前节点。`use/fix/watch --dry-run` 也不切换节点。
 
@@ -163,7 +165,7 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 | `--max-rate <N>` | 不限制 | 节点名称中的倍率上限，未知倍率排除；支持小数 |
 | `--group <名称>` | 实时识别 | 显式指定目标策略组；省略时选择唯一顶层业务组，歧义时列出可选组 |
 | `--url <地址>` | `https://chatgpt.com/` | 测试网址。优选流媒体可配 `--url https://www.youtube.com/`；只测连通性可用 `https://www.gstatic.com/generate_204` |
-| `--client <类型>` | 保存值或 cutecloud | 明确指定 cutecloud、clash-verge 或 auto |
+| `--client <类型>` | 保存值或 cutecloud | 明确指定 cutecloud、clash-verge、vvcloud 或 auto |
 | `--api <地址>` | 目标运行配置 | 内核 external-controller 地址，如 `http://127.0.0.1:9097`。多客户端在线时用它指定目标 |
 | `--secret <值>` | 无 | 内核 API 的鉴权密钥（客户端设置了 `secret` 时必填） |
 | `--proxy <地址>` | 目标内核端口 | 实测流量走的代理出口，按 mixed / HTTP / SOCKS 优先级选择 |
@@ -234,7 +236,7 @@ proxpilot/
     ├── mihomo.rs        Clash/mihomo API 客户端
     ├── http.rs          reqwest 内核客户端与 wreq 浏览器指纹实测
     ├── checker.rs       节点探测、实测验证、优选切换
-    ├── appstate.rs      同步 CuteCloud 选择记录
+    ├── appstate.rs      同步 CuteCloud / VVCloud 选择记录
     ├── sysproxy.rs      系统代理（注册表 + WinINET）
     └── ui.rs            彩色输出
 ```

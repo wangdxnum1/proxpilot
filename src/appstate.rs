@@ -1,51 +1,54 @@
-//! 同步客户端自己的选择记忆（CuteCloud：database.sqlite profiles.selected_map）。
+//! 同步 CuteCloud / VVCloud 的本地 database.sqlite profiles.selected_map。
 //!
-//! 客户端 GUI 显示的"当前节点"和它反向覆盖内核选择的依据都来自这份记忆，
-//! 切换内核后把它一并更新，界面与内核才不会长期脱节。
+//! 切换内核后尽力更新已有记录；GUI 和重启持久化的实际行为由客户端管理。
 
 use rusqlite::Connection;
 use std::path::PathBuf;
 
 use crate::ui;
 
-fn db_path() -> Option<PathBuf> {
-    let base = std::env::var("APPDATA").ok()?;
-    let p = PathBuf::from(base)
-        .join("CuteCloud")
-        .join("CuteCloud")
-        .join("database.sqlite");
-    if p.exists() {
-        Some(p)
-    } else {
-        None
-    }
+fn db_path(kind: crate::client_config::ClientKind, base: &std::path::Path) -> Option<PathBuf> {
+    use crate::client_config::ClientKind;
+    let directory = match kind {
+        ClientKind::CuteCloud => "CuteCloud/CuteCloud",
+        ClientKind::VvCloud => "VVCloud/VVCloud",
+        ClientKind::ClashVerge => return None,
+    };
+    let path = base.join(directory).join("database.sqlite");
+    path.is_file().then_some(path)
 }
 
-/// 把指定组在客户端记忆里的选中节点同步为 node（best-effort，失败不影响切换本身）
+/// 同步目标客户端的选择记录；失败不影响已完成的内核切换。
 pub fn sync_selection(be: &crate::Backend, group: &str, node: &str) {
-    if be.kind != Some(crate::client_config::ClientKind::CuteCloud) {
-        if be.kind == Some(crate::client_config::ClientKind::ClashVerge) {
-            ui::dim(
-                "Clash Verge：当前内核选择已更新；重启后的持久化由客户端管理，不写 profiles.yaml",
-            );
-        }
+    let Some(kind) = be.kind else {
+        return;
+    };
+    if kind == crate::client_config::ClientKind::ClashVerge {
+        ui::dim("Clash Verge：当前内核选择已更新；重启后的持久化由客户端管理，不写 profiles.yaml");
         return;
     }
-    let Some(path) = db_path() else {
-        return; // 非 CuteCloud 客户端或未安装，静默跳过
+    let Some(base) = std::env::var_os("APPDATA") else {
+        return;
     };
-    let res = sync_database(&path, group, node);
-    match res {
-        Ok(true) => ui::dim(
-            "已同步客户端的选择记忆；CuteCloud 重启后界面显示将与实际一致，且不会再用旧节点覆盖",
-        ),
-        Ok(false) => ui::dim("未找到记录此策略组的 CuteCloud profile，未同步选择记忆"),
+    let Some(path) = db_path(kind, std::path::Path::new(&base)) else {
+        return;
+    };
+    match sync_database(&path, group, node) {
+        Ok(true) => ui::dim(&format!(
+            "已同步 {} 的本地选择记录；客户端重启后的行为由其自身管理",
+            kind.display_name()
+        )),
+        Ok(false) => ui::dim(&format!(
+            "未找到记录此策略组的 {} profile，未同步选择记忆",
+            kind.display_name()
+        )),
         Err(e) => ui::dim(&format!("同步客户端记忆失败（不影响切换本身）：{}", e)),
     }
 }
 
 fn sync_database(path: &std::path::Path, group: &str, node: &str) -> Result<bool, String> {
-    let con = Connection::open(&path).map_err(|e| e.to_string())?;
+    let con = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| e.to_string())?;
     con.busy_timeout(std::time::Duration::from_secs(2))
         .map_err(|e| e.to_string())?;
     let mut stmt = con
@@ -88,6 +91,40 @@ fn sync_database(path: &std::path::Path, group: &str, node: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selection_database_is_isolated_by_client() {
+        use crate::client_config::ClientKind;
+        let root = std::env::temp_dir().join(format!(
+            "proxpilot-client-db-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for dir in ["CuteCloud/CuteCloud", "VVCloud/VVCloud"] {
+            let path = root.join(dir).join("database.sqlite");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let con = Connection::open(path).unwrap();
+            con.execute_batch(r#"CREATE TABLE profiles(id INTEGER, selected_map TEXT, current_group_name TEXT); INSERT INTO profiles VALUES(1, '{"Proxy":"old"}', 'Proxy');"#).unwrap();
+        }
+        let vv = db_path(ClientKind::VvCloud, &root).unwrap();
+        let cute = db_path(ClientKind::CuteCloud, &root).unwrap();
+        assert_ne!(vv, cute);
+        assert!(sync_database(&vv, "Proxy", "new").unwrap());
+        let con = Connection::open(cute).unwrap();
+        let saved: String = con
+            .query_row("SELECT selected_map FROM profiles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&saved).unwrap()["Proxy"],
+            "old"
+        );
+        assert!(db_path(ClientKind::ClashVerge, &root).is_none());
+        drop(con);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn updates_only_the_profile_with_matching_group() {
         let path = std::env::temp_dir().join(format!(

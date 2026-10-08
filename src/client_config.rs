@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub enum ClientKind {
     CuteCloud,
     ClashVerge,
+    VvCloud,
 }
 
 impl ClientKind {
@@ -16,12 +17,14 @@ impl ClientKind {
         match self {
             Self::CuteCloud => "cutecloud",
             Self::ClashVerge => "clash-verge",
+            Self::VvCloud => "vvcloud",
         }
     }
     pub fn display_name(self) -> &'static str {
         match self {
             Self::CuteCloud => "CuteCloud",
             Self::ClashVerge => "Clash Verge",
+            Self::VvCloud => "VVCloud",
         }
     }
 }
@@ -37,9 +40,10 @@ impl ClientSelection {
         match value.to_ascii_lowercase().as_str() {
             "cutecloud" => Ok(Self::Explicit(ClientKind::CuteCloud)),
             "clash-verge" => Ok(Self::Explicit(ClientKind::ClashVerge)),
+            "vvcloud" => Ok(Self::Explicit(ClientKind::VvCloud)),
             "auto" => Ok(Self::Auto),
             _ => Err(
-                "客户端类型无效；支持 cutecloud、clash-verge、auto（用 clients --supported 查看）"
+                "客户端类型无效；支持 cutecloud、clash-verge、vvcloud、auto（用 clients --supported 查看）"
                     .into(),
             ),
         }
@@ -174,6 +178,10 @@ mod tests {
             ClientSelection::parse("auto").unwrap(),
             ClientSelection::Auto
         );
+        assert_eq!(
+            ClientSelection::parse("VVCLOUD").unwrap(),
+            ClientSelection::Explicit(ClientKind::VvCloud)
+        );
         assert!(ClientSelection::parse("verge").is_err());
         assert!(ClientSelection::parse("unknown").is_err());
     }
@@ -192,6 +200,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         assert_eq!(v["future"]["value"], true);
         assert!(show_config(&p).unwrap().contains("clash-verge"));
+        save_default(&p, Some(ClientSelection::Explicit(ClientKind::VvCloud))).unwrap();
+        assert_eq!(
+            load_default(&p).unwrap(),
+            Some(ClientSelection::Explicit(ClientKind::VvCloud))
+        );
         save_default(&p, None).unwrap();
         assert_eq!(load_default(&p).unwrap(), None);
         fs::remove_dir_all(p.parent().unwrap()).unwrap();

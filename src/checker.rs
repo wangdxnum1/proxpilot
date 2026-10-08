@@ -139,24 +139,45 @@ pub fn is_real_node(info: &ProxyInfo, name: &str) -> bool {
     !SKIP_TYPES.contains(&info.ptype.as_str()) && !FAKE_NODES.iter().any(|f| name.contains(f))
 }
 
-/// 并发（8 路）探测节点可达性，返回 (探测延迟, 节点名) 升序
+/// 可用逻辑 CPU 数量的两倍，线程数不超过待测节点数。
+pub fn scan_concurrency(node_count: usize) -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_mul(2)
+        .min(node_count)
+}
+
+/// 按 CPU 数量并发探测节点可达性，返回 (探测延迟, 节点名) 升序。
 pub fn scan_reachable(
     be: &Backend,
     agent: &reqwest::blocking::Client,
     members: &[String],
     url: &str,
 ) -> Vec<(i64, String)> {
+    scan_with_concurrency(be, agent, members, url, scan_concurrency(members.len()))
+}
+
+fn scan_with_concurrency(
+    be: &Backend,
+    agent: &reqwest::blocking::Client,
+    members: &[String],
+    url: &str,
+    concurrency: usize,
+) -> Vec<(i64, String)> {
     let total = members.len();
+    let next = AtomicUsize::new(0);
     let done = Arc::new(AtomicUsize::new(0));
-    let spinner = ui::Spinner::start(&format!("并发探测 {} 个节点...", total));
+    let spinner = ui::Spinner::start(&format!("{} 路并发探测 {} 个节点...", concurrency, total));
     let reachable: Mutex<Vec<(i64, String)>> = Mutex::new(Vec::new());
     thread::scope(|s| {
-        for chunk in members.chunks(8) {
+        for _ in 0..concurrency {
+            let next = &next;
             let reachable = &reachable;
             let done = &done;
             let spinner = &spinner;
             s.spawn(move || {
-                for name in chunk {
+                while let Some(name) = members.get(next.fetch_add(1, Ordering::Relaxed)) {
                     if let Some(d) = mihomo::probe_delay(be, agent, name, url, 4000) {
                         reachable.lock().unwrap().push((d, name.clone()));
                     }
@@ -207,7 +228,11 @@ pub fn fix_flow(
             90_000
         }
     });
-    ui::info(&format!("组内真实节点 {} 个，8 路并发探测可达性...", total));
+    ui::info(&format!(
+        "组内真实节点 {} 个，{} 路并发探测可达性...",
+        total,
+        scan_concurrency(total)
+    ));
 
     let reachable = scan_reachable(be, agent, &members, &args.url);
     ui::info(&format!("探测完成：可达 {}/{}", reachable.len(), total));
@@ -295,4 +320,89 @@ pub fn fix_flow(
         ui::dim(&format!("最优实测延迟 {:.2}s", best_t));
     }
     Ok(best_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::test_support::{accept, listener, read_request};
+    use std::io::Write;
+    use std::time::Instant;
+
+    #[test]
+    fn scan_workers_obey_limit_and_process_every_node_once() {
+        let listener = listener();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let first_pair = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let mut requests = Vec::new();
+                thread::scope(|handlers| {
+                    let mut tasks = Vec::new();
+                    for index in 0..5 {
+                        let mut stream = accept(&listener);
+                        let active = &active;
+                        let peak = &peak;
+                        let first_pair = &first_pair;
+                        tasks.push(handlers.spawn(move || {
+                            let request = read_request(&mut stream);
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(current, Ordering::SeqCst);
+                            if index < 2 {
+                                first_pair.fetch_add(1, Ordering::SeqCst);
+                                let start = Instant::now();
+                                while first_pair.load(Ordering::SeqCst) < 2 {
+                                    assert!(start.elapsed() < Duration::from_secs(5), "second concurrent request did not arrive");
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(20));
+                            // 第三个响应是不可达节点，其余节点按延迟排序。
+                            let delay = if index == 2 { 0 } else { 5 - index };
+                            let body = format!(r#"{{"delay":{delay}}}"#);
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                            request
+                        }));
+                    }
+                    for task in tasks {
+                        requests.push(task.join().unwrap());
+                    }
+                });
+                requests
+            });
+            let backend = Backend {
+                client: "test".into(),
+                api,
+                secret: None,
+                proxy: String::new(),
+                source: "test".into(),
+                version: None,
+                alternatives: Vec::new(),
+            };
+            let members: Vec<_> = (0..5).map(|i| format!("node{i}")).collect();
+            let results = scan_with_concurrency(
+                &backend,
+                &crate::http::api_client().unwrap(),
+                &members,
+                "http://test.invalid/",
+                2,
+            );
+            assert_eq!(peak.load(Ordering::SeqCst), 2);
+            assert_eq!(results.len(), 4);
+            assert!(results.windows(2).all(|pair| pair[0] <= pair[1]));
+            let requests = server.join().unwrap();
+            for member in members {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|r| r.contains(&format!("/proxies/{member}/delay?")))
+                        .count(),
+                    1
+                );
+            }
+        });
+    }
 }

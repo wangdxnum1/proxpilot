@@ -27,6 +27,7 @@ pub struct Args {
     pub dry_run: bool,
     pub interval: u64,
     pub reopt: u64,
+    pub optimize: bool,
     pub detect: bool,
 }
 
@@ -53,6 +54,7 @@ fn parse_args() -> Args {
     let mut dry_run = false;
     let mut interval = 300u64;
     let mut reopt = 7200u64;
+    let mut optimize = false;
     let mut detect = false;
 
     while let Some(a) = it.next() {
@@ -66,6 +68,7 @@ fn parse_args() -> Args {
             "--samples" => samples = it.next().and_then(|v| v.parse().ok()).unwrap_or(samples),
             "--interval" => interval = it.next().and_then(|v| v.parse().ok()).unwrap_or(interval),
             "--reopt" => reopt = it.next().and_then(|v| v.parse().ok()).unwrap_or(reopt),
+            "--optimize" => optimize = true,
             "--dry-run" => dry_run = true,
             "--detect" => detect = true,
             "-h" | "--help" => cmd = Cmd::Help,
@@ -98,6 +101,7 @@ fn parse_args() -> Args {
         dry_run,
         interval,
         reopt,
+        optimize,
         detect,
     }
 }
@@ -117,7 +121,7 @@ fn print_help() {
     println!("  scan           探测组内所有节点的可达性（不切换）");
     println!("  fix            优选：探测 → 真实验证 → 切到实测最快的节点");
     println!("  use <节点>     手动切换到指定节点并验证");
-    println!("  watch          守护模式：定时检查，坏了自动修，定期重新优选");
+    println!("  watch          守护模式：保持可用节点，坏了自动修；加 --optimize 主动优选");
     println!();
     println!("选项:");
     println!("  --group <名称>   策略组名称（默认 AI服务）");
@@ -128,7 +132,8 @@ fn print_help() {
     println!("  --top <N>        优选时验证前 N 个候选（默认 12）");
     println!("  --samples <N>    每个节点实测次数（默认 2，全部 200 才通过）");
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
-    println!("  --reopt <秒>     watch 定时优选间隔（默认 7200）");
+    println!("  --optimize      watch 启动时及定时主动优选（默认关闭）");
+    println!("  --reopt <秒>     --optimize 的定时优选间隔（默认 7200）");
     println!("  --dry-run        只探测报告，不切换");
     println!(
         "  --detect         自动探测本机客户端与端口（默认不探测、直接使用 CuteCloud，速度更快）"
@@ -143,6 +148,7 @@ fn print_help() {
     println!("  proxpilot fix");
     println!("  proxpilot fix --group 流媒体 --url https://www.youtube.com/");
     println!("  proxpilot watch --interval 180");
+    println!("  proxpilot watch --optimize --reopt 7200");
     println!("  proxpilot use \"香港 IEPL 01\"");
 }
 
@@ -255,9 +261,10 @@ fn cmd_scan(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32
         }
     }
     ui::info(&format!(
-        "组「{}」共 {} 个真实节点，8 路并发探测...",
+        "组「{}」共 {} 个真实节点，{} 路并发探测...",
         args.group,
-        members.len()
+        members.len(),
+        checker::scan_concurrency(members.len())
     ));
     let reachable = checker::scan_reachable(be, agent, &members, &args.url);
     println!();
@@ -270,9 +277,32 @@ fn cmd_scan(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32
         reachable.len(),
         members.len()
     ));
+    const LOW_LATENCY_MS: i64 = 200;
     for (d, n) in reachable.iter().take(30) {
-        println!("      {} {:>5}ms  {}", "✔".green(), d, n);
+        let low_latency = *d <= LOW_LATENCY_MS;
+        let row = format!(
+            "      ✔ {:>5}ms  {}{}",
+            d,
+            n,
+            if low_latency { "  [低延迟]" } else { "" }
+        );
+        let row = if low_latency {
+            row.cyan().bold()
+        } else {
+            row.normal()
+        };
+        if group.now.as_deref() == Some(n.as_str()) {
+            println!("{}  {}", row, "[当前]".yellow());
+        } else {
+            println!("{}", row);
+        }
     }
+    println!(
+        "  标识：{} = 探测延迟 ≤ {}ms；{} = 当前选中节点",
+        "[低延迟]".cyan().bold(),
+        LOW_LATENCY_MS,
+        "[当前]".yellow()
+    );
     ui::dim("提示：可达 ≠ 能打开网页，IP 是否被风控要用 proxpilot fix 实测验证");
     0
 }
@@ -352,12 +382,45 @@ fn cmd_use(be: &Backend, agent: &reqwest::blocking::Client, args: &Args, node: &
     }
 }
 
+fn reoptimization_due(enabled: bool, elapsed: Option<Duration>, interval: u64) -> bool {
+    enabled && elapsed.map_or(true, |elapsed| elapsed.as_secs() >= interval)
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    #[test]
+    fn default_watch_never_proactively_optimizes() {
+        for elapsed in [None, Some(Duration::ZERO), Some(Duration::from_secs(86_400))] {
+            assert!(!reoptimization_due(false, elapsed, 7200));
+            assert!(!reoptimization_due(false, elapsed, 0));
+        }
+    }
+
+    #[test]
+    fn enabled_watch_optimizes_at_startup_and_after_interval() {
+        assert!(reoptimization_due(true, None, 7200));
+        assert!(!reoptimization_due(true, Some(Duration::ZERO), 7200));
+        assert!(!reoptimization_due(true, Some(Duration::from_secs(7199)), 7200));
+        assert!(reoptimization_due(true, Some(Duration::from_secs(7200)), 7200));
+        assert!(reoptimization_due(true, Some(Duration::from_secs(7201)), 7200));
+    }
+}
+
 fn cmd_watch(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i32 {
-    ui::info(&format!(
-        "守护模式：每 {} 秒检查一次，每 {} 秒重新优选，Ctrl+C 退出",
-        args.interval, args.reopt
-    ));
-    let mut last_opt = Instant::now() - Duration::from_secs(args.reopt + 1);
+    if args.optimize {
+        ui::info(&format!(
+            "守护模式：每 {} 秒检查一次，启动时及每 {} 秒主动优选，Ctrl+C 退出",
+            args.interval, args.reopt
+        ));
+    } else {
+        ui::info(&format!(
+            "守护模式：每 {} 秒检查一次，保持可用节点，仅故障时优选，Ctrl+C 退出",
+            args.interval
+        ));
+    }
+    let mut last_opt: Option<Instant> = None;
     let mut cycle: u64 = 0;
     loop {
         cycle += 1;
@@ -385,18 +448,22 @@ fn cmd_watch(be: &Backend, agent: &reqwest::blocking::Client, args: &Args) -> i3
                 last_code = c;
             }
         }
-        let due = last_opt.elapsed().as_secs() >= args.reopt;
+        let due = reoptimization_due(args.optimize, last_opt.map(|t| t.elapsed()), args.reopt);
         if broken || due {
             let reason = if broken {
                 format!("检测到 {} 不可访问（HTTP {}）", args.url, last_code)
             } else {
-                "到达定时优选时间".to_string()
+                if last_opt.is_none() {
+                    "启动主动优选".to_string()
+                } else {
+                    "到达定时优选时间".to_string()
+                }
             };
             ui::warn(&format!("[周期 {}] {}，开始优选...", cycle, reason));
             if let Err(e) = checker::fix_flow(be, agent, args) {
                 ui::fail(&e);
             }
-            last_opt = Instant::now();
+            last_opt = Some(Instant::now());
         } else {
             ui::dim(&format!("[周期 {}] 正常（HTTP 200）", cycle));
         }

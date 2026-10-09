@@ -69,6 +69,14 @@ pub fn get_version(be: &Backend, api: &crate::core_api::CoreApi) -> Result<Strin
         .ok_or_else(|| "响应不是有效的 mihomo 版本信息".into())
 }
 
+pub fn get_mode(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
+    api_json(be, api, "/configs")?
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(|mode| mode.to_ascii_lowercase())
+        .ok_or("内核未提供代理模式".into())
+}
+
 pub fn get_runtime_proxy(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
     let value = api_json(be, api, "/configs")?;
     for (name, scheme) in [

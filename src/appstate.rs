@@ -18,6 +18,39 @@ fn db_path(kind: crate::client_config::ClientKind, base: &std::path::Path) -> Op
     path.is_file().then_some(path)
 }
 
+fn active_profile_id(directory: &std::path::Path) -> Option<i64> {
+    let prefs: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(directory.join("shared_preferences.json")).ok()?,
+    )
+    .ok()?;
+    let config: serde_json::Value =
+        serde_json::from_str(prefs.get("flutter.config")?.as_str()?).ok()?;
+    config.get("currentProfileId")?.as_i64()
+}
+
+/// Read only the active subscription; the caller must validate this group
+/// against the target kernel's live /proxies response before using it.
+pub fn current_group(be: &crate::Backend) -> Option<String> {
+    let base = std::env::var_os("APPDATA")?;
+    let path = db_path(be.kind?, std::path::Path::new(&base))?;
+    current_group_from_database(&path)
+}
+
+fn current_group_from_database(path: &std::path::Path) -> Option<String> {
+    let profile = active_profile_id(path.parent()?)?;
+    let con = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    con.busy_timeout(std::time::Duration::from_millis(200))
+        .ok()?;
+    let group: Option<String> = con
+        .query_row(
+            "SELECT current_group_name FROM profiles WHERE id = ?1",
+            [profile],
+            |r| r.get(0),
+        )
+        .ok()?;
+    group.filter(|g| !g.trim().is_empty())
+}
+
 /// 同步目标客户端的选择记录；失败不影响已完成的内核切换。
 pub fn sync_selection(be: &crate::Backend, group: &str, node: &str) {
     let Some(kind) = be.kind else {
@@ -47,15 +80,22 @@ pub fn sync_selection(be: &crate::Backend, group: &str, node: &str) {
 }
 
 fn sync_database(path: &std::path::Path, group: &str, node: &str) -> Result<bool, String> {
+    let directory = path.parent().ok_or("数据库目录无效")?;
+    let profile = active_profile_id(directory);
+    // When preferences exist, never fall back to another subscription if
+    // the active profile cannot be read.
+    if directory.join("shared_preferences.json").exists() && profile.is_none() {
+        return Ok(false);
+    }
     let con = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|e| e.to_string())?;
     con.busy_timeout(std::time::Duration::from_secs(2))
         .map_err(|e| e.to_string())?;
     let mut stmt = con
-        .prepare("SELECT id, selected_map FROM profiles")
+        .prepare("SELECT id, selected_map FROM profiles WHERE (?1 IS NULL OR id = ?1)")
         .map_err(|e| e.to_string())?;
     let rows: Vec<(i64, String)> = stmt
-        .query_map([], |r| {
+        .query_map([profile], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -91,6 +131,65 @@ fn sync_database(path: &std::path::Path, group: &str, node: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn current_group_and_sync_follow_active_profile_without_cross_subscription_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "proxpilot-active-group-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("database.sqlite");
+        let prefs = root.join("shared_preferences.json");
+        let write_profile = |id| {
+            std::fs::write(
+                &prefs,
+                serde_json::json!({
+                    "flutter.config": serde_json::json!({"currentProfileId":id}).to_string()
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let con = Connection::open(&path).unwrap();
+        con.execute_batch("CREATE TABLE profiles(id INTEGER, current_group_name TEXT, selected_map TEXT); INSERT INTO profiles VALUES(1,'Other','{\"Shared\":\"old1\"}'); INSERT INTO profiles VALUES(2,'Shared','{\"Shared\":\"old2\"}');").unwrap();
+        write_profile(2);
+        assert_eq!(
+            current_group_from_database(&path).as_deref(),
+            Some("Shared")
+        );
+        assert!(sync_database(&path, "Shared", "new").unwrap());
+        let maps: Vec<String> = con
+            .prepare("SELECT selected_map FROM profiles ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&maps[0]).unwrap()["Shared"],
+            "old1"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&maps[1]).unwrap()["Shared"],
+            "new"
+        );
+        write_profile(1);
+        assert_eq!(current_group_from_database(&path).as_deref(), Some("Other"));
+        write_profile(999);
+        assert!(current_group_from_database(&path).is_none());
+        assert!(!sync_database(&path, "Shared", "wrong").unwrap());
+        std::fs::write(&prefs, "invalid").unwrap();
+        assert!(current_group_from_database(&path).is_none());
+        assert!(!sync_database(&path, "Shared", "wrong").unwrap());
+        assert!(current_group_from_database(&root.join("missing.sqlite")).is_none());
+        assert!(!root.join("missing.sqlite").exists());
+        drop(con);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn selection_database_is_isolated_by_client() {
         use crate::client_config::ClientKind;

@@ -14,7 +14,8 @@ use crate::ui;
 use crate::Args;
 
 /// 机场放在节点列表里的假节点（套餐信息占位）
-const FAKE_NODES: [&str; 12] = [
+const FAKE_NODES: [&str; 13] = [
+    "倍率提示",
     "剩余流量",
     "套餐到期",
     "到期",
@@ -228,10 +229,13 @@ pub fn fix_flow(
     let orig = group.now.clone().unwrap_or_else(|| "未知".into());
     ui::info(&format!("当前组「{}」→ {}", args.group, orig));
 
-    let selected = crate::nodeinfo::candidates(
+    let policy = crate::nodeinfo::BillingPolicy::for_backend(be, &proxies);
+    policy.report();
+    let selected = crate::nodeinfo::candidates_with_policy(
         &proxies,
         &group.all.clone().unwrap_or_default(),
         args.max_rate,
+        &policy,
     );
     crate::nodeinfo::report_candidates(&selected, args.max_rate);
     let mut members = selected.names;

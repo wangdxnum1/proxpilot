@@ -76,6 +76,7 @@ pub fn rate_from_name(name: &str) -> Option<f64> {
     }
     result
 }
+#[cfg(test)]
 pub fn permitted(name: &str, max_rate: Option<f64>) -> bool {
     max_rate.is_none_or(|max| rate_from_name(name).is_some_and(|rate| rate <= max))
 }
@@ -98,10 +99,126 @@ mod ambiguous_rate_tests {
         }
     }
 }
-pub fn rate_label(name: &str) -> String {
-    rate_from_name(name)
-        .map(|n| format!("{}倍率（名称）", n))
-        .unwrap_or_else(|| "倍率未知".into())
+#[derive(Default)]
+pub struct BillingPolicy {
+    rules: HashMap<String, Option<f64>>,
+}
+
+impl BillingPolicy {
+    pub fn for_backend(be: &Backend, proxies: &HashMap<String, ProxyInfo>) -> Self {
+        if be.kind != Some(crate::client_config::ClientKind::CuteCloud) {
+            return Self::default();
+        }
+        Self::from_hints(
+            proxies
+                .iter()
+                .filter(|(name, info)| info.all.is_none() && name.contains("倍率提示"))
+                .map(|(name, _)| name.as_str()),
+        )
+    }
+
+    fn from_hints<'a>(hints: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut policy = Self::default();
+        for hint in hints {
+            for part in hint.split(['|', '｜']).skip(1) {
+                let part = part.trim();
+                let Some((route, number)) = part.split_once(['x', 'X', '×']) else {
+                    continue;
+                };
+                let route = route.trim();
+                if !matches!(route, "直连" | "中转" | "专线") {
+                    continue;
+                }
+                let number = number.trim();
+                let rate = if !number.is_empty()
+                    && number.chars().all(|c| c.is_ascii_digit() || c == '.')
+                {
+                    number
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|r| r.is_finite() && *r > 0.0)
+                } else {
+                    None
+                };
+                policy
+                    .rules
+                    .entry(route.into())
+                    .and_modify(|old| {
+                        if *old != rate {
+                            *old = None;
+                        }
+                    })
+                    .or_insert(rate);
+            }
+        }
+        policy
+    }
+
+    /// The bool identifies subscription-derived rates, so UI can show provenance.
+    pub fn resolve(&self, name: &str) -> Option<(f64, bool)> {
+        if let Some(rate) = rate_from_name(name) {
+            return Some((rate, false));
+        }
+        // An invalid/conflicting explicit rate must not be masked by a route hint.
+        if name.contains("倍率") {
+            return None;
+        }
+        let mut routes = std::collections::HashSet::new();
+        for part in name.split(['|', '｜']).skip(1).map(str::trim) {
+            if matches!(part, "直连" | "中转" | "专线") {
+                routes.insert(part);
+            }
+        }
+        if routes.len() != 1 {
+            return None;
+        }
+        self.rules
+            .get(*routes.iter().next()?)?
+            .map(|rate| (rate, true))
+    }
+
+    pub fn permitted(&self, name: &str, max_rate: Option<f64>) -> bool {
+        max_rate.is_none_or(|max| self.resolve(name).is_some_and(|(rate, _)| rate <= max))
+    }
+
+    pub fn label(&self, name: &str) -> String {
+        self.resolve(name)
+            .map(|(rate, hint)| {
+                format!(
+                    "{}倍率（{}）",
+                    rate,
+                    if hint {
+                        "订阅倍率提示，按线路标签匹配"
+                    } else {
+                        "名称"
+                    }
+                )
+            })
+            .unwrap_or_else(|| "倍率未知".into())
+    }
+
+    pub fn report(&self) {
+        if self.rules.is_empty() {
+            return;
+        }
+        let mut rules: Vec<_> = self
+            .rules
+            .iter()
+            .map(|(route, rate)| {
+                format!(
+                    "{} {}",
+                    route,
+                    rate.map(|r| format!("{}倍率", r))
+                        .unwrap_or("未知/冲突".into())
+                )
+            })
+            .collect();
+        rules.sort();
+        crate::ui::dim(&format!(
+            "CuteCloud 订阅倍率提示：{}；仅匹配明确线路标签，未注明类型保持未知",
+            rules.join("、")
+        ));
+    }
 }
 
 pub struct Candidates {
@@ -110,10 +227,19 @@ pub struct Candidates {
     pub over_limit: usize,
     pub placeholders: usize,
 }
+#[cfg(test)]
 pub fn candidates(
     proxies: &HashMap<String, ProxyInfo>,
     members: &[String],
     max_rate: Option<f64>,
+) -> Candidates {
+    candidates_with_policy(proxies, members, max_rate, &BillingPolicy::default())
+}
+pub fn candidates_with_policy(
+    proxies: &HashMap<String, ProxyInfo>,
+    members: &[String],
+    max_rate: Option<f64>,
+    policy: &BillingPolicy,
 ) -> Candidates {
     let mut result = Candidates {
         names: vec![],
@@ -136,7 +262,7 @@ pub fn candidates(
             continue;
         }
         if let Some(max) = max_rate {
-            match rate_from_name(name) {
+            match policy.resolve(name).map(|(rate, _)| rate) {
                 None => {
                     result.unknown += 1;
                     continue;
@@ -155,7 +281,7 @@ pub fn candidates(
 pub fn report_candidates(selected: &Candidates, max_rate: Option<f64>) {
     if let Some(max) = max_rate {
         crate::ui::info(&format!(
-            "倍率上限 {}（依据名称）：候选 {}；排除超限 {}、未知倍率 {}",
+            "倍率上限 {}（依据名称或已识别的订阅提示）：候选 {}；排除超限 {}、未知倍率 {}",
             max,
             selected.names.len(),
             selected.over_limit,
@@ -409,5 +535,121 @@ mod tests {
             .unwrap()
             .contains("MUST-NOT-DISPLAY"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod billing_policy_tests {
+    use super::*;
+
+    const HINT: &str = "🇨🇳 倍率提示|直连x1|中转x1|专线x2";
+
+    #[test]
+    fn route_hints_require_explicit_route_labels_and_preserve_explicit_rates() {
+        let policy = BillingPolicy::from_hints([HINT]);
+        for name in ["香港 A1 | 中转", "日本.H2 | 直连 | Trojan"] {
+            assert_eq!(policy.resolve(name), Some((1.0, true)));
+            assert!(policy.permitted(name, Some(1.0)));
+        }
+        assert_eq!(policy.resolve("香港 X1 | 专线"), Some((2.0, true)));
+        assert!(!policy.permitted("香港 X1 | 专线", Some(1.0)));
+        assert_eq!(
+            policy.resolve("香港 X1 | 专线 | 0.5倍率"),
+            Some((0.5, false))
+        );
+        for name in [
+            "台湾 X1 | 原生",
+            "新加坡 X1",
+            "专线A1-日本2",
+            "台湾 | 非专线",
+            "香港 | 直连 | 专线",
+            "香港 | 中转 | 1倍率-3倍率",
+            "香港 | 中转 | 1e3倍率",
+        ] {
+            assert_eq!(policy.resolve(name), None, "{name}");
+            assert!(!policy.permitted(name, Some(1.0)), "{name}");
+        }
+        assert!(policy.label("香港 X1 | 专线").contains("订阅倍率提示"));
+    }
+
+    #[test]
+    fn conflicting_and_malformed_hints_remain_unknown_without_hardcoded_rates() {
+        let policy = BillingPolicy::from_hints([HINT, "倍率提示|直连x2|中转x1|专线x2"]);
+        assert_eq!(policy.resolve("日本 | 直连"), None);
+        assert_eq!(policy.resolve("香港 | 中转"), Some((1.0, true)));
+        let changed = BillingPolicy::from_hints(["倍率提示｜直连 X 0.5｜专线×3"]);
+        assert_eq!(changed.resolve("香港｜专线"), Some((3.0, true)));
+        assert_eq!(changed.resolve("日本 | 直连"), Some((0.5, true)));
+        for malformed in [
+            "倍率提示|专线x0",
+            "倍率提示|专线x-1",
+            "倍率提示|专线x1/2",
+            "倍率提示|专线x1e2",
+            "倍率提示|专线xNaN",
+            "倍率提示|专线x1..2",
+        ] {
+            assert_eq!(
+                BillingPolicy::from_hints([malformed]).resolve("香港 | 专线"),
+                None
+            );
+        }
+        assert_eq!(BillingPolicy::default().resolve("香港 | 专线"), None);
+    }
+
+    #[test]
+    fn live_hints_are_cutecloud_only_and_placeholder_never_becomes_candidate() {
+        let proxies: HashMap<String, ProxyInfo> = serde_json::from_value(serde_json::json!({
+            (HINT): {"type":"Shadowsocks"},
+            "香港 A1 | 中转": {"type":"Shadowsocks"},
+            "日本.H2 | 直连 | Trojan": {"type":"Trojan"},
+            "香港 X1 | 专线": {"type":"Vmess"},
+            "台湾 X1 | 原生": {"type":"Vmess"}
+        }))
+        .unwrap();
+        let mut be = Backend {
+            kind: Some(crate::client_config::ClientKind::CuteCloud),
+            client: "CuteCloud".into(),
+            api: "http://127.0.0.1:9090".to_string().into(),
+            secret: None,
+            proxy: "http://127.0.0.1:7890".into(),
+            source: "test".into(),
+            version: None,
+            alternatives: vec![],
+        };
+        let policy = BillingPolicy::for_backend(&be, &proxies);
+        let members = vec![
+            HINT.into(),
+            "香港 A1 | 中转".into(),
+            "香港 A1 | 中转".into(),
+            "日本.H2 | 直连 | Trojan".into(),
+            "香港 X1 | 专线".into(),
+            "台湾 X1 | 原生".into(),
+        ];
+        let selected = candidates_with_policy(&proxies, &members, Some(1.0), &policy);
+        assert_eq!(
+            selected.names,
+            vec!["香港 A1 | 中转", "日本.H2 | 直连 | Trojan"]
+        );
+        assert_eq!(
+            (selected.unknown, selected.over_limit, selected.placeholders),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            candidates_with_policy(&proxies, &members, None, &policy)
+                .names
+                .len(),
+            4
+        );
+        for kind in [
+            Some(crate::client_config::ClientKind::VvCloud),
+            Some(crate::client_config::ClientKind::ClashVerge),
+            None,
+        ] {
+            be.kind = kind;
+            assert_eq!(
+                BillingPolicy::for_backend(&be, &proxies).resolve("香港 A1 | 中转"),
+                None
+            );
+        }
     }
 }

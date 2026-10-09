@@ -571,7 +571,21 @@ pub fn refresh(be: &Backend, args: &Args, api: &CoreApi) -> Result<Backend, Stri
         return verify_with_proxy(be.clone(), api, args.proxy.as_deref());
     }
     let next = refresh_candidate(be, args, &DiscoveryPaths::current()?)?;
-    let mut next = verify_with_proxy(next, api, args.proxy.as_deref())?;
+    let mut next = match verify_with_proxy(next, api, args.proxy.as_deref()) {
+        Ok(next) => next,
+        Err(_) if be.kind == Some(ClientKind::CuteCloud) => {
+            // The GUI can hot-update the controller without writing config.yaml.
+            // Revalidate the pinned endpoint's current owner and live API; never
+            // substitute another client's endpoint or treat a closed API as alive.
+            let mut pinned = be.clone();
+            if args.secret.is_some() {
+                pinned.secret = args.secret.clone();
+            }
+            pinned.source = "已验证的 CuteCloud 监听接口（运行配置暂不可用）".into();
+            verify_with_proxy(pinned, api, args.proxy.as_deref())?
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(proxy) = &args.proxy {
         next.proxy = proxy.clone();
     }
@@ -582,7 +596,15 @@ fn refresh_candidate(be: &Backend, args: &Args, paths: &DiscoveryPaths) -> Resul
     let mut next = if args.api.is_some() || be.kind.is_none() {
         be.clone()
     } else {
-        configured(be.kind.unwrap(), paths)?
+        match configured(be.kind.unwrap(), paths) {
+            Ok(next) => next,
+            Err(_) if be.kind == Some(ClientKind::CuteCloud) => {
+                let mut pinned = be.clone();
+                pinned.source = "CuteCloud 上轮监听接口（等待实时验证）".into();
+                pinned
+            }
+            Err(e) => return Err(e),
+        }
     };
     if args.secret.is_some() {
         next.secret = args.secret.clone();
@@ -900,6 +922,75 @@ mod proxy_tests {
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
+    #[test]
+    fn cutecloud_refresh_preserves_pinned_endpoint_when_runtime_is_stale() {
+        let root = std::env::temp_dir().join(format!(
+            "proxpilot-cute-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = DiscoveryPaths {
+            vvcloud: root.join("vv"),
+            cutecloud: root.join("cute"),
+            clash_verge: root.join("verge"),
+        };
+        std::fs::create_dir_all(&paths.cutecloud).unwrap();
+        std::fs::create_dir_all(&paths.clash_verge).unwrap();
+        let file = paths.runtime(ClientKind::CuteCloud);
+        std::fs::write(
+            &file,
+            "external-controller: 127.0.0.1:9090\nsecret: pinned-secret\n",
+        )
+        .unwrap();
+        let pinned = configured(ClientKind::CuteCloud, &paths).unwrap();
+        std::fs::write(
+            paths.runtime(ClientKind::ClashVerge),
+            "external-controller: 127.0.0.1:9097\n",
+        )
+        .unwrap();
+        let args =
+            crate::parse_args_from(["watch".into(), "--secret".into(), "override".into()]).unwrap();
+        std::fs::write(&file, "external-controller: ''\n").unwrap();
+        let next = refresh_candidate(&pinned, &args, &paths).unwrap();
+        assert_eq!(next.kind, Some(ClientKind::CuteCloud));
+        assert_eq!(next.api, pinned.api);
+        assert_eq!(next.secret.as_deref(), Some("override"));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            refresh_candidate(&pinned, &args, &paths).unwrap().api,
+            pinned.api
+        );
+        std::fs::write(
+            &file,
+            "external-controller: 127.0.0.1:9091\nsecret: changed\n",
+        )
+        .unwrap();
+        let updated = refresh_candidate(&pinned, &args, &paths).unwrap();
+        assert_eq!(
+            updated.api,
+            ApiEndpoint::Http("http://127.0.0.1:9091".into())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a running CuteCloud selected by the system proxy; read-only"]
+    fn live_cutecloud_watch_refresh_revalidates_hot_updated_controller() {
+        let args =
+            crate::parse_args_from(["watch".into(), "--client".into(), "auto".into()]).unwrap();
+        let api = CoreApi::new().unwrap();
+        let pinned = crate::detect::detect(&api, &args).unwrap();
+        assert_eq!(pinned.kind, Some(ClientKind::CuteCloud));
+        let updated = refresh(&pinned, &args, &api).unwrap();
+        assert_eq!(updated.kind, Some(ClientKind::CuteCloud));
+        assert_eq!(updated.api, pinned.api);
+        assert!(updated.version.is_some());
+        assert!(!updated.proxy.is_empty());
+    }
+
     #[test]
     fn watch_reads_changed_pipe_without_cross_client_fallback() {
         let root = std::env::temp_dir().join(format!(

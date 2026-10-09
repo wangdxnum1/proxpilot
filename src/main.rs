@@ -307,7 +307,7 @@ fn print_help() {
     println!("  watch          守护模式：保持可用节点，坏了自动修；加 --optimize 主动优选");
     println!();
     println!("选项:");
-    println!("  --group <名称>   策略组名称（未指定时从目标客户端实时识别）");
+    println!("  --group <名称>   指定策略组（默认优先读取客户端当前组并校验内核）");
     println!("  --url <地址>     测试网址（默认 https://chatgpt.com/）");
     println!("  --client <类型>  cutecloud / clash-verge / vvcloud / auto；覆盖保存的默认客户端");
     println!("  --api <地址>     显式指定 HTTP 内核 API（优先级最高）");
@@ -361,18 +361,146 @@ fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
 
 fn runtime_group_args(be: &Backend, api: &core_api::CoreApi, args: &Args) -> Result<Args, String> {
     let proxies = mihomo::get_proxies(be, api)?;
-    group_args_from_proxies(&proxies, args)
+    let saved = if args.group.is_empty() {
+        appstate::current_group(be)
+    } else {
+        None
+    };
+    group_args_from_proxies(&proxies, args, saved.as_deref())
 }
 fn group_args_from_proxies(
     proxies: &std::collections::HashMap<String, mihomo::ProxyInfo>,
     args: &Args,
+    saved: Option<&str>,
 ) -> Result<Args, String> {
     let mut resolved = args.clone();
+    if args.group.is_empty() {
+        if let Some(group) =
+            saved.filter(|name| proxies.get(*name).is_some_and(|p| p.all.is_some()))
+        {
+            resolved.group = group.into();
+            ui::info(&format!(
+                "客户端当前策略组：{}（本地记忆，已校验内核）",
+                group
+            ));
+            return Ok(resolved);
+        }
+        if saved.is_some() {
+            ui::warn("客户端保存的策略组已失效，按实时内核确定检测或切换范围");
+        }
+        if matches!(args.cmd, Cmd::Check | Cmd::Scan | Cmd::Nodes) {
+            return Ok(resolved);
+        }
+    }
     resolved.group = mihomo::resolve_group(proxies, &args.group)?;
     if args.group.is_empty() {
         ui::info(&format!("实时识别策略组：{}", resolved.group));
     }
     Ok(resolved)
+}
+
+struct NodeScope {
+    label: String,
+    members: Vec<String>,
+    current: Vec<(String, Option<String>)>,
+    current_notice: Option<String>,
+}
+
+impl NodeScope {
+    fn is_current(&self, name: &str) -> bool {
+        self.current
+            .iter()
+            .any(|(_, selected)| selected.as_deref() == Some(name))
+    }
+
+    fn print_current(&self, members: &[String], reachable: &[(i64, String)]) {
+        for (group, selected) in &self.current {
+            ui::info(&format!(
+                "组「{}」{}",
+                group,
+                scan_current_status(selected.as_deref(), members, reachable)
+            ));
+        }
+        if let Some(notice) = &self.current_notice {
+            ui::dim(notice);
+        }
+    }
+}
+
+#[cfg(test)]
+fn node_scope(
+    proxies: &std::collections::HashMap<String, mihomo::ProxyInfo>,
+    group: &str,
+) -> Result<NodeScope, String> {
+    node_scope_with_mode(proxies, group, Some("rule"))
+}
+
+fn selected_leaf(
+    proxies: &std::collections::HashMap<String, mihomo::ProxyInfo>,
+    group: &str,
+) -> Option<String> {
+    let mut name = group;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(name) {
+            return None;
+        }
+        let info = proxies.get(name)?;
+        if info.all.is_none() {
+            return checker::is_real_node(info, name).then(|| name.to_string());
+        }
+        name = info.now.as_deref()?;
+    }
+}
+
+fn node_scope_with_mode(
+    proxies: &std::collections::HashMap<String, mihomo::ProxyInfo>,
+    group: &str,
+    mode: Option<&str>,
+) -> Result<NodeScope, String> {
+    let (label, mut members) = if !group.is_empty() {
+        let info = proxies
+            .get(group)
+            .filter(|p| p.all.is_some())
+            .ok_or_else(|| mihomo::missing_group(proxies, group))?;
+        (
+            format!("组「{}」", group),
+            info.all.clone().unwrap_or_default(),
+        )
+    } else {
+        ("全内核".into(), proxies.keys().cloned().collect())
+    };
+    if group.is_empty() {
+        members.sort();
+    }
+    let root = match mode {
+        Some("global") => Some("GLOBAL".to_string()),
+        Some("rule") => mihomo::resolve_group(proxies, group).ok(),
+        _ => None,
+    };
+    let mut current = Vec::new();
+    let current_notice = if let Some(root) = root {
+        if let Some(leaf) = selected_leaf(proxies, &root) {
+            current.push((root, Some(leaf)));
+            None
+        } else {
+            Some(format!("组「{}」的选择链未指向可确认的真实节点（可能为直连、拒绝、信息条目或循环）；未标记 [当前]", root))
+        }
+    } else {
+        Some(match mode {
+            Some("direct") => "当前为直连模式，未使用代理节点".into(),
+            Some("rule") => {
+                "规则模式存在多个候选业务组，无法唯一确定当前节点；可用 --group 指定检查范围".into()
+            }
+            _ => "无法确认代理模式，未标记当前节点".into(),
+        })
+    };
+    Ok(NodeScope {
+        label,
+        members,
+        current,
+        current_notice,
+    })
 }
 
 fn cmd_nodes(be: &Backend, api: &core_api::CoreApi, args: &Args) -> i32 {
@@ -383,22 +511,22 @@ fn cmd_nodes(be: &Backend, api: &core_api::CoreApi, args: &Args) -> i32 {
             return 1;
         }
     };
-    let group = match proxies.get(&args.group) {
-        Some(p) => p,
-        None => {
-            ui::fail(&mihomo::missing_group(&proxies, &args.group));
+    let mode = mihomo::get_mode(be, api).ok();
+    let scope = match node_scope_with_mode(&proxies, &args.group, mode.as_deref()) {
+        Ok(scope) => scope,
+        Err(e) => {
+            ui::fail(&e);
             return 1;
         }
     };
-    let selected = nodeinfo::candidates(
-        &proxies,
-        &group.all.clone().unwrap_or_default(),
-        args.max_rate,
-    );
+    let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
+    policy.report();
+    let selected =
+        nodeinfo::candidates_with_policy(&proxies, &scope.members, args.max_rate, &policy);
     nodeinfo::report_candidates(&selected, args.max_rate);
     ui::info(&format!(
-        "组「{}」真实节点 {} 个（不测速）",
-        args.group,
+        "{}真实节点 {} 个（不测速）",
+        scope.label,
         selected.names.len()
     ));
     for name in &selected.names {
@@ -407,16 +535,18 @@ fn cmd_nodes(be: &Backend, api: &core_api::CoreApi, args: &Args) -> i32 {
             "  {}  [{}]  {}  {}{}",
             name,
             info.ptype,
-            nodeinfo::rate_label(name),
+            policy.label(name),
             nodeinfo::name_labels(name).join(" / "),
-            if group.now.as_deref() == Some(name) {
+            if scope.is_current(name) {
                 " [当前]"
             } else {
                 ""
             }
         );
     }
-    ui::dim("协议来自内核；倍率、专线、家宽和用途标签来自名称，未实测验证。");
+    ui::dim(
+        "协议来自内核；倍率来自名称或已识别的订阅提示；线路、家宽和用途标签来自名称，未实测验证。",
+    );
     if selected.names.is_empty() {
         1
     } else {
@@ -444,6 +574,8 @@ fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i
         ui::fail("节点不属于指定策略组");
         return 1;
     }
+    let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
+    policy.report();
     let metadata = nodeinfo::load_metadata(be);
     let record = metadata.nodes.get(name);
     let config = record.map(|(config, _)| config);
@@ -494,7 +626,7 @@ fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i
             .map(|(_, source)| source.as_str())
             .unwrap_or("没有可关联的本机节点配置")
     );
-    println!("  倍率：{}", nodeinfo::rate_label(name));
+    println!("  倍率：{}", policy.label(name));
     println!(
         "  名称标签：{}（未验证）",
         nodeinfo::name_labels(name).join(" / ")
@@ -510,7 +642,7 @@ fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i
         .collect();
     groups.sort();
     println!("  所属策略组：{}（内核 API）", groups.join("、"));
-    if !nodeinfo::permitted(name, args.max_rate) {
+    if !policy.permitted(name, args.max_rate) {
         ui::warn("此节点不符合指定倍率上限；详情命令仅展示，不切换");
     }
     for notice in metadata.notices {
@@ -545,13 +677,21 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
 
     match mihomo::get_proxies(be, agent) {
         Ok(proxies) => {
-            if !proxies.contains_key(&args.group) {
+            if !args.group.is_empty() && !proxies.contains_key(&args.group) {
                 ui::fail(&mihomo::missing_group(&proxies, &args.group));
                 return 1;
             }
-            if let Some(g) = proxies.get(&args.group) {
+            let display_group = if args.group.is_empty() {
+                mihomo::resolve_group(&proxies, "").ok()
+            } else {
+                Some(args.group.clone())
+            };
+            if let Some((name, g)) = display_group
+                .as_deref()
+                .and_then(|name| proxies.get(name).map(|g| (name, g)))
+            {
                 let now = g.now.clone().unwrap_or_else(|| "未知".into());
-                ui::info(&format!("当前组「{}」→ {}", args.group, now));
+                ui::info(&format!("当前组「{}」→ {}", name, now));
             }
             match checker::verify_access(&be.proxy, &args.url, args.samples) {
                 checker::Verdict::Pass(t) => {
@@ -592,38 +732,34 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
             return 1;
         }
     };
-    let group = match proxies.get(&args.group) {
-        Some(g) => g,
-        None => {
-            ui::fail(&mihomo::missing_group(&proxies, &args.group));
+    let mode = mihomo::get_mode(be, agent).ok();
+    let scope = match node_scope_with_mode(&proxies, &args.group, mode.as_deref()) {
+        Ok(scope) => scope,
+        Err(e) => {
+            ui::fail(&e);
             return 1;
         }
     };
-    let selected = nodeinfo::candidates(
-        &proxies,
-        &group.all.clone().unwrap_or_default(),
-        args.max_rate,
-    );
+    let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
+    policy.report();
+    let selected =
+        nodeinfo::candidates_with_policy(&proxies, &scope.members, args.max_rate, &policy);
     nodeinfo::report_candidates(&selected, args.max_rate);
     let members = selected.names;
     if members.is_empty() {
-        ui::info(&scan_current_status(group.now.as_deref(), &members, &[]));
+        scope.print_current(&members, &[]);
         ui::fail("没有符合条件的真实节点，请检查倍率限制或策略组");
         return 1;
     }
     ui::info(&format!(
-        "组「{}」共 {} 个真实节点，{} 路并发探测...",
-        args.group,
+        "{}共 {} 个真实节点（去重后），{} 路并发探测...",
+        scope.label,
         members.len(),
         checker::scan_concurrency(members.len())
     ));
     let reachable = checker::scan_reachable(be, agent, &members, &args.url);
     println!();
-    ui::info(&scan_current_status(
-        group.now.as_deref(),
-        &members,
-        &reachable,
-    ));
+    scope.print_current(&members, &reachable);
     if reachable.is_empty() {
         ui::fail("没有任何节点可达");
         return 2;
@@ -639,11 +775,11 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         reachable.len()
     ));
     for (d, n) in reachable.iter().take(30) {
-        print_scan_row(*d, n, group.now.as_deref());
+        print_scan_row(*d, n, scope.is_current(n).then_some(n.as_str()), &policy);
     }
     let economical: Vec<_> = reachable
         .iter()
-        .filter(|(_, name)| is_one_rate(name))
+        .filter(|(_, name)| policy.resolve(name).is_some_and(|(rate, _)| rate == 1.0))
         .collect();
     println!();
     ui::info(&format!(
@@ -651,10 +787,15 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         economical.len()
     ));
     for (delay, name) in economical {
-        print_scan_row(*delay, name, group.now.as_deref());
+        print_scan_row(
+            *delay,
+            name,
+            scope.is_current(name).then_some(name.as_str()),
+            &policy,
+        );
     }
     println!(
-        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称标注1倍率；{} = 当前选中节点",
+        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称或订阅提示识别为1倍率；{} = 当前选中节点",
         "[低延迟]".cyan().bold(),
         "[1倍率·省流量]".green().bold(),
         "[当前]".yellow()
@@ -710,11 +851,157 @@ mod scan_current_tests {
     }
 }
 
+#[cfg(test)]
+mod node_scope_tests {
+    use super::*;
+
+    fn proxies() -> std::collections::HashMap<String, mihomo::ProxyInfo> {
+        serde_json::from_value(serde_json::json!({
+            "AI服务": {"type":"Selector", "all":["自动选择", "共享-1倍率"], "now":"自动选择"},
+            "流媒体": {"type":"Selector", "all":["共享-1倍率", "其他-3倍率", "共享-1倍率"], "now":"共享-1倍率"},
+            "自动选择": {"type":"URLTest", "all":["共享-1倍率"], "now":"共享-1倍率"},
+            "共享-1倍率": {"type":"Shadowsocks"},
+            "其他-3倍率": {"type":"Trojan"},
+            "未分组-1倍率": {"type":"Vmess"},
+            "DIRECT": {"type":"Direct"},
+            "REJECT": {"type":"Reject"},
+            "续费网址:https://example.invalid": {"type":"Shadowsocks"}
+        })).unwrap()
+    }
+
+    #[test]
+    fn saved_group_is_used_by_detection_and_switching_commands_with_explicit_override() {
+        let proxies = proxies();
+        for command in ["check", "scan", "nodes", "fix", "use", "watch"] {
+            let mut input = vec![command.to_string()];
+            if command == "use" {
+                input.push("共享-1倍率".into());
+            }
+            let args = parse_args_from(input.clone()).unwrap();
+            assert_eq!(
+                group_args_from_proxies(&proxies, &args, Some("流媒体"))
+                    .unwrap()
+                    .group,
+                "流媒体"
+            );
+            // Re-resolving with the original arguments follows GUI changes,
+            // as watch does on each cycle.
+            assert_eq!(
+                group_args_from_proxies(&proxies, &args, Some("AI服务"))
+                    .unwrap()
+                    .group,
+                "AI服务"
+            );
+            input.extend(["--group".into(), "自动选择".into()]);
+            let explicit = parse_args_from(input).unwrap();
+            assert_eq!(
+                group_args_from_proxies(&proxies, &explicit, Some("流媒体"))
+                    .unwrap()
+                    .group,
+                "自动选择"
+            );
+            for saved in [None, Some("不存在"), Some("共享-1倍率")] {
+                let resolved = group_args_from_proxies(&proxies, &args, saved);
+                if matches!(args.cmd, Cmd::Check | Cmd::Scan | Cmd::Nodes) {
+                    assert!(resolved.unwrap().group.is_empty());
+                } else {
+                    assert!(resolved.is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_scan_deduplicates_shared_nodes_and_includes_ungrouped_nodes() {
+        let proxies = proxies();
+        assert!(mihomo::resolve_group(&proxies, "").is_err());
+        let scope = node_scope(&proxies, "").unwrap();
+        let selected = nodeinfo::candidates(&proxies, &scope.members, None);
+        assert_eq!(
+            selected.names,
+            vec!["共享-1倍率", "其他-3倍率", "未分组-1倍率"]
+        );
+        let economical = nodeinfo::candidates(&proxies, &scope.members, Some(1.0));
+        assert_eq!(economical.names, vec!["共享-1倍率", "未分组-1倍率"]);
+        assert!(!scope.is_current("共享-1倍率"));
+        assert!(scope.current.is_empty());
+        assert!(scope
+            .current_notice
+            .as_deref()
+            .unwrap()
+            .contains("无法唯一"));
+    }
+
+    #[test]
+    fn explicit_group_still_limits_candidates_and_rejects_node_or_missing_group() {
+        let proxies = proxies();
+        let scope = node_scope(&proxies, "流媒体").unwrap();
+        let selected = nodeinfo::candidates(&proxies, &scope.members, None);
+        assert_eq!(selected.names, vec!["共享-1倍率", "其他-3倍率"]);
+        assert!(node_scope(&proxies, "不存在").is_err());
+        assert!(node_scope(&proxies, "共享-1倍率").is_err());
+    }
+
+    #[test]
+    fn global_scan_handles_group_cycles_and_no_groups() {
+        let cyclic = serde_json::from_value(serde_json::json!({
+            "A": {"all":["B"], "now":"B"},
+            "B": {"all":["A"], "now":"A"},
+            "node": {"type":"Trojan"}
+        }))
+        .unwrap();
+        let scope = node_scope(&cyclic, "").unwrap();
+        assert!(scope.current.iter().all(|(_, now)| now.is_none()));
+        assert_eq!(
+            nodeinfo::candidates(&cyclic, &scope.members, None).names,
+            vec!["node"]
+        );
+        let empty = node_scope(&std::collections::HashMap::new(), "").unwrap();
+        assert!(empty.members.is_empty());
+        assert!(empty.current.is_empty());
+    }
+
+    #[test]
+    fn only_the_selected_root_chain_is_marked_current() {
+        let mut proxies: std::collections::HashMap<String, mihomo::ProxyInfo> = serde_json::from_value(serde_json::json!({
+            "GLOBAL": {"all":["VVCloud", "自动选择", "vietnam", "japan"], "now":"自动选择"},
+            "VVCloud": {"all":["自动选择", "故障转移", "vietnam", "japan"], "now":"vietnam"},
+            "自动选择": {"type":"URLTest", "all":["vietnam", "japan"], "now":"japan"},
+            "故障转移": {"type":"Fallback", "all":["剩余流量：495 GB", "vietnam"], "now":"剩余流量：495 GB"},
+            "vietnam": {"type":"Trojan"}, "japan": {"type":"Trojan"},
+            "剩余流量：495 GB": {"type":"Trojan"}, "DIRECT": {"type":"Direct"}
+        })).unwrap();
+        let scope = node_scope_with_mode(&proxies, "", Some("rule")).unwrap();
+        assert!(scope.is_current("vietnam"));
+        assert!(!scope.is_current("japan"));
+        assert_eq!(scope.current.len(), 1);
+        let global = node_scope_with_mode(&proxies, "VVCloud", Some("global")).unwrap();
+        assert!(global.is_current("japan"));
+        assert!(!global.is_current("vietnam"));
+        proxies.get_mut("VVCloud").unwrap().now = Some("自动选择".into());
+        assert!(node_scope(&proxies, "").unwrap().is_current("japan"));
+        let direct = node_scope_with_mode(&proxies, "", Some("direct")).unwrap();
+        assert!(direct.current.is_empty());
+        assert!(direct.current_notice.unwrap().contains("直连模式"));
+        assert!(node_scope_with_mode(&proxies, "", None)
+            .unwrap()
+            .current
+            .is_empty());
+        proxies.get_mut("VVCloud").unwrap().now = Some("故障转移".into());
+        let placeholder = node_scope(&proxies, "").unwrap();
+        assert!(placeholder.current.is_empty());
+        assert!(!placeholder.is_current("剩余流量：495 GB"));
+        proxies.get_mut("VVCloud").unwrap().now = Some("DIRECT".into());
+        assert!(node_scope(&proxies, "").unwrap().current.is_empty());
+    }
+}
+
+#[cfg(test)]
 fn is_one_rate(name: &str) -> bool {
     nodeinfo::rate_from_name(name) == Some(1.0)
 }
 
-fn print_scan_row(delay: i64, name: &str, current: Option<&str>) {
+fn print_scan_row(delay: i64, name: &str, current: Option<&str>, policy: &nodeinfo::BillingPolicy) {
     let row = format!(
         "      ✔ {:>5}ms  {}{}",
         delay,
@@ -726,7 +1013,7 @@ fn print_scan_row(delay: i64, name: &str, current: Option<&str>) {
     } else {
         row.normal()
     };
-    let economical = if is_one_rate(name) {
+    let economical = if policy.resolve(name).is_some_and(|(rate, _)| rate == 1.0) {
         format!("  {}", "[1倍率·省流量]".green().bold())
     } else {
         String::new()
@@ -736,7 +1023,11 @@ fn print_scan_row(delay: i64, name: &str, current: Option<&str>) {
     } else {
         String::new()
     };
-    println!("{}{}{}", row, economical, selected);
+    let provenance = match policy.resolve(name) {
+        Some((rate, true)) => format!("  [{}倍率·订阅提示]", rate),
+        _ => String::new(),
+    };
+    println!("{}{}{}{}", row, economical, provenance, selected);
 }
 
 #[cfg(test)]
@@ -830,7 +1121,9 @@ fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &s
         ui::fail("指定节点不是该策略组中的真实节点");
         return 1;
     }
-    if !nodeinfo::permitted(node, args.max_rate) {
+    let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
+    policy.report();
+    if !policy.permitted(node, args.max_rate) {
         ui::fail("指定节点超过倍率上限或倍率未知；未切换");
         return 1;
     }
@@ -952,7 +1245,12 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
                 continue;
             }
         };
-        let cycle_args = match group_args_from_proxies(&proxies, args) {
+        let saved = if args.group.is_empty() {
+            appstate::current_group(be)
+        } else {
+            None
+        };
+        let cycle_args = match group_args_from_proxies(&proxies, args, saved.as_deref()) {
             Ok(resolved) => resolved,
             Err(e) => {
                 ui::fail(&e);
@@ -965,8 +1263,9 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             thread::sleep(Duration::from_secs(args.interval));
             continue;
         }
+        let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
         if let Some(current_node) = proxies.get(&args.group).and_then(|p| p.now.as_deref()) {
-            if !nodeinfo::permitted(current_node, args.max_rate) {
+            if !policy.permitted(current_node, args.max_rate) {
                 ui::warn("当前选择不符合倍率上限；默认保持可用节点，下次故障修复或主动优选只使用合规候选");
             }
         }

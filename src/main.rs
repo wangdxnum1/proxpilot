@@ -802,9 +802,10 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         );
     }
     println!(
-        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称或订阅提示识别为1倍率；{} = 当前选中节点",
+        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称或订阅提示识别为1倍率；{} = 名称标注专线；{} = 当前选中节点",
         "[低延迟]".cyan().bold(),
         "[1倍率·省流量]".green().bold(),
+        "[专线]".magenta().bold(),
         "[当前]".yellow()
     );
     ui::dim(
@@ -1051,6 +1052,16 @@ fn print_scan_row(
     let route = if labels.is_empty() {
         String::new()
     } else {
+        let labels: Vec<_> = labels
+            .iter()
+            .map(|label| {
+                if *label == "专线" {
+                    label.magenta().bold().to_string()
+                } else {
+                    label.to_string()
+                }
+            })
+            .collect();
         format!("  [{}]", labels.join("·"))
     };
     println!(

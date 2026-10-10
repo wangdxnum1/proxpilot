@@ -441,14 +441,22 @@ pub fn bool_text(value: Option<bool>) -> &'static str {
         None => "未知",
     }
 }
-pub fn name_labels(name: &str) -> Vec<&'static str> {
+/// Provider-declared route/egress labels, not measured network properties.
+pub fn route_labels(name: &str) -> Vec<&'static str> {
     let mut labels = vec![];
-    if name.contains("专线") {
-        labels.push("专线");
+    for label in ["直连", "中转", "专线"] {
+        if name.contains(label) {
+            labels.push(label);
+        }
     }
     if name.contains("家宽") || name.contains("住宅") {
-        labels.push("家宽/住宅IP");
+        labels.push("家宽");
     }
+    labels
+}
+
+pub fn name_labels(name: &str) -> Vec<&'static str> {
+    let mut labels = route_labels(name);
     if name.contains("流媒体") {
         labels.push("流媒体");
     }

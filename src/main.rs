@@ -775,7 +775,13 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         reachable.len()
     ));
     for (d, n) in reachable.iter().take(30) {
-        print_scan_row(*d, n, scope.is_current(n).then_some(n.as_str()), &policy);
+        print_scan_row(
+            *d,
+            n,
+            scope.is_current(n).then_some(n.as_str()),
+            &policy,
+            proxies.get(n),
+        );
     }
     let economical: Vec<_> = reachable
         .iter()
@@ -792,6 +798,7 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
             name,
             scope.is_current(name).then_some(name.as_str()),
             &policy,
+            proxies.get(name),
         );
     }
     println!(
@@ -799,6 +806,9 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         "[低延迟]".cyan().bold(),
         "[1倍率·省流量]".green().bold(),
         "[当前]".yellow()
+    );
+    ui::dim(
+        "协议来自内核 API；直连/中转/专线/家宽标签来自节点名称，未实测验证；未标注的类型不推断。",
     );
     ui::dim("提示：可达 ≠ 能打开网页，IP 是否被风控要用 proxpilot fix 实测验证");
     0
@@ -1001,7 +1011,13 @@ fn is_one_rate(name: &str) -> bool {
     nodeinfo::rate_from_name(name) == Some(1.0)
 }
 
-fn print_scan_row(delay: i64, name: &str, current: Option<&str>, policy: &nodeinfo::BillingPolicy) {
+fn print_scan_row(
+    delay: i64,
+    name: &str,
+    current: Option<&str>,
+    policy: &nodeinfo::BillingPolicy,
+    info: Option<&mihomo::ProxyInfo>,
+) {
     let row = format!(
         "      ✔ {:>5}ms  {}{}",
         delay,
@@ -1027,7 +1043,20 @@ fn print_scan_row(delay: i64, name: &str, current: Option<&str>, policy: &nodein
         Some((rate, true)) => format!("  [{}倍率·订阅提示]", rate),
         _ => String::new(),
     };
-    println!("{}{}{}{}", row, economical, provenance, selected);
+    let protocol = info
+        .map(|p| p.ptype.trim())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("协议未知");
+    let labels = nodeinfo::route_labels(name);
+    let route = if labels.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", labels.join("·"))
+    };
+    println!(
+        "{}  [{}]{}{}{}{}",
+        row, protocol, route, economical, provenance, selected
+    );
 }
 
 #[cfg(test)]

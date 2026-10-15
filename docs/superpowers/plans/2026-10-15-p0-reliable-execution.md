@@ -38,9 +38,9 @@
 
 **Interfaces:** Keep `header(width, economical) -> String` and `row(&Row, width, economical) -> String`; use one fixed display width for the delay column. Header `延迟(ms)`; table cells contain right-aligned integer milliseconds without repeated units; compact mode includes units explicitly.
 
-- [ ] Change the wide table header and cells together; keep label fit/wrapping, current marker and colors.
-- [ ] Verify the actual CLI with a local fake core, including rank 1/10/30 and delays 49/299/1691; confirm field boundaries by display cells, not UTF-8 bytes. This is reversible layout work: reuse the existing behavioral checks instead of introducing tests that duplicate formatting.
-- [ ] Run `cargo test --locked --quiet`; commit the presentation correction and record the result.
+- [x] Change the wide table header and cells together; keep label fit/wrapping, current marker and colors.
+- [x] Verify the actual CLI with a local fake core, including rank 1/10/30 and delays 49/299/1691; confirm field boundaries by display cells, not UTF-8 bytes. This is reversible layout work: reuse the existing behavioral checks instead of introducing tests that duplicate formatting.
+- [x] Run `cargo test --locked --quiet`; commit the presentation correction and record the result.
 
 ### Task 2: Preserve typed request and verification evidence
 
@@ -48,10 +48,10 @@
 
 **Interfaces:** `AppError { code: ErrorCode, stage: Stage, http_status: Option<u16>, retryable: bool, message: String }`, `type AppResult<T> = Result<T, AppError>`. Expose `CoreApi::request_detailed(...) -> AppResult<CoreResponse>`, `BrowserProbe::test_detailed(url) -> AppResult<(u16,f64)>` and `mihomo::probe_delay_detailed(...) -> AppResult<i64>`. Existing string APIs may call these methods while migration is incremental. Verification failures retain AppError instead of u16; build a serializable verification report for P2.
 
-- [ ] Add failing tests for timeout/response truncation/HTTP-auth classifications, sanitized messages, and deceptive OpenAI URL hosts. Use existing local transport fixtures; no real network.
-- [ ] Run those tests and capture the failing output.
-- [ ] Implement classifications from structured library evidence, with transport_unknown when insufficient. Preserve status codes, remove `(0,99.0)` conversion and blanket IP reputation claims; parse URL host boundaries.
-- [ ] Run targeted tests and the full suite. Update all existing callers so error wording/exit behavior is consistent; commit.
+- [x] Add failing tests for timeout/response truncation/HTTP-auth classifications, sanitized messages, and deceptive OpenAI URL hosts. Use existing local transport fixtures; no real network.
+- [x] Run those tests and capture the failing output.
+- [x] Implement classifications from structured library evidence, with transport_unknown when insufficient. Preserve status codes, remove `(0,99.0)` conversion and blanket IP reputation claims; parse URL host boundaries.
+- [x] Run targeted tests and the full suite. Update all existing callers so error wording/exit behavior is consistent; commit.
 
 ### Task 3: Cancellation, modification lock and recovery journal
 

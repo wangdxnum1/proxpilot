@@ -8,6 +8,7 @@ mod diagnostics;
 mod http;
 mod mihomo;
 mod nodeinfo;
+mod operation;
 mod procinfo;
 mod scan_output;
 mod sysproxy;

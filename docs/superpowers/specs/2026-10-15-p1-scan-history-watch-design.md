@@ -1,6 +1,6 @@
 # P1：扫描调优、历史评分与守护防抖设计
 
-状态：待用户评审。依赖 [P0](2026-10-15-p0-reliable-execution-design.md) 的报告、取消和事务；属于 [完整目标](2026-10-15-reliability-roadmap.md)。
+状态：用户已批准；按阶段实施。依赖 [P0](2026-10-15-p0-reliable-execution-design.md) 的报告、取消和事务；属于 [完整目标](2026-10-15-reliability-roadmap.md)。
 
 ## 1. 可控扫描
 

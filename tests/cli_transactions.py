@@ -127,6 +127,30 @@ class Fixture:
 
 
 class Transactions(unittest.TestCase):
+    def test_second_mutation_is_busy_but_readonly_scan_can_run(self):
+        release = threading.Event()
+        def pending():
+            release.wait(10)
+            return 200
+        with Fixture([pending]) as fixture:
+            process = fixture.background("use", "target")
+            try:
+                self.assertTrue(fixture.proxy_started.wait(5))
+                other = fixture.run("use", "original")
+                self.assertEqual(other.returncode, 1, other.stdout + other.stderr)
+                self.assertEqual([value for method, value in fixture.requests if method == "PUT"], ["target"])
+                scanned = fixture.run("scan")
+                self.assertEqual(scanned.returncode, 0, scanned.stdout + scanned.stderr)
+                self.assertEqual(fixture.selected, "target")
+                console_break(process.pid)
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+                self.assertEqual(fixture.selected, "original")
+            finally:
+                release.set()
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
     def test_crashed_use_can_be_inspected_and_explicitly_recovered(self):
         release = threading.Event()
         def pending():

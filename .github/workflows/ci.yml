@@ -1,0 +1,70 @@
+name: Windows reliability
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.98.0', '1.99.0']
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-${{ matrix.rust }}
+      NO_COLOR: '1'
+      PROXPILOT_SPINNER: '0'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install pinned Rust and show tool versions
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/check-toolchain.ps1
+      - name: Verify native package and block producer tools
+        run: |
+          ./vendor/btls-sys/verify.ps1
+          $block = Join-Path $env:RUNNER_TEMP 'blocked-native-tools'
+          New-Item -ItemType Directory $block | Out-Null
+          foreach ($name in 'cmake','nasm','clang','clang-cl','bindgen') {
+            Set-Content -Encoding ascii (Join-Path $block "$name.cmd") '@echo Native producer tool must not be invoked. 1>&2', '@exit /b 91'
+          }
+          "$block" >> $env:GITHUB_PATH
+          "LIBCLANG_PATH=$block/nonexistent" >> $env:GITHUB_ENV
+          "CMAKE=$block/cmake.cmd" >> $env:GITHUB_ENV
+          "NASM=$block/nasm.cmd" >> $env:GITHUB_ENV
+      - name: Format, Rust tests and script failure injection
+        run: |
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --quiet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_build_scripts.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Release build and offline CLI acceptance
+        run: |
+          ./scripts/build.ps1 -Target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./bin/proxpilot.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/cli_transactions.py --bin bin/proxpilot.exe -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Local package with checksums, licenses and metadata
+        if: matrix.rust == '1.99.0'
+        run: ./scripts/release.ps1
+      - name: Upload verified package
+        if: matrix.rust == '1.99.0'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: proxpilot-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error

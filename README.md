@@ -17,7 +17,7 @@ ProxPilot 直接与本机运行的内核 API 通信：并发探测所有节点 �
 
 ## 编译
 
-Windows x64 构建只需要 **Rust 1.98+ 和兼容的 MSVC C++ 工具链（含 Windows SDK）**，不需要安装 CMake、NASM、LLVM 或 libclang。项目内置匹配 `btls-sys 0.5.6` 的 BoringSSL 静态库与预生成 Rust 绑定，普通 `cargo build` 和 `cargo test` 会自动使用它们。预编译库由 MSVC 14.51（Visual Studio 2026）生成，目前验证该工具集；更旧的 MSVC 尚未验证，需使用兼容的链接器和运行库。依赖包随源码直接入库，不使用 Git LFS，也不需额外下载脚本。
+Windows x64 开发与 release 固定 **Rust 1.99.0**（`rust-toolchain.toml`；rustup 首次自动安装），最低版本 1.98.0 由 CI 单独验证。需要 **MSVC 14.51.36231 或兼容的更新工具集（Visual Studio 2026，含 Windows SDK）**，不需要安装 CMake、NASM、LLVM 或 libclang。项目内置匹配 `btls-sys 0.5.6` 的 BoringSSL 静态库与预生成 Rust 绑定，普通 `cargo build` 和 `cargo test` 会自动使用它们。更旧的 MSVC 不受此预编译包支持。依赖包随源码直接入库，不使用 Git LFS，也不需额外下载脚本。
 
 本地适配及依赖包来源见 [vendor/btls-sys/README.md](vendor/btls-sys/README.md)。浏览器指纹实测能力保留；BoringSSL、SQLite 和 CRT 静态链接进 exe，使用者无需安装。
 
@@ -25,9 +25,13 @@ Windows x64 构建只需要 **Rust 1.98+ 和兼容的 MSVC C++ 工具链（含 W
 build.bat
 ```
 
-脚本会执行 `cargo build --release`，并把产物拷贝到 **`bin\proxpilot.exe`**（兼容自定义 target triple 的产物路径）。 exe 为静态链接 CRT 的单文件，拷到任何 Windows 10/11 机器可直接运行，无需 VC++ 运行库。
+脚本先检查 MSVC/SDK 和原生依赖 SHA256，再执行 `cargo build --release --locked`，只接受本次 Cargo JSON 消息报告的 exe，复制到 **`bin\proxpilot.exe`** 后再次校验哈希。支持 `CARGO_TARGET_DIR`、Cargo target 配置和 `build.bat -Target x86_64-pc-windows-msvc`；构建、定位或复制失败均返回非零，不回退到旧 exe。产物静态链接 CRT，用户运行不需要安装 Rust 或 VC++ 运行库。
 
 手动编译：`cargo build --release --locked`（项目级 `.cargo/config.toml` 已配置 crt-static）。
+
+`release.bat` 默认只运行测试、构建并在 `dist` 打包 ZIP、SHA256、版本/提交元数据及依赖许可证信息，不提交或推送代码。`release.bat -PublishDraft` 才会检查干净工作区、版本/CHANGELOG、tag、GitHub 登录及远端，创建并推送版本 tag，然后上传到**草稿** Release。任何失败都会停止；同名 tag 不覆盖。正式发布由维护者检查草稿后完成。
+
+`.github/workflows/ci.yml` 在干净 Windows VS2026 runner 上分别验证 Rust 1.98.0/1.99.0，使用独立 target 目录，禁止调用原生库生产工具，并运行本地假内核、取消/恢复验收和脚本故障注入。Python 只用于开发/CI 测试，exe 运行不依赖它。
 
 ## 快速开始
 

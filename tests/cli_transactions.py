@@ -2,6 +2,7 @@
 import argparse
 from contextlib import closing
 import http.server
+import hashlib
 import json
 import os
 import sqlite3
@@ -150,6 +151,38 @@ class Fixture:
 
 
 class Transactions(unittest.TestCase):
+    def seed_verification_history(self, fixture, node, passed):
+        path = Path(fixture.temporary.name) / "ProxPilot/history.sqlite3"
+        with closing(sqlite3.connect(path)) as db:
+            scope,target = db.execute("SELECT scope,target FROM measurements LIMIT 1").fetchone()
+            evidence = {"stage":"verification","availability":"webpage" if passed else "failed", "delay_ms":200.0 if passed else None,
+                        "error_code":None if passed else "website_http", "http_status":200 if passed else 403, "samples_requested":2, "samples_passed":2 if passed else 0}
+            for _ in range(3):
+                db.execute("INSERT INTO measurements(scope,target,node,timestamp,evidence) VALUES(?,?,?,?,?)", (scope,target,hashlib.sha256(node.encode()).hexdigest(),int(time.time()),json.dumps(evidence)))
+            db.commit()
+
+    def test_fix_uses_history_score_within_current_grade(self):
+        with Fixture([200]) as fixture:
+            def measured():
+                if fixture.selected == "original": time.sleep(0.08)
+                return 200
+            fixture.responses = [measured]
+            self.assertEqual(fixture.run("scan").returncode, 0)
+            self.seed_verification_history(fixture, "target", False)
+            self.seed_verification_history(fixture, "original", True)
+            result = fixture.run("fix", "--top", "2", "--no-system-proxy")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(fixture.selected, "original", result.stdout)
+            self.assertIn("50/25/15/10", result.stdout)
+
+    def test_good_history_does_not_select_currently_failed_node(self):
+        with Fixture([403,200,200]) as fixture:
+            self.assertEqual(fixture.run("scan").returncode, 0)
+            self.seed_verification_history(fixture, "target", True)
+            result = fixture.run("fix", "--top", "2", "--no-system-proxy")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(fixture.selected, "original", result.stdout)
+
     def test_external_switch_during_verification_is_not_attributed_to_candidate_history(self):
         with Fixture([200]) as fixture:
             def externally_changed():
@@ -180,6 +213,7 @@ class Transactions(unittest.TestCase):
             self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
             self.assertEqual(len(fixture.requests), count)
             self.assertNotIn("target", listed.stdout)
+            self.assertIn("50/25/15/10", listed.stdout)
             preview = fixture.run("history", "clear", "--dry-run")
             self.assertEqual(preview.returncode, 0, preview.stdout + preview.stderr)
             with closing(sqlite3.connect(path)) as db: self.assertEqual(db.execute("SELECT count(*) FROM measurements").fetchone()[0], 3)

@@ -97,6 +97,8 @@ pub struct CommitReport {
     pub verification: VerificationReport,
     pub memory: Option<MemorySync>,
     pub warnings: Vec<AppError>,
+    pub score: Option<crate::scoring::ScoreBreakdown>,
+    pub candidates: Vec<crate::scoring::Candidate>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -357,6 +359,8 @@ impl<'a, C: SwitchControl + ?Sized> SwitchTransaction<'a, C> {
             verification: verification.clone(),
             memory,
             warnings,
+            score: None,
+            candidates: vec![],
         })
     }
 

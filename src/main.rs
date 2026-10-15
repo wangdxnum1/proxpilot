@@ -14,6 +14,7 @@ mod probe_scheduler;
 mod procinfo;
 mod runtime_switch;
 mod scan_output;
+mod scoring;
 mod switching;
 mod sysproxy;
 mod ui;
@@ -326,6 +327,7 @@ fn cmd_history(clear: bool, dry_run: bool) -> Result<(), String> {
         "最近测量：{} 条（30天内，最多显示100条；节点/范围使用不可逆指纹别名）",
         rows.len()
     ));
+    let mut shown = std::collections::HashSet::new();
     for row in rows {
         let stage = if row.measurement.stage == diagnostics::Stage::Probe {
             "初筛"
@@ -358,6 +360,20 @@ fn cmd_history(clear: bool, dry_run: bool) -> Result<(), String> {
             grade,
             delay
         );
+        if row.measurement.stage == diagnostics::Stage::Verification
+            && shown.insert((row.scope.clone(), row.target.clone(), row.node.clone()))
+        {
+            let evidence = store.recent_entry(&row, now)?;
+            let unverified = diagnostics::VerificationReport {
+                availability: diagnostics::Availability::Failed,
+                mean_ms: None,
+                samples_requested: 0,
+                samples_passed: 0,
+                error: None,
+            };
+            let basis = scoring::score_at(&evidence, &unverified, None, now);
+            ui::dim(&format!("历史依据（人为权重 50/25/15/10）：{} 次验证 · 成功率分 {:.1}/50 · 延迟分 {:.1}/25 · 稳定性分 {:.1}/15；倍率未知，成本分0；不代表当前可用",basis.samples,basis.success,basis.latency,basis.stability));
+        }
     }
     Ok(())
 }
@@ -449,7 +465,7 @@ fn print_help() {
     println!("  info <节点>    查看节点配置详情及信息来源（不显示凭据）");
     println!("  check          体检：内核 / 系统代理 / 当前节点能否访问测试网址");
     println!("  scan           探测组内所有节点的可达性（不切换）");
-    println!("  fix            优选：探测 → 真实验证 → 切到实测最快的节点");
+    println!("  fix            优选：探测 → 真实验证 → 按验证等级和参考分优选并确认");
     println!("  use <节点>     手动切换到指定节点并验证");
     println!("  watch          守护模式：保持可用节点，坏了自动修；加 --optimize 主动优选");
     println!();
@@ -1309,6 +1325,19 @@ fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
 
 fn print_commit(result: &switching::CommitReport) {
     ui::ok(&format!("已确认 {} → {}", result.group, result.selected));
+    if let Some(score) = &result.score {
+        ui::info(&format!(
+            "参考分 {:.1}/100 · 历史网页验证 {} 次{}",
+            score.total,
+            score.samples,
+            if score.samples < 3 {
+                "（样本不足，成功率/波动采用中性先验）"
+            } else {
+                ""
+            }
+        ));
+        ui::dim(&format!("人为权重 50/25/15/10：成功率 {:.1}/50 · 延迟 {:.1}/25 · 稳定性 {:.1}/15 · 成本 {:.1}/10；先比较本轮验证等级，再比较参考分",score.success,score.latency,score.stability,score.cost));
+    }
     match result.verification.availability {
         diagnostics::Availability::Webpage => ui::ok(&format!(
             "网页验证通过（平均 {:.2}s）",

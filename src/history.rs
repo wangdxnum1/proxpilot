@@ -209,6 +209,19 @@ impl HistorySession {
             .ok_or_else(unavailable)?
             .recent(&self.scope, node, now())
     }
+    pub fn prior(&mut self, node: &str) -> Vec<HistoryEntry> {
+        if self.warning.is_some() {
+            return vec![];
+        }
+        match self.recent(node) {
+            Ok(rows) => rows,
+            Err(error) => {
+                crate::ui::warn(&format!("测量历史读取失败，评分采用冷启动先验：{error}"));
+                self.warning = Some(error);
+                vec![]
+            }
+        }
+    }
 }
 impl HistoryStore {
     pub fn current() -> AppResult<Self> {
@@ -316,7 +329,7 @@ impl HistoryStore {
                 time,
                 scope.map(|s| &s.identity),
                 scope.map(|s| &s.target),
-                node.map(fingerprint),
+                node,
                 limit as i64
             ])
             .map_err(|_| unavailable())?;
@@ -351,7 +364,15 @@ impl HistoryStore {
         node: &str,
         time: i64,
     ) -> AppResult<Vec<HistoryEntry>> {
-        self.query(Some(scope), Some(node), time, 10000)
+        self.query(Some(scope), Some(&fingerprint(node)), time, 10000)
+    }
+    pub fn recent_entry(&self, entry: &HistoryEntry, time: i64) -> AppResult<Vec<HistoryEntry>> {
+        let scope = HistoryScope {
+            identity: entry.scope.clone(),
+            target: entry.target.clone(),
+            profile: None,
+        };
+        self.query(Some(&scope), Some(&entry.node), time, 10000)
     }
     pub fn list(&self, time: i64) -> AppResult<Vec<HistoryEntry>> {
         self.query(None, None, time, 100)
@@ -545,6 +566,8 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(store.recent(&scope, "n", now).unwrap().len(), 10_000);
+            let latest = store.list(now).unwrap().remove(0);
+            assert_eq!(store.recent_entry(&latest, now).unwrap().len(), 10_000);
             assert_eq!(
                 store
                     .connection

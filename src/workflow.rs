@@ -288,9 +288,12 @@ pub fn use_flow(
             target: target.into(),
         });
     }
-    let result = in_transaction(&control, &scope, args, |transaction| {
+    let mut scored_candidate = None;
+    let mut history_warning = None;
+    let mut result = in_transaction(&control, &scope, args, |transaction| {
         let mut history =
             crate::history::HistorySession::new(be, scope.profile, &args.group, &args.url);
+        let prior = history.prior(target);
         transaction.select(target)?;
         let evidence = checker::verify_access_report_with_timeout(
             &be.proxy,
@@ -299,9 +302,23 @@ pub fn use_flow(
             args.verify_timeout_ms,
         );
         transaction.validate_current()?;
+        scored_candidate = crate::scoring::Candidate::verified(
+            target.into(),
+            &prior,
+            evidence.clone(),
+            policy.resolve(target).map(|(rate, _)| rate),
+        );
         history.record_verification(be, target, &evidence);
+        history_warning = history.warning;
         Ok(evidence)
     })?;
+    if let Some(candidate) = scored_candidate {
+        result.score = Some(candidate.score.clone());
+        result.candidates.push(candidate);
+    }
+    if let Some(error) = history_warning {
+        result.warnings.push(error);
+    }
     Ok(SelectionOutcome::Committed { result })
 }
 
@@ -329,7 +346,10 @@ pub fn fix_flow(
     if !checker::core_alive(&be.proxy) {
         return Err(AppError::new(ErrorCode::ClientUnavailable, Stage::Discovery).into());
     }
-    in_transaction(&control, &scope, args, |transaction| {
+    let mut ranking = Vec::new();
+    let mut chosen_score = None;
+    let mut history_warning = None;
+    let mut result = in_transaction(&control, &scope, args, |transaction| {
         let mut history =
             crate::history::HistorySession::new(be, scope.profile, &args.group, &args.url);
         if args.manage_system_proxy {
@@ -364,6 +384,7 @@ pub fn fix_flow(
         let mut verified = Vec::new();
         let mut last_error = AppError::new(ErrorCode::ProbeFailed, Stage::Verification);
         for (_, name) in reachable.iter().take(args.top) {
+            let prior = history.prior(name);
             transaction.select(name)?;
             let evidence = checker::verify_access_report_with_timeout(
                 &be.proxy,
@@ -395,33 +416,24 @@ pub fn fix_flow(
                         "仅 IP 交叉检查通过"
                     }
                 ));
-                verified.push((name.clone(), evidence));
+                if let Some(candidate) = crate::scoring::Candidate::verified(
+                    name.clone(),
+                    &prior,
+                    evidence,
+                    policy.resolve(name).map(|(rate, _)| rate),
+                ) {
+                    verified.push(candidate);
+                }
             }
             if verified.len() >= 5 {
                 break;
             }
         }
-        verified.sort_by(|a, b| {
-            let grade = |e: &VerificationReport| {
-                if e.availability == Availability::Webpage {
-                    0
-                } else {
-                    1
-                }
-            };
-            grade(&a.1)
-                .cmp(&grade(&b.1))
-                .then_with(|| {
-                    a.1.mean_ms
-                        .unwrap_or(f64::MAX)
-                        .total_cmp(&b.1.mean_ms.unwrap_or(f64::MAX))
-                })
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        let Some((best, prior)) = verified.first() else {
+        verified.sort_by(crate::scoring::compare_candidates);
+        let Some(best) = verified.first() else {
             return Err(last_error);
         };
-        transaction.select(best)?;
+        transaction.select(&best.node)?;
         let final_evidence = checker::verify_access_report_with_timeout(
             &be.proxy,
             &args.url,
@@ -429,14 +441,23 @@ pub fn fix_flow(
             args.verify_timeout_ms,
         );
         transaction.validate_current()?;
-        history.record_verification(be, best, &final_evidence);
-        if prior.availability == Availability::Webpage
+        history.record_verification(be, &best.node, &final_evidence);
+        if best.verification.availability == Availability::Webpage
             && final_evidence.availability != Availability::Webpage
         {
             return Err(final_evidence.error.unwrap_or_else(|| {
                 AppError::new(ErrorCode::TransportUnknown, Stage::Verification)
             }));
         }
+        chosen_score = Some(best.score.clone());
+        ranking = verified;
+        history_warning = history.warning;
         Ok(final_evidence)
-    })
+    })?;
+    result.score = chosen_score;
+    result.candidates = ranking;
+    if let Some(error) = history_warning {
+        result.warnings.push(error);
+    }
+    Ok(result)
 }

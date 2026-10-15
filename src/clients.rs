@@ -398,7 +398,7 @@ fn active_proxy_owner(registry: &str) -> Option<String> {
     }
 }
 
-fn cutecloud_managed_profile(paths: &DiscoveryPaths) -> Option<bool> {
+pub(crate) fn cutecloud_managed_profile(paths: &DiscoveryPaths) -> Option<bool> {
     let prefs: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(paths.cutecloud.join("shared_preferences.json")).ok()?,
     )

@@ -7,6 +7,7 @@ mod clients;
 mod commands;
 mod core_api;
 mod detect;
+mod diagnose;
 mod diagnostics;
 mod history;
 mod http;
@@ -79,6 +80,8 @@ pub struct Args {
     pub watch: watch_policy::WatchSettings,
     pub detect: bool,
     pub json: bool,
+    pub output: Option<std::path::PathBuf>,
+    pub overwrite: bool,
 }
 
 #[derive(Clone)]
@@ -95,6 +98,7 @@ pub enum Cmd {
     Info(String),
     Recover(RecoveryAction),
     History(bool),
+    Diagnose,
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +139,8 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         watch: Default::default(),
         detect: false,
         json: false,
+        output: None,
+        overwrite: false,
     };
     let mut command = false;
     let mut supported = false;
@@ -221,6 +227,8 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             "--no-system-proxy" => args.manage_system_proxy = false,
             "--detect" => args.detect = true,
             "--json" => args.json = true,
+            "--output" => args.output = Some(value(&mut it, &arg)?.into()),
+            "--overwrite" => args.overwrite = true,
             "--supported" => supported = true,
             "--retry" | "--discard" => {
                 if recovery_action.is_some() {
@@ -237,11 +245,12 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 return Ok(args);
             }
             "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" | "nodes"
-            | "info" | "recover" | "history"
+            | "info" | "recover" | "history" | "diagnose"
                 if !command =>
             {
                 command = true;
                 args.cmd = match arg.as_str() {
+                    "diagnose" => Cmd::Diagnose,
                     "nodes" => Cmd::Nodes,
                     "recover" => Cmd::Recover(RecoveryAction::Inspect),
                     "history" => Cmd::History(false),
@@ -269,6 +278,9 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             "clear" if matches!(args.cmd, Cmd::History(false)) => args.cmd = Cmd::History(true),
             _ => return Err(format!("未知命令或参数：{}", arg)),
         }
+    }
+    if (args.output.is_some() || args.overwrite) && !matches!(args.cmd, Cmd::Diagnose) {
+        return Err("--output / --overwrite 仅用于 diagnose".into());
     }
     if supported {
         if matches!(args.cmd, Cmd::Clients(_)) {
@@ -539,6 +551,7 @@ fn print_help() {
     println!("用法: proxpilot <命令> [选项]");
     println!();
     println!("命令:");
+    println!("  diagnose       只读匿名诊断；--output <文件>，覆盖需 --overwrite；不测速/上传");
     println!("  history [clear] 查看最近测量记录或清理本工具历史（无需内核在线）");
     println!("  recover [--retry | --discard]  查看、重试恢复或仅清理恢复记录");
     println!("  clients [--supported]  查看发现的客户端 / 支持的类型");
@@ -1658,6 +1671,18 @@ fn run_main() {
         exit(1)
     });
     let static_result = match &args.cmd {
+        Cmd::Diagnose => Some((|| -> Result<(), String> {
+            let value = diagnose::collect(&args);
+            if let Some(path) = &args.output {
+                diagnose::write_report(path, args.overwrite, &value).map_err(|e| {
+                    report::error(&e);
+                    e.to_string()
+                })?;
+            }
+            report::data(&value);
+            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            Ok(())
+        })()),
         Cmd::Clients(s) => Some(cmd_clients(&args, *s)),
         Cmd::Config(c) => Some(cmd_config(c, args.dry_run)),
         Cmd::History(clear) => Some(cmd_history(*clear, args.dry_run)),
@@ -1711,7 +1736,7 @@ fn run_main() {
         Cmd::Fix => cmd_fix(&be, &agent, &args),
         Cmd::Use(n) => cmd_use(&be, &agent, &args, n),
         Cmd::Watch => cmd_watch(&be, &agent, &args),
-        Cmd::Clients(_) | Cmd::Config(_) | Cmd::History(_) => unreachable!(),
+        Cmd::Clients(_) | Cmd::Config(_) | Cmd::History(_) | Cmd::Diagnose => unreachable!(),
         Cmd::Help => {
             print_help();
             0

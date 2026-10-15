@@ -4,6 +4,9 @@ use colored::Colorize;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+const DELAY_WIDTH: usize = 8;
+const RANK_WIDTH: usize = 2;
+
 #[derive(Clone, Copy, Default)]
 enum Style {
     #[default]
@@ -126,8 +129,8 @@ fn protocol_name(protocol: &str) -> &str {
 }
 
 pub fn header(width: usize, economical: bool) -> String {
-    // 与数据行的五位延迟数字右边界对齐，末尾三列留给“ ms”。
-    let delay = format!("{}   ", pad_start("延迟", 5));
+    // 单位只在表头出现，表头与数值共享列宽及右边界。
+    let delay = pad_start("延迟(ms)", DELAY_WIDTH);
     let text = if width < 76 && economical {
         "节点 / 延迟 · 协议".into()
     } else if width < 76 {
@@ -137,7 +140,7 @@ pub fn header(width: usize, economical: bool) -> String {
     } else {
         format!(
             "  {}  {}  {}  {}  节点",
-            pad_start("#", 2),
+            pad_start("#", RANK_WIDTH),
             delay,
             pad("倍率", 6),
             pad("协议", 10)
@@ -173,15 +176,15 @@ pub fn row(row: &Row<'_>, width: usize, economical: bool) -> String {
     let mut result = String::new();
     let name_indent;
     if compact {
-        let prefix = format!("  {marker} {rank:>2}  ");
+        let prefix = format!("  {marker} {rank:>RANK_WIDTH$}  ");
         name_indent = prefix.width();
         result.push_str(&name_style.paint(&prefix));
     } else {
         let mut prefix = vec![span(format!("  {marker} "), name_style)];
         if !economical {
-            prefix.push(span(format!("{rank:>2}  "), Style::Dim));
+            prefix.push(span(format!("{rank:>RANK_WIDTH$}  "), Style::Dim));
         }
-        prefix.push(span(format!("{:>5} ms  ", row.delay), delay_style));
+        prefix.push(span(format!("{:>DELAY_WIDTH$}  ", row.delay), delay_style));
         if !economical {
             prefix.push(span(format!("{}  ", pad(&rate, 6)), rate_style));
         }

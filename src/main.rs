@@ -4,6 +4,7 @@ mod client_config;
 mod clients;
 mod core_api;
 mod detect;
+mod diagnostics;
 mod http;
 mod mihomo;
 mod nodeinfo;
@@ -726,11 +727,7 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
                     0
                 }
                 checker::Verdict::Fail(c) => {
-                    let cs = if c == 0 {
-                        "连接或传输失败".to_string()
-                    } else {
-                        format!("HTTP {}", c)
-                    };
+                    let cs = c.to_string();
                     ui::fail(&format!(
                         "{} 不可访问（{}）—— 运行 proxpilot fix 自动优选切换",
                         args.url, cs
@@ -779,7 +776,19 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         members.len(),
         checker::scan_concurrency(members.len())
     ));
-    let reachable = checker::scan_reachable(be, agent, &members, &args.url);
+    let report = checker::scan_reachable_report(be, agent, &members, &args.url);
+    let reachable = report.reachable();
+    if let Some(error) = report.controller_failure() {
+        ui::fail(&error.to_string());
+        return 1;
+    }
+    let mut failures = std::collections::BTreeMap::<String, usize>::new();
+    for error in report.measurements.iter().filter_map(|m| m.error.as_ref()) {
+        *failures.entry(error.to_string()).or_default() += 1;
+    }
+    for (reason, count) in failures {
+        ui::dim(&format!("{count} 个节点探测未成功：{reason}"));
+    }
     println!();
     scope.print_current(&members, &reachable);
     if reachable.is_empty() {
@@ -1124,7 +1133,7 @@ fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
                     ui::ok(&format!("最终确认：{} 可访问（IP 检查通过）", args.url))
                 }
                 checker::Verdict::Fail(c) => {
-                    ui::warn(&format!("最终确认异常（HTTP {}），可重跑 proxpilot fix", c))
+                    ui::warn(&format!("最终确认异常（{}），可重跑 proxpilot fix", c))
                 }
             }
             0
@@ -1186,7 +1195,7 @@ fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &s
                     0
                 }
                 checker::Verdict::Fail(c) => {
-                    ui::warn(&format!("切换成功但 {} 未通过验证（HTTP {}）", args.url, c));
+                    ui::warn(&format!("切换成功但 {} 未通过验证（{}）", args.url, c));
                     2
                 }
             }
@@ -1314,8 +1323,8 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
         let v1 = checker::verify_access(&be.proxy, &args.url, 1);
         let mut broken = !v1.is_ok();
         let mut last_code = match &v1 {
-            checker::Verdict::Fail(c) => *c,
-            _ => 200,
+            checker::Verdict::Fail(error) => error.to_string(),
+            _ => String::new(),
         };
         if broken {
             // 5 秒后复测一次，避免偶发误报
@@ -1323,13 +1332,13 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             let v2 = checker::verify_access(&be.proxy, &args.url, 1);
             broken = !v2.is_ok();
             if let checker::Verdict::Fail(c) = v2 {
-                last_code = c;
+                last_code = c.to_string();
             }
         }
         let due = reoptimization_due(args.optimize, last_opt.map(|t| t.elapsed()), args.reopt);
         if broken || due {
             let reason = if broken {
-                format!("检测到 {} 不可访问（HTTP {}）", args.url, last_code)
+                format!("检测到 {} 不可访问（{}）", args.url, last_code)
             } else {
                 if last_opt.is_none() {
                     "启动主动优选".to_string()

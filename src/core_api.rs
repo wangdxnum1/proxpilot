@@ -1,4 +1,5 @@
 use crate::detect::Backend;
+use crate::diagnostics::{AppError, AppResult, ErrorCode, Stage};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
@@ -49,10 +50,22 @@ impl CoreApi {
         path: &str,
         body: Option<Vec<u8>>,
         timeout: Duration,
-    ) -> Result<CoreResponse, String> {
+    ) -> AppResult<CoreResponse> {
+        self.request_detailed(be, method, path, body, timeout)
+    }
+
+    pub fn request_detailed(
+        &self,
+        be: &Backend,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        timeout: Duration,
+    ) -> AppResult<CoreResponse> {
         let response = match &be.api {
             ApiEndpoint::Http(base) => {
-                crate::clients::validate_endpoint_identity(be.kind, base)?;
+                crate::clients::validate_endpoint_identity(be.kind, base)
+                    .map_err(|_| AppError::new(ErrorCode::IdentityMismatch, Stage::Controller))?;
                 let mut request = self
                     .http
                     .request(method, format!("{}{}", base.trim_end_matches('/'), path))
@@ -67,15 +80,15 @@ impl CoreApi {
                 }
                 let response = request
                     .send()
-                    .map_err(|e| format!("API 请求失败：{}", e.without_url()))?;
+                    .map_err(|e| AppError::from_reqwest(&e, Stage::Controller))?;
                 let status = response.status().as_u16();
                 // 错误响应无需读取可能含私密诊断信息的响应体。
                 if !(200..300).contains(&status) {
-                    return Err(format!("API 请求失败：HTTP {}", status));
+                    return Err(AppError::controller_status(status));
                 }
                 let body = response
                     .bytes()
-                    .map_err(|e| format!("API 响应传输失败：{}", e.without_url()))?
+                    .map_err(|e| AppError::from_reqwest(&e, Stage::Controller))?
                     .to_vec();
                 CoreResponse { status, body }
             }
@@ -83,7 +96,7 @@ impl CoreApi {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|_| AppError::new(ErrorCode::StateUnavailable, Stage::Controller))?;
                 runtime.block_on(async {
                     tokio::time::timeout(timeout, async {
                         let stream = loop {
@@ -92,7 +105,12 @@ impl CoreApi {
                                 Err(e) if e.raw_os_error() == Some(231) => {
                                     tokio::time::sleep(Duration::from_millis(10)).await
                                 }
-                                Err(e) => return Err(format!("连接内核命名管道失败：{}", e)),
+                                Err(_) => {
+                                    return Err(AppError::new(
+                                        ErrorCode::ClientUnavailable,
+                                        Stage::Controller,
+                                    ))
+                                }
                             }
                         };
                         if let Some(kind) = be.kind {
@@ -108,13 +126,18 @@ impl CoreApi {
                                 || crate::procinfo::identify_pid(Some(pid)).name
                                     != kind.display_name()
                             {
-                                return Err("命名管道服务端身份不匹配或无法确认".into());
+                                return Err(AppError::new(
+                                    ErrorCode::IdentityMismatch,
+                                    Stage::Controller,
+                                ));
                             }
                         }
                         let (mut sender, connection) =
                             hyper::client::conn::http1::handshake(TokioIo::new(stream))
                                 .await
-                                .map_err(|e| format!("管道 HTTP 握手失败：{}", e))?;
+                                .map_err(|_| {
+                                    AppError::new(ErrorCode::TransportUnknown, Stage::Controller)
+                                })?;
                         let connection = tokio::spawn(connection);
                         let mut builder = hyper::Request::builder()
                             .method(method.as_str())
@@ -129,21 +152,24 @@ impl CoreApi {
                         }
                         let request = builder
                             .body(Full::new(Bytes::from(body.unwrap_or_default())))
-                            .map_err(|_| "API 请求参数或鉴权头无效".to_string())?;
+                            .map_err(|_| {
+                                AppError::new(ErrorCode::InvalidInput, Stage::Controller)
+                            })?;
                         let result = async {
-                            let response = sender
-                                .send_request(request)
-                                .await
-                                .map_err(|e| format!("管道 API 请求失败：{}", e))?;
+                            let response = sender.send_request(request).await.map_err(|_| {
+                                AppError::new(ErrorCode::TransportUnknown, Stage::Controller)
+                            })?;
                             let status = response.status().as_u16();
                             if !(200..300).contains(&status) {
-                                return Err(format!("API 请求失败：HTTP {}", status));
+                                return Err(AppError::controller_status(status));
                             }
                             let body = response
                                 .into_body()
                                 .collect()
                                 .await
-                                .map_err(|e| format!("管道响应传输失败：{}", e))?
+                                .map_err(|_| {
+                                    AppError::new(ErrorCode::ResponseTransfer, Stage::Controller)
+                                })?
                                 .to_bytes()
                                 .to_vec();
                             Ok(CoreResponse { status, body })
@@ -153,7 +179,7 @@ impl CoreApi {
                         result
                     })
                     .await
-                    .map_err(|_| "内核 API 操作超时".to_string())?
+                    .map_err(|_| AppError::new(ErrorCode::ControllerTimeout, Stage::Controller))?
                 })?
             }
         };
@@ -167,6 +193,30 @@ mod tests {
     use crate::detect::Backend;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn controller_auth_errors_keep_machine_readable_status_without_response_secrets() {
+        let (url, server) = crate::http::test_support::serve(vec![
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 21\r\nConnection: close\r\n\r\nprivate-response-body".to_vec(),
+        ]);
+        let error = CoreApi::new()
+            .unwrap()
+            .request(
+                &backend(url.into()),
+                reqwest::Method::GET,
+                "/version",
+                None,
+                Duration::from_secs(2),
+            )
+            .err()
+            .unwrap();
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["code"], "controller_auth");
+        assert_eq!(value["http_status"], 401);
+        assert_eq!(value["retryable"], false);
+        assert!(!value.to_string().contains("private-response-body"));
+        server.join().unwrap();
+    }
 
     fn backend(api: ApiEndpoint) -> Backend {
         Backend {
@@ -290,26 +340,26 @@ mod tests {
 
     #[test]
     fn named_pipe_reports_truncation_timeout_and_http_error() {
-        for (response, pause, succeeds) in [
+        for (response, pause, expected_code) in [
             (
                 b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort".to_vec(),
                 Duration::ZERO,
-                false,
+                Some("response_transfer"),
             ),
             (
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec(),
                 Duration::ZERO,
-                false,
+                Some("controller_auth"),
             ),
             (
                 b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
                 Duration::ZERO,
-                true,
+                None,
             ),
             (
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
                 Duration::from_millis(250),
-                false,
+                Some("controller_timeout"),
             ),
         ] {
             let (endpoint, server) = pipe_server(response, pause);
@@ -320,9 +370,13 @@ mod tests {
                 None,
                 Duration::from_millis(100),
             );
-            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(result.is_ok(), expected_code.is_none());
             if let Err(error) = result {
-                assert!(!error.contains("private-test-secret"));
+                assert_eq!(
+                    serde_json::to_value(&error).unwrap()["code"],
+                    expected_code.unwrap()
+                );
+                assert!(!error.to_string().contains("private-test-secret"));
             }
             server.join().unwrap();
         }

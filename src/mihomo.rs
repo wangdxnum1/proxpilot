@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::diagnostics::{AppError, AppResult, ErrorCode, Stage};
 use crate::Backend;
 
 #[derive(Deserialize, Clone)]
@@ -101,24 +102,37 @@ pub fn probe_delay(
     node: &str,
     url: &str,
     timeout_ms: u32,
-) -> Option<i64> {
+) -> AppResult<i64> {
+    probe_delay_detailed(be, api, node, url, timeout_ms)
+}
+
+pub fn probe_delay_detailed(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+    node: &str,
+    url: &str,
+    timeout_ms: u32,
+) -> AppResult<i64> {
     let path = format!(
         "/proxies/{}/delay?url={}&timeout={}",
         enc_path(node),
         enc(url),
         timeout_ms
     );
-    let response = api
-        .request(
-            be,
-            reqwest::Method::GET,
-            &path,
-            None,
-            std::time::Duration::from_millis(u64::from(timeout_ms) + 2000),
-        )
-        .ok()?;
-    let value: Value = serde_json::from_slice(&response.body).ok()?;
-    value.get("delay")?.as_i64().filter(|d| *d > 0)
+    let response = api.request(
+        be,
+        reqwest::Method::GET,
+        &path,
+        None,
+        std::time::Duration::from_millis(u64::from(timeout_ms) + 2000),
+    )?;
+    let value: Value = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Probe))?;
+    value
+        .get("delay")
+        .and_then(Value::as_i64)
+        .filter(|d| *d > 0)
+        .ok_or_else(|| AppError::new(ErrorCode::ProbeFailed, Stage::Probe))
 }
 
 pub fn switch_group(

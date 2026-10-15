@@ -24,6 +24,8 @@ serde_json = "1"
 colored = "2"
 winreg = "0.52"
 rusqlite = { version = "0.32", features = ["bundled"] }
+unicode-width = "0.2"
+unicode-segmentation = "1.13"
 
 [profile.release]
 strip = true

@@ -8,6 +8,7 @@ mod http;
 mod mihomo;
 mod nodeinfo;
 mod procinfo;
+mod scan_output;
 mod sysproxy;
 mod ui;
 
@@ -216,6 +217,7 @@ fn cmd_clients(supported: bool) -> Result<(), String> {
                     ""
                 }
             );
+            println!("  配置来源：{}", be.source);
         } else {
             println!(
                 "{}：不可用 — {}",
@@ -344,17 +346,29 @@ fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
             return Err(1);
         }
     };
-    ui::info(&format!("目标客户端：{}", be.client.green().bold()));
-    ui::info(&format!("内核 API：{}（{}）", be.api, be.source));
-    if let Some(v) = &be.version {
-        ui::dim(&format!("内核版本 {}", v));
+    if matches!(args.cmd, Cmd::Scan) {
+        scan_output::note(
+            &format!(
+                "{} · 内核 {} · {}",
+                be.client,
+                be.version.as_deref().unwrap_or("版本未知"),
+                be.proxy
+            ),
+            scan_output::terminal_width(),
+        );
+    } else {
+        ui::info(&format!("目标客户端：{}", be.client.green().bold()));
+        ui::info(&format!("内核 API：{}（{}）", be.api, be.source));
+        if let Some(v) = &be.version {
+            ui::dim(&format!("内核版本 {}", v));
+        }
+        ui::info(&format!("代理出口：{}", be.proxy));
     }
     if !be.alternatives.is_empty() {
         for (c, a) in &be.alternatives {
             ui::dim(&format!("同时发现：{}（{}）—— 用 --api 可指定", c, a));
         }
     }
-    ui::info(&format!("代理出口：{}", be.proxy));
     println!();
     Ok((be, agent))
 }
@@ -414,15 +428,23 @@ impl NodeScope {
     }
 
     fn print_current(&self, members: &[String], reachable: &[(i64, String)]) {
+        let width = scan_output::terminal_width();
         for (group, selected) in &self.current {
-            ui::info(&format!(
-                "组「{}」{}",
-                group,
-                scan_current_status(selected.as_deref(), members, reachable)
-            ));
+            print!(
+                "{}",
+                scan_output::current(
+                    group,
+                    selected.as_deref(),
+                    &format!(
+                        "{} · 扫描开始时的选择",
+                        scan_current_detail(selected.as_deref(), members, reachable)
+                    ),
+                    width,
+                )
+            );
         }
         if let Some(notice) = &self.current_notice {
-            ui::dim(notice);
+            scan_output::note(notice, width);
         }
     }
 }
@@ -764,23 +786,35 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         ui::fail("没有任何节点可达");
         return 2;
     }
-    ui::ok(&format!(
-        "可达 {}/{}（注意：任何 HTTP 响应都算可达，IP 被风控的 403 也包含）",
+    let width = scan_output::terminal_width();
+    println!(
+        "  {}  {} 可达 / {} 已测",
+        "扫描完成".bold(),
         reachable.len(),
         members.len()
-    ));
+    );
+    println!();
     ui::info(&format!(
         "可达排行：显示前 {} / {} 个（按延迟排序）",
         reachable.len().min(30),
         reachable.len()
     ));
-    for (d, n) in reachable.iter().take(30) {
-        print_scan_row(
-            *d,
-            n,
-            scope.is_current(n).then_some(n.as_str()),
-            &policy,
-            proxies.get(n),
+    print!("{}", scan_output::header(width, false));
+    for (index, (d, n)) in reachable.iter().take(30).enumerate() {
+        print!(
+            "{}",
+            scan_output::row(
+                &scan_output::Row {
+                    delay: *d,
+                    name: n,
+                    current: scope.is_current(n),
+                    rank: Some(index + 1),
+                    rate: policy.resolve(n),
+                    protocol: proxies.get(n).map(|p| p.ptype.as_str()).unwrap_or(""),
+                },
+                width,
+                false
+            )
         );
     }
     let economical: Vec<_> = reachable
@@ -792,52 +826,74 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         "1倍率可达节点：{} 个（按延迟排序，完整列出）",
         economical.len()
     ));
+    if !economical.is_empty() {
+        print!("{}", scan_output::header(width, true));
+    }
     for (delay, name) in economical {
-        print_scan_row(
-            *delay,
-            name,
-            scope.is_current(name).then_some(name.as_str()),
-            &policy,
-            proxies.get(name),
+        print!(
+            "{}",
+            scan_output::row(
+                &scan_output::Row {
+                    delay: *delay,
+                    name,
+                    current: scope.is_current(name),
+                    rank: None,
+                    rate: policy.resolve(name),
+                    protocol: proxies.get(name).map(|p| p.ptype.as_str()).unwrap_or(""),
+                },
+                width,
+                true
+            )
         );
     }
-    println!(
-        "  标识：{} = 探测延迟 ≤ 200ms；{} = 名称或订阅提示识别为1倍率；{} = 名称标注专线；{} = 当前选中节点",
-        "[低延迟]".cyan().bold(),
-        "[1倍率·省流量]".green().bold(),
-        "[专线]".magenta().bold(),
-        "[当前]".yellow()
+    println!();
+    scan_output::note(
+        "延迟 ≤ 200ms 为低延迟；1× 为1倍率，? 为未知倍率；▶ 当前；SS = Shadowsocks。",
+        width,
     );
-    ui::dim(
-        "协议来自内核 API；直连/中转/专线/家宽标签来自节点名称，未实测验证；未标注的类型不推断。",
+    scan_output::note(
+        "协议来自内核；倍率来自名称或标注的订阅提示；线路与家宽标签来自名称，未经实测验证。",
+        width,
     );
-    ui::dim("提示：可达 ≠ 能打开网页，IP 是否被风控要用 proxpilot fix 实测验证");
+    scan_output::note(
+        "可达仅表示收到 HTTP 响应（含 403）；网站可用性请运行 proxpilot fix。",
+        width,
+    );
     0
 }
 
-fn scan_current_status(
+fn scan_current_detail(
     current: Option<&str>,
     members: &[String],
     reachable: &[(i64, String)],
 ) -> String {
     let Some(name) = current else {
-        return "[当前] 内核未提供当前选择".into();
+        return "内核未提供当前选择".into();
     };
-    let status = if let Some((rank, (delay, _))) =
-        reachable.iter().enumerate().find(|(_, (_, n))| n == name)
-    {
+    if let Some((rank, (delay, _))) = reachable.iter().enumerate().find(|(_, (_, n))| n == name) {
         format!("{}ms · 可达排名 {}/{}", delay, rank + 1, reachable.len())
     } else if members.iter().any(|n| n == name) {
         "本轮探测未成功（超时或请求失败，不等于客户端一定不可用）".into()
     } else {
         "未参与本轮探测（不在筛选后的真实节点候选中）".into()
-    };
-    format!("[当前] {} · {}（扫描开始时的选择）", name, status)
+    }
 }
 
 #[cfg(test)]
 mod scan_current_tests {
     use super::*;
+    fn scan_current_status(
+        current: Option<&str>,
+        members: &[String],
+        reachable: &[(i64, String)],
+    ) -> String {
+        scan_output::current(
+            "test",
+            current,
+            &scan_current_detail(current, members, reachable),
+            100,
+        )
+    }
     #[test]
     fn current_node_outside_top_thirty_is_still_visible() {
         let mut reachable: Vec<_> = (0..30).map(|i| (i + 1, format!("node-{}", i))).collect();
@@ -1010,64 +1066,6 @@ mod node_scope_tests {
 #[cfg(test)]
 fn is_one_rate(name: &str) -> bool {
     nodeinfo::rate_from_name(name) == Some(1.0)
-}
-
-fn print_scan_row(
-    delay: i64,
-    name: &str,
-    current: Option<&str>,
-    policy: &nodeinfo::BillingPolicy,
-    info: Option<&mihomo::ProxyInfo>,
-) {
-    let row = format!(
-        "      ✔ {:>5}ms  {}{}",
-        delay,
-        name,
-        if delay <= 200 { "  [低延迟]" } else { "" }
-    );
-    let row = if delay <= 200 {
-        row.cyan().bold()
-    } else {
-        row.normal()
-    };
-    let economical = if policy.resolve(name).is_some_and(|(rate, _)| rate == 1.0) {
-        format!("  {}", "[1倍率·省流量]".green().bold())
-    } else {
-        String::new()
-    };
-    let selected = if current == Some(name) {
-        format!("  {}", "[当前]".yellow())
-    } else {
-        String::new()
-    };
-    let provenance = match policy.resolve(name) {
-        Some((rate, true)) => format!("  [{}倍率·订阅提示]", rate),
-        _ => String::new(),
-    };
-    let protocol = info
-        .map(|p| p.ptype.trim())
-        .filter(|p| !p.is_empty())
-        .unwrap_or("协议未知");
-    let labels = nodeinfo::route_labels(name);
-    let route = if labels.is_empty() {
-        String::new()
-    } else {
-        let labels: Vec<_> = labels
-            .iter()
-            .map(|label| {
-                if *label == "专线" {
-                    label.magenta().bold().to_string()
-                } else {
-                    label.to_string()
-                }
-            })
-            .collect();
-        format!("  [{}]", labels.join("·"))
-    };
-    println!(
-        "{}  [{}]{}{}{}{}",
-        row, protocol, route, economical, provenance, selected
-    );
 }
 
 #[cfg(test)]

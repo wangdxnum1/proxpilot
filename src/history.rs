@@ -196,7 +196,17 @@ impl HistorySession {
         if report.error.as_ref().is_some_and(|error| {
             matches!(
                 error.code,
-                ErrorCode::Cancelled | ErrorCode::ControllerAuth | ErrorCode::IdentityMismatch
+                ErrorCode::Cancelled
+                    | ErrorCode::ControllerAuth
+                    | ErrorCode::IdentityMismatch
+                    | ErrorCode::InvalidInput
+                    | ErrorCode::StateUnavailable
+                    | ErrorCode::ProfileChanged
+                    | ErrorCode::SelectionConflict
+                    | ErrorCode::ClientUnavailable
+                    | ErrorCode::ControllerHttp
+                    | ErrorCode::ControllerTimeout
+                    | ErrorCode::RollbackFailed
             )
         }) {
             return;

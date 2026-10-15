@@ -14,12 +14,14 @@ pub struct KernelSwitchControl<'a> {
 
 impl KernelSwitchControl<'_> {
     pub fn identity(&self, pid: Option<u32>) -> String {
-        format!(
-            "{}|{}|{}|{:?}",
-            self.backend.kind.map(|k| k.name()).unwrap_or("explicit"),
-            self.backend.source,
-            self.backend.api,
-            pid
+        crate::history::fingerprint(
+            &serde_json::json!([
+                self.backend.kind.map(|k| k.name()).unwrap_or("explicit"),
+                self.backend.source,
+                self.backend.api.to_string(),
+                pid
+            ])
+            .to_string(),
         )
     }
 }
@@ -93,6 +95,48 @@ mod tests {
         switching::SwitchTransaction,
     };
     use std::io::Write;
+    #[test]
+    fn runtime_identity_does_not_serialize_credentials_or_user_paths() {
+        let api = CoreApi::new().unwrap();
+        let mut be = Backend {
+            kind: None,
+            client: "test".into(),
+            api: "http://user:password@127.0.0.1:9000/private?token=secret"
+                .to_string()
+                .into(),
+            secret: Some("bearer-secret".into()),
+            proxy: String::new(),
+            source: r"C:\Users\private-user\config.yaml".into(),
+            version: None,
+            alternatives: vec![],
+        };
+        let one = KernelSwitchControl {
+            backend: &be,
+            api: &api,
+        }
+        .identity(Some(1));
+        assert_eq!(one.len(), 64);
+        for value in ["password", "token", "private-user", "bearer-secret"] {
+            assert!(!one.contains(value));
+        }
+        assert_ne!(
+            one,
+            KernelSwitchControl {
+                backend: &be,
+                api: &api
+            }
+            .identity(Some(2))
+        );
+        be.source = r"C:\other\config.yaml".into();
+        assert_ne!(
+            one,
+            KernelSwitchControl {
+                backend: &be,
+                api: &api
+            }
+            .identity(Some(1))
+        );
+    }
 
     #[test]
     fn live_http_adapter_checks_state_and_commits_without_client_memory() {
@@ -155,11 +199,10 @@ mod tests {
         let mut transaction =
             SwitchTransaction::begin_at(&control, "test-group", Cancellation::new(), &root)
                 .unwrap();
-        assert!(transaction
-            .snapshot()
-            .state
-            .identity
-            .contains(&format!("Some({})", std::process::id())));
+        assert_eq!(
+            transaction.snapshot().state.identity,
+            control.identity(Some(std::process::id()))
+        );
         transaction.select("target").unwrap();
         let result = transaction
             .commit(&VerificationReport {

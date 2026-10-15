@@ -99,6 +99,7 @@ pub struct CommitReport {
     pub warnings: Vec<AppError>,
     pub score: Option<crate::scoring::ScoreBreakdown>,
     pub candidates: Vec<crate::scoring::Candidate>,
+    pub failures: Vec<crate::diagnostics::NodeFailure>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -361,6 +362,7 @@ impl<'a, C: SwitchControl + ?Sized> SwitchTransaction<'a, C> {
             warnings,
             score: None,
             candidates: vec![],
+            failures: vec![],
         })
     }
 

@@ -214,3 +214,10 @@ pub struct VerificationReport {
     pub samples_passed: usize,
     pub error: Option<AppError>,
 }
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NodeFailure {
+    pub node: String,
+    pub phase: Stage,
+    pub error: AppError,
+}

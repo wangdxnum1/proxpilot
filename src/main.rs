@@ -18,10 +18,11 @@ mod scoring;
 mod switching;
 mod sysproxy;
 mod ui;
+mod watch;
+mod watch_policy;
 mod workflow;
 
 use std::process::exit;
-use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
@@ -46,6 +47,7 @@ pub struct Args {
     pub interval: u64,
     pub reopt: u64,
     pub optimize: bool,
+    pub watch: watch_policy::WatchSettings,
     pub detect: bool,
 }
 
@@ -100,6 +102,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         interval: 300,
         reopt: 7200,
         optimize: false,
+        watch: Default::default(),
         detect: false,
     };
     let mut command = false;
@@ -173,6 +176,16 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                     .map_err(|_| "--reopt 必须为整数")?
             }
             "--optimize" => args.optimize = true,
+            "--min-switch-interval" | "--failure-cooldown" | "--manual-hold" => {
+                let seconds: u64 = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| format!("{} 必须为非负整数秒", arg))?;
+                match arg.as_str() {
+                    "--min-switch-interval" => args.watch.min_switch_interval_secs = seconds,
+                    "--failure-cooldown" => args.watch.failure_cooldown_secs = seconds,
+                    _ => args.watch.manual_hold_secs = seconds,
+                }
+            }
             "--dry-run" => args.dry_run = true,
             "--no-system-proxy" => args.manage_system_proxy = false,
             "--detect" => args.detect = true,
@@ -241,6 +254,11 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
     }
     if args.samples == 0 || args.interval == 0 || args.reopt == 0 {
         return Err("samples、interval、reopt 必须大于 0".into());
+    }
+    if !reqwest::Url::parse(&args.url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+    {
+        return Err("测试网址必须是带主机名的 http(s) URL".into());
     }
     Ok(args)
 }
@@ -384,6 +402,18 @@ mod cli_tests {
         parse_args_from(values.iter().map(|v| v.to_string()))
     }
     #[test]
+    fn watch_protection_controls_accept_explicit_zero_and_reject_negative_values() {
+        for flag in [
+            "--min-switch-interval",
+            "--failure-cooldown",
+            "--manual-hold",
+        ] {
+            assert!(parse(&["watch", flag, "0"]).is_ok());
+            assert!(parse(&["watch", flag, "900"]).is_ok());
+            assert!(parse(&["watch", flag, "-1"]).is_err());
+        }
+    }
+    #[test]
     fn probe_controls_have_strict_bounds_and_valid_defaults() {
         for (flag, good, bad) in [
             ("--concurrency", vec!["1", "256"], vec!["0", "257", "-1"]),
@@ -486,6 +516,9 @@ fn print_help() {
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
     println!("  --optimize      watch 启动时及定时主动优选（默认关闭）");
     println!("  --reopt <秒>     --optimize 的定时优选间隔（默认 7200）");
+    println!("  --min-switch-interval <秒> 正式切换最短间隔（默认 120，0 关闭）");
+    println!("  --failure-cooldown <秒>    失败候选冷却时间（默认 600，0 关闭）");
+    println!("  --manual-hold <秒>         操作外选择变化后的主动优化保护（默认 900，0 关闭）");
     println!("  --dry-run        只探测报告，不切换");
     println!("  --no-system-proxy 保持系统代理现状（适用于 TUN 或手动代理）");
     println!("  --detect         自动探测（兼容 --client auto）");
@@ -1450,225 +1483,24 @@ fn cmd_retry_recovery(be: &Backend, api: &core_api::CoreApi) -> i32 {
     }
 }
 
-fn reoptimization_due(enabled: bool, elapsed: Option<Duration>, interval: u64) -> bool {
-    enabled && elapsed.map_or(true, |elapsed| elapsed.as_secs() >= interval)
-}
-
-#[cfg(test)]
-mod watch_tests {
-    use super::*;
-
-    #[test]
-    fn default_watch_never_proactively_optimizes() {
-        for elapsed in [
-            None,
-            Some(Duration::ZERO),
-            Some(Duration::from_secs(86_400)),
-        ] {
-            assert!(!reoptimization_due(false, elapsed, 7200));
-            assert!(!reoptimization_due(false, elapsed, 0));
-        }
-    }
-
-    #[test]
-    fn enabled_watch_optimizes_at_startup_and_after_interval() {
-        assert!(reoptimization_due(true, None, 7200));
-        assert!(!reoptimization_due(true, Some(Duration::ZERO), 7200));
-        assert!(!reoptimization_due(
-            true,
-            Some(Duration::from_secs(7199)),
-            7200
-        ));
-        assert!(reoptimization_due(
-            true,
-            Some(Duration::from_secs(7200)),
-            7200
-        ));
-        assert!(reoptimization_due(
-            true,
-            Some(Duration::from_secs(7201)),
-            7200
-        ));
-    }
-}
-
 fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
-    if args.optimize {
-        ui::info(&format!(
-            "守护模式：每 {} 秒检查一次，启动时及每 {} 秒主动优选，Ctrl+C 退出",
-            args.interval, args.reopt
-        ));
-    } else {
-        ui::info(&format!(
-            "守护模式：每 {} 秒检查一次，保持可用节点，仅故障时优选，Ctrl+C 退出",
-            args.interval
-        ));
-    }
     if args.dry_run {
         return match runtime_group_args(initial, agent, args) {
             Ok(resolved) => cmd_scan(initial, agent, &resolved),
-            Err(e) => {
-                ui::fail(&e);
-                1
+            Err(error) => {
+                ui::fail(&error);
+                if operation::Cancellation::global().is_cancelled() {
+                    130
+                } else {
+                    1
+                }
             }
         };
     }
-    let cancellation = operation::Cancellation::global();
-    let mut current = initial.clone();
-    let mut last_opt: Option<Instant> = None;
-    let mut cycle: u64 = 0;
-    loop {
-        if cancellation.is_cancelled() {
-            return 130;
-        }
-        cycle += 1;
-        match clients::refresh(&current, args, agent) {
-            Ok(next) => current = next,
-            Err(e) => {
-                ui::warn(&format!("目标客户端暂不可用：{}", e));
-                if cancellation
-                    .wait(Duration::from_secs(args.interval))
-                    .is_err()
-                {
-                    return 130;
-                }
-                continue;
-            }
-        }
-        let be = &current;
-        let proxies = match mihomo::get_proxies(be, agent) {
-            Ok(proxies) => proxies,
-            Err(e) => {
-                ui::warn(&format!("读取实时策略组失败，等待重试：{}", e));
-                if cancellation
-                    .wait(Duration::from_secs(args.interval))
-                    .is_err()
-                {
-                    return 130;
-                }
-                continue;
-            }
-        };
-        let saved = if args.group.is_empty() {
-            appstate::current_group(be)
-        } else {
-            None
-        };
-        let cycle_args = match group_args_from_proxies(&proxies, args, saved.as_deref()) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                ui::fail(&e);
-                return 1;
-            }
-        };
-        let args = &cycle_args;
-        if !checker::core_alive(&be.proxy) {
-            ui::warn("内核未运行，等待中...");
-            if cancellation
-                .wait(Duration::from_secs(args.interval))
-                .is_err()
-            {
-                return 130;
-            }
-            continue;
-        }
-        let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
-        if let Some(current_node) = proxies.get(&args.group).and_then(|p| p.now.as_deref()) {
-            if !policy.permitted(current_node, args.max_rate) {
-                ui::warn("当前选择不符合倍率上限；默认保持可用节点，下次故障修复或主动优选只使用合规候选");
-            }
-        }
-        if args.manage_system_proxy && !sysproxy::matches(&be.proxy) {
-            ui::warn("系统代理被关闭或指向其他客户端，自动重新打开");
-            let control = runtime_switch::KernelSwitchControl {
-                backend: be,
-                api: agent,
-            };
-            if let Err(error) = workflow::repair_system_proxy(&control) {
-                ui::warn(&format!("系统代理修复未完成：{}", error));
-                if error.error.code == diagnostics::ErrorCode::Cancelled {
-                    return 130;
-                }
-                if cancellation
-                    .wait(Duration::from_secs(args.interval))
-                    .is_err()
-                {
-                    return 130;
-                }
-                continue;
-            }
-        }
-        let v1 = checker::verify_recorded_current(
-            be,
-            agent,
-            &args.group,
-            &args.url,
-            1,
-            args.verify_timeout_ms,
-        );
-        let mut broken = !v1.is_ok();
-        let mut last_code = match &v1 {
-            checker::Verdict::Fail(error) => error.to_string(),
-            _ => String::new(),
-        };
-        if broken {
-            // 5 秒后复测一次，避免偶发误报
-            if cancellation.wait(Duration::from_secs(5)).is_err() {
-                return 130;
-            }
-            let v2 = checker::verify_recorded_current(
-                be,
-                agent,
-                &args.group,
-                &args.url,
-                1,
-                args.verify_timeout_ms,
-            );
-            broken = !v2.is_ok();
-            if let checker::Verdict::Fail(c) = v2 {
-                last_code = c.to_string();
-            }
-        }
-        let due = reoptimization_due(args.optimize, last_opt.map(|t| t.elapsed()), args.reopt);
-        if broken || due {
-            let reason = if broken {
-                format!("检测到 {} 不可访问（{}）", args.url, last_code)
-            } else {
-                if last_opt.is_none() {
-                    "启动主动优选".to_string()
-                } else {
-                    "到达定时优选时间".to_string()
-                }
-            };
-            ui::warn(&format!("[周期 {}] {}，开始优选...", cycle, reason));
-            match workflow::fix_flow(be, agent, args) {
-                Ok(result) => print_commit(&result),
-                Err(e) => {
-                    ui::fail(&e.to_string());
-                    if e.error.code == diagnostics::ErrorCode::Cancelled {
-                        return 130;
-                    }
-                }
-            }
-            last_opt = Some(Instant::now());
-        } else {
-            ui::dim(&format!(
-                "[周期 {}] {}",
-                cycle,
-                if matches!(v1, checker::Verdict::PassIpOnly) {
-                    "仅 IP 交叉检查通过，浏览器仍需确认"
-                } else {
-                    "网页验证通过（HTTP 200）"
-                }
-            ));
-        }
-        if cancellation
-            .wait(Duration::from_secs(args.interval))
-            .is_err()
-        {
-            return 130;
-        }
-    }
+    watch::run(initial, agent, args, &mut |event| {
+        watch::render_text(event);
+        true
+    })
 }
 
 /// 控制台默认 GBK 代码页会显示乱码，切到 UTF-8（对 mintty 等无副作用）

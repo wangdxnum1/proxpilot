@@ -44,6 +44,13 @@ fn valid_history(row: &HistoryEntry, now: i64) -> bool {
                     | ErrorCode::ControllerAuth
                     | ErrorCode::IdentityMismatch
                     | ErrorCode::ClientUnavailable
+                    | ErrorCode::InvalidInput
+                    | ErrorCode::StateUnavailable
+                    | ErrorCode::ProfileChanged
+                    | ErrorCode::SelectionConflict
+                    | ErrorCode::RollbackFailed
+                    | ErrorCode::ControllerHttp
+                    | ErrorCode::ControllerTimeout
             )
         })
         && (measurement.availability != Some(Availability::Webpage)
@@ -210,6 +217,23 @@ mod tests {
     }
     fn close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-9, "{a} != {b}");
+    }
+    #[test]
+    fn configuration_and_local_state_errors_do_not_lower_node_success_rate() {
+        for code in [
+            ErrorCode::InvalidInput,
+            ErrorCode::StateUnavailable,
+            ErrorCode::ProfileChanged,
+        ] {
+            let mut rows = vec![row(Availability::Failed, None); 3];
+            for row in &mut rows {
+                row.measurement.error_code = Some(code);
+            }
+            assert_eq!(
+                super::score(&rows, &current(Availability::Webpage, Some(500.0)), None).samples,
+                0
+            );
+        }
     }
     #[test]
     fn cold_start_and_exact_weights() {

@@ -203,6 +203,15 @@ pub fn verify_access_with_timeout(
     ))
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CurrentVerification {
+    pub verification: VerificationReport,
+    pub state: Option<crate::switching::LiveState>,
+    pub stable: bool,
+    pub controller_error: Option<AppError>,
+    pub history_warning: Option<AppError>,
+}
+
 pub fn verify_recorded_current(
     be: &Backend,
     api: &crate::core_api::CoreApi,
@@ -211,43 +220,77 @@ pub fn verify_recorded_current(
     samples: usize,
     timeout_ms: u32,
 ) -> Verdict {
+    let result = verify_current_report(be, api, group, url, samples, timeout_ms);
+    if let Some(error) = &result.controller_error {
+        ui::warn(&format!("验证期间控制接口不可用，未归属节点历史：{error}"));
+    } else if !group.is_empty() && !result.stable {
+        ui::warn("验证期间客户端或选择发生变化，未将本轮测量计入节点历史");
+    }
+    Verdict::from_report(result.verification)
+}
+
+pub fn verify_current_report(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+    group: &str,
+    url: &str,
+    samples: usize,
+    timeout_ms: u32,
+) -> CurrentVerification {
     use crate::switching::SwitchControl;
     let control = crate::runtime_switch::KernelSwitchControl { backend: be, api };
+    let mut controller_error = None;
     let before = if group.is_empty() {
         None
     } else {
-        control.state(group).ok()
+        match control.state(group) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                controller_error = Some(error);
+                None
+            }
+        }
     };
     let report = verify_access_report_with_timeout(&be.proxy, url, samples, timeout_ms);
-    if !report
+    let mut result = CurrentVerification {
+        verification: report,
+        state: before.clone(),
+        stable: false,
+        controller_error,
+        history_warning: None,
+    };
+    if result
+        .verification
         .error
         .as_ref()
         .is_some_and(|e| e.code == ErrorCode::Cancelled)
+        || group.is_empty()
     {
-        if let Some(mut before) = before {
-            match control.state(group) {
-                Ok(mut after) => {
-                    before.members.sort();
-                    after.members.sort();
-                    if before.identity == after.identity
-                        && before.profile == after.profile
-                        && before.members == after.members
-                        && before.selection == after.selection
-                    {
-                        if let Some(node) = before.selection {
-                            let mut history =
-                                crate::history::HistorySession::new(be, before.profile, group, url);
-                            history.record_verification(be, &node, &report);
-                        }
-                    } else {
-                        ui::warn("验证期间客户端或选择发生变化，未将本轮测量计入节点历史");
+        return result;
+    }
+    match control.state(group) {
+        Ok(mut after) => {
+            after.members.sort();
+            if let Some(mut before) = before {
+                before.members.sort();
+                result.stable = before.identity == after.identity
+                    && before.profile == after.profile
+                    && before.members == after.members
+                    && before.selection == after.selection;
+                if result.stable {
+                    if let Some(node) = before.selection {
+                        let mut history =
+                            crate::history::HistorySession::new(be, before.profile, group, url);
+                        history.record_verification(be, &node, &result.verification);
+                        result.history_warning = history.warning;
                     }
                 }
-                Err(_) => ui::warn("验证后无法核对当前节点，未将本轮测量计入历史"),
             }
+            result.state = Some(after);
         }
+        Err(error) => result.controller_error = Some(error),
     }
-    Verdict::from_report(report)
+    result
 }
 
 pub fn is_real_node(info: &ProxyInfo, name: &str) -> bool {
@@ -319,13 +362,38 @@ fn scan_network_report(
         && !report.measurements.is_empty()
         && report.measurements.iter().all(|m| m.error.is_some())
     {
-        if let Err(error) = agent.request(
-            be,
-            reqwest::Method::GET,
-            "/version",
-            None,
-            Duration::from_secs(2),
-        ) {
+        let health = agent
+            .request(
+                be,
+                reqwest::Method::GET,
+                "/version",
+                None,
+                Duration::from_secs(2),
+            )
+            .and_then(|response| {
+                let value: serde_json::Value = serde_json::from_slice(&response.body)
+                    .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))?;
+                if value
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                {
+                    return Err(AppError::new(ErrorCode::InvalidResponse, Stage::Controller));
+                }
+                Ok(())
+            });
+        if let Err(error) = health {
+            report.controller_error = Some(error);
+        } else if let Some(error) = report
+            .measurements
+            .iter()
+            .filter_map(|measurement| measurement.error.as_ref())
+            .find(|error| {
+                error.stage == Stage::Controller || error.code == ErrorCode::InvalidResponse
+            })
+        {
+            let mut error = error.clone();
+            error.stage = Stage::Controller;
             report.controller_error = Some(error);
         }
     }

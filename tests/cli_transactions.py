@@ -56,6 +56,15 @@ class Fixture:
         self.truncate_first_probe = False
         self.probe_status = 200
         self.health_failure_after_probe = False
+        self.nodes = ["original", "target"]
+        self.after_health_state_reads = 0
+        self.change_before_operation = False
+        self.changed_before_operation = threading.Event()
+        self.url = "http://fixture.invalid/"
+        self.samples = 1
+        self.fail_restore = False
+        self.fail_prepare_once = False
+        self.prepare_outage = threading.Event()
         self.mutex = threading.Lock()
         self.temporary = tempfile.TemporaryDirectory(prefix="proxpilot-cli-")
         fixture = self
@@ -76,10 +85,20 @@ class Fixture:
                     selected = fixture.selected
                 if path == "/version": self.reply({"version": "fixture"}, 503 if fixture.health_failure_after_probe and fixture.delay_queries else 200)
                 elif path == "/configs": self.reply({"mode": "rule", "mixed-port": fixture.proxy.server_port})
-                elif path == "/proxies": self.reply({"proxies": {
-                    "group": {"type": "Selector", "all": ["original", "target"], "now": selected},
-                    "original": {"type": "Shadowsocks"}, "target": {"type": "Shadowsocks"},
-                }})
+                elif path == "/proxies":
+                    if fixture.proxy_requests == 1:
+                        fixture.after_health_state_reads += 1
+                        if fixture.fail_prepare_once and fixture.after_health_state_reads == 2:
+                            fixture.fail_prepare_once = False
+                            fixture.prepare_outage.set()
+                            self.reply({}, 503)
+                            return
+                        if fixture.change_before_operation and fixture.after_health_state_reads == 2:
+                            fixture.selected = selected = "target"
+                            fixture.changed_before_operation.set()
+                    proxies = {node: {"type":"Shadowsocks"} for node in fixture.nodes}
+                    proxies["group"] = {"type":"Selector", "all":fixture.nodes, "now":selected}
+                    self.reply({"proxies":proxies})
                 elif path.endswith("/delay"):
                     with fixture.mutex:
                         fixture.delay_queries.append(self.path)
@@ -100,8 +119,9 @@ class Fixture:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 with fixture.mutex:
                     fixture.requests.append(("PUT", body["name"]))
-                    fixture.selected = body["name"]
-                self.reply({}, 204)
+                    failed = fixture.fail_restore and body["name"] == "original" and fixture.selected == "target"
+                    if not failed: fixture.selected = body["name"]
+                self.reply({}, 503 if failed else 204)
 
         class Proxy(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_): pass
@@ -132,7 +152,7 @@ class Fixture:
     def command(self, *arguments):
         return [str(EXECUTABLE), *arguments, "--api", f"http://127.0.0.1:{self.core.server_port}",
                 "--proxy", f"http://127.0.0.1:{self.proxy.server_port}", "--group", "group",
-                "--url", "http://fixture.invalid/", "--samples", "1"]
+                "--url", self.url, "--samples", str(self.samples)]
     def environment(self):
         env = dict(os.environ, APPDATA=self.temporary.name, NO_COLOR="1", PROXPILOT_SPINNER="0")
         env.pop("CLICOLOR_FORCE", None)
@@ -151,6 +171,207 @@ class Fixture:
 
 
 class Transactions(unittest.TestCase):
+    def test_all_probe_api_errors_are_environment_errors_even_when_version_endpoint_is_healthy(self):
+        with Fixture([200]) as fixture:
+            fixture.probe_status = 503
+            result = fixture.run("scan", "--concurrency", "1")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(fixture.proxy_requests, 0)
+            path = Path(fixture.temporary.name) / "ProxPilot/history.sqlite3"
+            with closing(sqlite3.connect(path)) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM measurements").fetchone()[0], 0)
+
+    def test_watch_controller_outage_does_not_cool_nodes_or_consume_reopt_schedule(self):
+        with Fixture([200]) as fixture:
+            fixture.fail_prepare_once = True
+            def response():
+                if fixture.selected == "original": time.sleep(0.08)
+                return 200
+            fixture.responses = [response]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "1", "--no-system-proxy")
+            try:
+                self.assertTrue(fixture.prepare_outage.wait(5))
+                self.wait_watch_cycle(fixture)
+                self.assertEqual(len(fixture.delay_queries), 1)
+                self.assertEqual(fixture.selected, "original")
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_watch_sufficient_gain_commits_with_equal_samples_and_minimum_interval(self):
+        with Fixture([200]) as fixture:
+            fixture.samples = 2
+            def response():
+                time.sleep(0.6 if fixture.selected == "original" else 0.01)
+                return 200
+            fixture.responses = [response]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "1", "--reopt", "1", "--no-system-proxy")
+            try:
+                self.wait_watch_cycle(fixture)
+                self.assertEqual(fixture.selected, "target")
+                self.assertEqual(fixture.proxy_requests, 7)
+                probes = len(fixture.delay_queries)
+                time.sleep(2.4)
+                self.assertEqual(len(fixture.delay_queries), probes)
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_watch_final_validation_must_still_meet_benefit_threshold(self):
+        with Fixture([200]) as fixture:
+            target_calls = 0
+            def response():
+                nonlocal target_calls
+                if fixture.selected == "original": time.sleep(0.6)
+                else:
+                    target_calls += 1
+                    time.sleep(0.01 if target_calls == 1 else 0.55)
+                return 200
+            fixture.responses = [response]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "300", "--no-system-proxy")
+            try:
+                self.wait_watch_cycle(fixture)
+                self.assertEqual(fixture.proxy_requests, 4)
+                self.assertEqual(fixture.selected, "original")
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_watch_keep_rollback_failure_retains_journal_and_never_claims_restore(self):
+        with Fixture([200]) as fixture:
+            fixture.fail_restore = True
+            def response():
+                if fixture.selected == "original": time.sleep(0.08)
+                return 200
+            fixture.responses = [response]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "300", "--no-system-proxy")
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if ("PUT","original") in fixture.requests: break
+                    time.sleep(0.01)
+                self.assertIn(("PUT","original"), fixture.requests)
+                time.sleep(0.1)
+                self.assertTrue((Path(fixture.temporary.name) / "ProxPilot/recovery.bin").exists())
+                self.assertEqual(fixture.selected, "target")
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+                self.assertIn("503", stdout)
+                self.assertNotIn("已恢复原选择", stdout)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_watch_invalid_url_is_configuration_error_without_node_penalty(self):
+        with Fixture([200]) as fixture:
+            fixture.url = "not-a-url"
+            process = fixture.background("watch", "--interval", "300", "--no-system-proxy")
+            try:
+                try: stdout,stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired: self.fail("invalid URL must stop as configuration error, not enter failure rechecks")
+                self.assertEqual(process.returncode, 1, stdout + stderr)
+                self.assertEqual(fixture.proxy_requests, 0)
+                self.assertFalse(any(method == "PUT" for method,_ in fixture.requests))
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_manual_change_between_health_and_transaction_is_not_overwritten(self):
+        with Fixture([200]) as fixture:
+            fixture.nodes.append("third")
+            fixture.change_before_operation = True
+            def response():
+                if fixture.selected == "target": time.sleep(0.6)
+                return 200
+            fixture.responses = [response]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "300", "--no-system-proxy")
+            try:
+                self.assertTrue(fixture.changed_before_operation.wait(5))
+                time.sleep(1.5)
+                self.assertEqual(fixture.selected, "target")
+                self.assertFalse(any(method == "PUT" for method,_ in fixture.requests))
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def wait_watch_cycle(self, fixture):
+        deadline = time.monotonic() + 8
+        journal = Path(fixture.temporary.name) / "ProxPilot/recovery.bin"
+        while time.monotonic() < deadline:
+            if fixture.proxy_requests >= 3 and not journal.exists(): return
+            time.sleep(0.01)
+        self.fail("watch operation did not finish")
+
+    def test_watch_insufficient_benefit_restores_original(self):
+        with Fixture([200]) as fixture:
+            def response():
+                if fixture.selected == "original": time.sleep(0.08)
+                return 200
+            fixture.responses = [response]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "300", "--no-system-proxy")
+            try:
+                self.wait_watch_cycle(fixture)
+                self.assertEqual(fixture.selected, "original")
+                self.assertEqual([value for method,value in fixture.requests if method == "PUT"], ["target","original"])
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_watch_respects_manual_selection_after_optimization(self):
+        with Fixture([200]) as fixture:
+            def response():
+                if fixture.selected == "original": time.sleep(0.08)
+                return 200
+            fixture.responses = [response]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "1", "--reopt", "1", "--no-system-proxy")
+            try:
+                self.wait_watch_cycle(fixture)
+                manual = "target" if fixture.selected == "original" else "original"
+                fixture.selected = manual
+                before = len([r for r in fixture.requests if r[0] == "PUT"])
+                time.sleep(2.4)
+                self.assertEqual(fixture.selected, manual)
+                self.assertEqual(len([r for r in fixture.requests if r[0] == "PUT"]), before)
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
+    def test_watch_failed_alternative_is_not_repeated_during_cooldown(self):
+        with Fixture([200]) as fixture:
+            fixture.responses = [lambda: 403 if fixture.selected == "target" else 200]
+            process = fixture.background("watch", "--optimize", "--top", "1", "--interval", "1", "--reopt", "1", "--no-system-proxy")
+            try:
+                self.wait_watch_cycle(fixture)
+                probes = len(fixture.delay_queries)
+                time.sleep(2.4)
+                self.assertEqual(len(fixture.delay_queries), probes)
+                self.assertEqual(fixture.selected, "original")
+                console_break(process.pid)
+                stdout,stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+            finally:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
     def seed_verification_history(self, fixture, node, passed):
         path = Path(fixture.temporary.name) / "ProxPilot/history.sqlite3"
         with closing(sqlite3.connect(path)) as db:

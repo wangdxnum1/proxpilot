@@ -15,7 +15,6 @@ jobs:
         rust: ['1.98.0', '1.99.0']
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-${{ matrix.rust }}
       NO_COLOR: '1'
       PROXPILOT_SPINNER: '0'
     defaults:
@@ -25,6 +24,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install pinned Rust and show tool versions
         run: |
+          "CARGO_TARGET_DIR=$env:RUNNER_TEMP/cargo-$env:RUSTUP_TOOLCHAIN" >> $env:GITHUB_ENV
           rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./scripts/check-toolchain.ps1

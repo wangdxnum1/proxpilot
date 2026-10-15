@@ -9,6 +9,7 @@ mod http;
 mod mihomo;
 mod nodeinfo;
 mod operation;
+mod probe_scheduler;
 mod procinfo;
 mod runtime_switch;
 mod scan_output;
@@ -36,6 +37,8 @@ pub struct Args {
     pub url: String,
     pub top: usize,
     pub samples: usize,
+    pub probe: probe_scheduler::ProbeOptions,
+    pub verify_timeout_ms: u32,
     pub dry_run: bool,
     pub manage_system_proxy: bool,
     pub interval: u64,
@@ -87,6 +90,8 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         url: "https://chatgpt.com/".into(),
         top: 12,
         samples: 2,
+        probe: Default::default(),
+        verify_timeout_ms: 12000,
         dry_run: false,
         manage_system_proxy: true,
         interval: 300,
@@ -126,6 +131,24 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 args.max_rate = Some(limit);
             }
             "--url" => args.url = value(&mut it, &arg)?,
+            "--concurrency" | "--probe-timeout-ms" | "--verify-timeout-ms" | "--retries" => {
+                let number: u32 = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| format!("{} 必须为非负整数", arg))?;
+                match arg.as_str() {
+                    "--concurrency" if (1..=256).contains(&number) => {
+                        args.probe.concurrency = Some(number as usize)
+                    }
+                    "--probe-timeout-ms" if (100..=120000).contains(&number) => {
+                        args.probe.timeout_ms = number
+                    }
+                    "--verify-timeout-ms" if (100..=120000).contains(&number) => {
+                        args.verify_timeout_ms = number
+                    }
+                    "--retries" if number <= 3 => args.probe.retries = number as u8,
+                    _ => return Err(format!("{} 超出允许范围", arg)),
+                }
+            }
             "--top" => {
                 args.top = value(&mut it, &arg)?
                     .parse()
@@ -283,6 +306,30 @@ mod cli_tests {
         parse_args_from(values.iter().map(|v| v.to_string()))
     }
     #[test]
+    fn probe_controls_have_strict_bounds_and_valid_defaults() {
+        for (flag, good, bad) in [
+            ("--concurrency", vec!["1", "256"], vec!["0", "257", "-1"]),
+            (
+                "--probe-timeout-ms",
+                vec!["100", "120000"],
+                vec!["99", "120001"],
+            ),
+            (
+                "--verify-timeout-ms",
+                vec!["100", "120000"],
+                vec!["99", "120001"],
+            ),
+            ("--retries", vec!["0", "3"], vec!["4", "-1"]),
+        ] {
+            for value in good {
+                assert!(parse(&["scan", flag, value]).is_ok(), "{flag} {value}");
+            }
+            for value in bad {
+                assert!(parse(&["scan", flag, value]).is_err(), "{flag} {value}");
+            }
+        }
+    }
+    #[test]
     fn client_commands_and_strict_errors() {
         assert!(matches!(
             parse(&["clients", "--supported"]).unwrap().cmd,
@@ -353,6 +400,10 @@ fn print_help() {
     println!("  --max-rate <N>  倍率上限；未知倍率排除，scan/fix/watch/nodes/use 生效");
     println!("  --top <N>        优选时验证前 N 个候选（默认 12）");
     println!("  --samples <N>    每个节点实测次数（默认 2，全部 200 才通过）");
+    println!("  --concurrency <N> 固定并发 1–256；默认自适应，上限 min(CPU×2,32,节点数)");
+    println!("  --probe-timeout-ms <N>  初筛超时 100–120000ms（默认 4000）");
+    println!("  --verify-timeout-ms <N> 网页单次采样整体超时 100–120000ms（默认 12000）");
+    println!("  --retries <N>    初筛传输失败额外重试 0–3 次（默认 1），不重试网页失败采样");
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
     println!("  --optimize      watch 启动时及定时主动优选（默认关闭）");
     println!("  --reopt <秒>     --optimize 的定时优选间隔（默认 7200）");
@@ -760,7 +811,12 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
                 let now = g.now.clone().unwrap_or_else(|| "未知".into());
                 ui::info(&format!("当前组「{}」→ {}", name, now));
             }
-            match checker::verify_access(&be.proxy, &args.url, args.samples) {
+            match checker::verify_access_with_timeout(
+                &be.proxy,
+                &args.url,
+                args.samples,
+                args.verify_timeout_ms,
+            ) {
                 checker::Verdict::Pass(t) => {
                     ui::ok(&format!("{} 可访问（平均 {:.2}s）", args.url, t));
                     0
@@ -791,6 +847,11 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
 }
 
 fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
+    match switching::inspect_recovery() {
+        Ok(Some(_)) => ui::warn("存在尚未清理的操作记录；本次只读扫描保持现状，可用 recover 查看或显式处理"),
+        Err(_) => ui::warn("操作恢复记录无法安全读取；本次只读扫描保持现状，可用 recover 查看，确认放弃后用 recover --discard 清理"),
+        Ok(None) => {}
+    }
     let proxies = match mihomo::get_proxies(be, agent) {
         Ok(p) => p,
         Err(e) => {
@@ -818,12 +879,17 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         return 1;
     }
     ui::info(&format!(
-        "{}共 {} 个真实节点（去重后），{} 路并发探测...",
+        "{}共 {} 个真实节点（去重后），并发上限 {}...",
         scope.label,
         members.len(),
-        checker::scan_concurrency(members.len())
+        args.probe.limit(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            members.len()
+        )
     ));
-    let report = checker::scan_reachable_report(be, agent, &members, &args.url);
+    let report = checker::scan_report(be, agent, &members, &args.url, &args.probe);
     if report.cancelled {
         ui::warn(&format!(
             "扫描已取消，已完成 {}/{}",
@@ -1438,7 +1504,8 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
                 continue;
             }
         }
-        let v1 = checker::verify_access(&be.proxy, &args.url, 1);
+        let v1 =
+            checker::verify_access_with_timeout(&be.proxy, &args.url, 1, args.verify_timeout_ms);
         let mut broken = !v1.is_ok();
         let mut last_code = match &v1 {
             checker::Verdict::Fail(error) => error.to_string(),
@@ -1449,7 +1516,12 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             if cancellation.wait(Duration::from_secs(5)).is_err() {
                 return 130;
             }
-            let v2 = checker::verify_access(&be.proxy, &args.url, 1);
+            let v2 = checker::verify_access_with_timeout(
+                &be.proxy,
+                &args.url,
+                1,
+                args.verify_timeout_ms,
+            );
             broken = !v2.is_ok();
             if let checker::Verdict::Fail(c) = v2 {
                 last_code = c.to_string();

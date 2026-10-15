@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 
@@ -46,6 +47,12 @@ class Fixture:
         self.requests = []
         self.proxy_requests = 0
         self.proxy_started = threading.Event()
+        self.delay_queries = []
+        self.delay_active = 0
+        self.delay_peak = 0
+        self.truncate_first_probe = False
+        self.probe_status = 200
+        self.health_failure_after_probe = False
         self.mutex = threading.Lock()
         self.temporary = tempfile.TemporaryDirectory(prefix="proxpilot-cli-")
         fixture = self
@@ -64,13 +71,27 @@ class Fixture:
                 with fixture.mutex:
                     fixture.requests.append(("GET", path))
                     selected = fixture.selected
-                if path == "/version": self.reply({"version": "fixture"})
+                if path == "/version": self.reply({"version": "fixture"}, 503 if fixture.health_failure_after_probe and fixture.delay_queries else 200)
                 elif path == "/configs": self.reply({"mode": "rule", "mixed-port": fixture.proxy.server_port})
                 elif path == "/proxies": self.reply({"proxies": {
                     "group": {"type": "Selector", "all": ["original", "target"], "now": selected},
                     "original": {"type": "Shadowsocks"}, "target": {"type": "Shadowsocks"},
                 }})
-                elif path.endswith("/delay"): self.reply({"delay": 10 if "/target/" in path else 50})
+                elif path.endswith("/delay"):
+                    with fixture.mutex:
+                        fixture.delay_queries.append(self.path)
+                        truncate = fixture.truncate_first_probe and len(fixture.delay_queries) == 1
+                        fixture.delay_active += 1
+                        fixture.delay_peak = max(fixture.delay_peak, fixture.delay_active)
+                    time.sleep(0.03)
+                    with fixture.mutex: fixture.delay_active -= 1
+                    if truncate:
+                        self.send_response(200)
+                        self.send_header("Content-Length", "100")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(b'{')
+                    else: self.reply({"delay": 10 if "/target/" in path else 50}, fixture.probe_status)
                 else: self.reply({}, 404)
             def do_PUT(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -127,6 +148,39 @@ class Fixture:
 
 
 class Transactions(unittest.TestCase):
+    def test_global_controller_failure_is_environment_error_and_auth_is_not_retried(self):
+        for status in (401, 503):
+            with self.subTest(status=status), Fixture([200]) as fixture:
+                fixture.probe_status = status
+                fixture.health_failure_after_probe = status == 503
+                result = fixture.run("scan", "--concurrency", "1", "--retries", "3")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(len(fixture.delay_queries), 1 if status == 401 else 2)
+                self.assertEqual(fixture.selected, "original")
+                self.assertFalse(any(method == "PUT" for method, _ in fixture.requests))
+
+    def test_probe_controls_reach_core_and_retry_truncated_response(self):
+        with Fixture([200]) as fixture:
+            fixture.truncate_first_probe = True
+            result = fixture.run("scan", "--concurrency", "1", "--probe-timeout-ms", "777", "--retries", "1")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(fixture.delay_queries), 3)
+            self.assertEqual(fixture.delay_peak, 1)
+            self.assertTrue(all(urllib.parse.parse_qs(urllib.parse.urlsplit(q).query)["timeout"] == ["777"] for q in fixture.delay_queries))
+
+    def test_website_timeout_is_applied_without_retrying_failed_sample(self):
+        def pending():
+            time.sleep(1)
+            return 200
+        with Fixture([pending]) as fixture:
+            started = time.monotonic()
+            result = fixture.run("use", "target", "--verify-timeout-ms", "100", "--retries", "3")
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertLess(elapsed, 0.9)
+            self.assertEqual(fixture.selected, "original")
+            self.assertEqual(fixture.proxy_requests, 1)
+
     def test_second_mutation_is_busy_but_readonly_scan_can_run(self):
         release = threading.Event()
         def pending():
@@ -141,6 +195,7 @@ class Transactions(unittest.TestCase):
                 self.assertEqual([value for method, value in fixture.requests if method == "PUT"], ["target"])
                 scanned = fixture.run("scan")
                 self.assertEqual(scanned.returncode, 0, scanned.stdout + scanned.stderr)
+                self.assertIn("recover", scanned.stdout)
                 self.assertEqual(fixture.selected, "target")
                 console_break(process.pid)
                 stdout, stderr = process.communicate(timeout=5)

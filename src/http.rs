@@ -423,11 +423,17 @@ pub struct BrowserProbe {
     safari_cookies: Arc<Jar>,
     prefer_safari: Cell<bool>,
     runtime: Runtime,
+    timeout: Duration,
 }
 
 impl BrowserProbe {
     pub fn new(proxy: &str) -> AppResult<Self> {
+        Self::new_with_timeout(proxy, 12000)
+    }
+
+    pub fn new_with_timeout(proxy: &str, timeout_ms: u32) -> AppResult<Self> {
         Ok(Self {
+            timeout: Duration::from_millis(u64::from(timeout_ms)),
             proxy: wreq::Proxy::all(proxy)
                 .map_err(|e| AppError::from_wreq(&e, Stage::Configuration))?,
             cookies: Arc::new(Jar::default()),
@@ -461,8 +467,8 @@ impl BrowserProbe {
                 self.cookies.clone()
             })
             .redirect(wreq::redirect::Policy::limited(10))
-            .timeout(Duration::from_secs(12))
-            .connect_timeout(Duration::from_secs(8))
+            .timeout(self.timeout)
+            .connect_timeout(self.timeout.min(Duration::from_secs(8)))
     }
 
     async fn request(&self, url: &str, safari: bool) -> AppResult<(u16, bool)> {
@@ -495,7 +501,7 @@ impl BrowserProbe {
         Ok((code, challenge))
     }
 
-    /// 最多尝试两个浏览器配置，整体 12 秒超时；耗时包含候补请求。
+    /// 最多两个浏览器配置共享配置的整体超时；耗时包含候补请求。
     pub fn test(&self, url: &str) -> AppResult<(u16, f64)> {
         self.test_detailed(url)
     }
@@ -512,7 +518,7 @@ impl BrowserProbe {
         cancellation.check()?;
         self.runtime.block_on(async {
             let start = Instant::now();
-            let request = tokio::time::timeout(Duration::from_secs(12), async {
+            let request = tokio::time::timeout(self.timeout, async {
                 let preferred = self.prefer_safari.get();
                 let (code, challenge) = self.request(url, preferred).await?;
                 // 普通 403 或断连不重试；只对服务端明确标记的 Challenge 使用候补。

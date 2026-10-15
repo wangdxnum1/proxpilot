@@ -290,10 +290,11 @@ pub fn use_flow(
     }
     let result = in_transaction(&control, &scope, args, |transaction| {
         transaction.select(target)?;
-        Ok(checker::verify_access_report(
+        Ok(checker::verify_access_report_with_timeout(
             &be.proxy,
             &args.url,
             args.samples,
+            args.verify_timeout_ms,
         ))
     })?;
     Ok(SelectionOutcome::Committed { result })
@@ -327,7 +328,7 @@ pub fn fix_flow(
         if args.manage_system_proxy {
             transaction.repair_proxy()?;
         }
-        let scan = checker::scan_reachable_report(be, api, &candidates.names, &args.url);
+        let scan = checker::scan_report(be, api, &candidates.names, &args.url, &args.probe);
         if let Some(error) = scan.controller_failure() {
             return Err(error.clone());
         }
@@ -350,7 +351,12 @@ pub fn fix_flow(
         let mut last_error = AppError::new(ErrorCode::ProbeFailed, Stage::Verification);
         for (_, name) in reachable.iter().take(args.top) {
             transaction.select(name)?;
-            let evidence = checker::verify_access_report(&be.proxy, &args.url, args.samples);
+            let evidence = checker::verify_access_report_with_timeout(
+                &be.proxy,
+                &args.url,
+                args.samples,
+                args.verify_timeout_ms,
+            );
             if evidence
                 .error
                 .as_ref()
@@ -400,7 +406,12 @@ pub fn fix_flow(
             return Err(last_error);
         };
         transaction.select(best)?;
-        let final_evidence = checker::verify_access_report(&be.proxy, &args.url, args.samples);
+        let final_evidence = checker::verify_access_report_with_timeout(
+            &be.proxy,
+            &args.url,
+            args.samples,
+            args.verify_timeout_ms,
+        );
         if prior.availability == Availability::Webpage
             && final_evidence.availability != Availability::Webpage
         {

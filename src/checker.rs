@@ -1,8 +1,10 @@
 //! 节点探测、真实访问验证与优选切换。
 
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -100,6 +102,15 @@ fn is_openai_url(url: &str) -> bool {
 
 /// 实测报告保留状态与失败类别；IP-only 不能冒充网页通过。
 pub fn verify_access_report(proxy: &str, url: &str, samples: usize) -> VerificationReport {
+    verify_access_report_with_timeout(proxy, url, samples, 12000)
+}
+
+pub fn verify_access_report_with_timeout(
+    proxy: &str,
+    url: &str,
+    samples: usize,
+    timeout_ms: u32,
+) -> VerificationReport {
     let n = samples.max(1);
     let mut report = VerificationReport {
         availability: Availability::Failed,
@@ -108,7 +119,7 @@ pub fn verify_access_report(proxy: &str, url: &str, samples: usize) -> Verificat
         samples_passed: 0,
         error: None,
     };
-    let probe = match crate::http::BrowserProbe::new(proxy) {
+    let probe = match crate::http::BrowserProbe::new_with_timeout(proxy, timeout_ms) {
         Ok(probe) => probe,
         Err(error) => {
             report.error = Some(error);
@@ -171,7 +182,16 @@ pub fn verify_access_report(proxy: &str, url: &str, samples: usize) -> Verificat
 }
 
 pub fn verify_access(proxy: &str, url: &str, samples: usize) -> Verdict {
-    let report = verify_access_report(proxy, url, samples);
+    verify_access_with_timeout(proxy, url, samples, 12000)
+}
+
+pub fn verify_access_with_timeout(
+    proxy: &str,
+    url: &str,
+    samples: usize,
+    timeout_ms: u32,
+) -> Verdict {
+    let report = verify_access_report_with_timeout(proxy, url, samples, timeout_ms);
     match report.availability {
         Availability::Webpage => Verdict::Pass(report.mean_ms.unwrap_or_default() / 1000.0),
         Availability::IpOnly => Verdict::PassIpOnly,
@@ -189,27 +209,7 @@ pub fn is_real_node(info: &ProxyInfo, name: &str) -> bool {
         && !FAKE_NODES.iter().any(|f| name.contains(f))
 }
 
-/// 可用逻辑 CPU 数量的两倍，线程数不超过待测节点数。
-pub fn scan_concurrency(node_count: usize) -> usize {
-    thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .saturating_mul(2)
-        .min(node_count)
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ProbeMeasurement {
-    pub node: String,
-    pub delay_ms: Option<i64>,
-    pub error: Option<AppError>,
-}
-
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ScanReport {
-    pub measurements: Vec<ProbeMeasurement>,
-    pub cancelled: bool,
-}
+pub type ScanReport = crate::probe_scheduler::ProbeRun;
 
 impl ScanReport {
     pub fn reachable(&self) -> Vec<(i64, String)> {
@@ -221,27 +221,55 @@ impl ScanReport {
         reachable.sort();
         reachable
     }
-
     pub fn controller_failure(&self) -> Option<&AppError> {
-        self.measurements
-            .iter()
-            .filter_map(|m| m.error.as_ref())
-            .find(|error| {
-                matches!(
-                    error.code,
-                    ErrorCode::ControllerAuth | ErrorCode::IdentityMismatch
-                )
-            })
+        self.controller_error.as_ref()
     }
 }
 
-pub fn scan_reachable_report(
+pub fn scan_report(
     be: &Backend,
     agent: &crate::core_api::CoreApi,
     members: &[String],
     url: &str,
+    options: &crate::probe_scheduler::ProbeOptions,
 ) -> ScanReport {
-    scan_report_with_concurrency(be, agent, members, url, scan_concurrency(members.len()))
+    let cancel = crate::operation::Cancellation::global();
+    let cpu = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let spinner = ui::Spinner::start(&format!(
+        "探测 {} 个节点（并发上限 {}）...",
+        members.len(),
+        options.limit(cpu, members.len())
+    ));
+    let mut report =
+        crate::probe_scheduler::run(members, options, cpu, &cancel, |name, timeout| {
+            mihomo::probe_delay(be, agent, name, url, timeout)
+        });
+    drop(spinner);
+    if !report.cancelled
+        && report.controller_error.is_none()
+        && !report.measurements.is_empty()
+        && report.measurements.iter().all(|m| m.error.is_some())
+    {
+        if let Err(error) = agent.request(
+            be,
+            reqwest::Method::GET,
+            "/version",
+            None,
+            Duration::from_secs(2),
+        ) {
+            report.controller_error = Some(error);
+        }
+    }
+    ui::dim(&format!(
+        "已完成 {} 个唯一节点；重试 {} 次；请求并发峰值 {}（上限 {}）",
+        report.measurements.len(),
+        report.retries,
+        report.peak_concurrency,
+        report.concurrency_limit
+    ));
+    report
 }
 
 #[cfg(test)]
@@ -252,59 +280,18 @@ fn scan_with_concurrency(
     url: &str,
     concurrency: usize,
 ) -> Vec<(i64, String)> {
-    scan_report_with_concurrency(be, agent, members, url, concurrency).reachable()
-}
-
-fn scan_report_with_concurrency(
-    be: &Backend,
-    agent: &crate::core_api::CoreApi,
-    members: &[String],
-    url: &str,
-    concurrency: usize,
-) -> ScanReport {
-    let cancellation = crate::operation::Cancellation::global();
-    let total = members.len();
-    let next = AtomicUsize::new(0);
-    let done = Arc::new(AtomicUsize::new(0));
-    let spinner = ui::Spinner::start(&format!("{} 路并发探测 {} 个节点...", concurrency, total));
-    let measurements = Mutex::new(Vec::new());
-    thread::scope(|s| {
-        for _ in 0..concurrency {
-            let next = &next;
-            let measurements = &measurements;
-            let done = &done;
-            let spinner = &spinner;
-            let cancellation = &cancellation;
-            s.spawn(move || {
-                while !cancellation.is_cancelled() {
-                    let Some(name) = members.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                        break;
-                    };
-                    if cancellation.is_cancelled() {
-                        break;
-                    }
-                    let (delay_ms, error) = match mihomo::probe_delay(be, agent, name, url, 4000) {
-                        Ok(delay) => (Some(delay), None),
-                        Err(error) => (None, Some(error)),
-                    };
-                    measurements.lock().unwrap().push(ProbeMeasurement {
-                        node: name.clone(),
-                        delay_ms,
-                        error,
-                    });
-                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    spinner.set_text(format!("并发探测节点... 已测 {}/{}", n, total));
-                }
-            });
-        }
-    });
-    drop(spinner);
-    let mut measurements = measurements.into_inner().unwrap();
-    measurements.sort_by(|a, b| a.node.cmp(&b.node));
-    ScanReport {
-        measurements,
-        cancelled: cancellation.is_cancelled(),
-    }
+    scan_report(
+        be,
+        agent,
+        members,
+        url,
+        &crate::probe_scheduler::ProbeOptions {
+            concurrency: Some(concurrency),
+            retries: 0,
+            ..Default::default()
+        },
+    )
+    .reachable()
 }
 
 #[cfg(test)]

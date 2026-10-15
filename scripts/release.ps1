@@ -6,6 +6,8 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 }
 Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent
+$taskConsoleEncoding = [Console]::OutputEncoding
+$taskPipeEncoding = $OutputEncoding
 $utf8 = New-Object Text.UTF8Encoding($false)
 function Write-Utf8([string]$Path, [string]$Content) { [IO.File]::WriteAllText($Path, $Content, $utf8) }
 function Invoke-Checked([string]$Command, [string[]]$Arguments) {
@@ -15,6 +17,8 @@ function Invoke-Checked([string]$Command, [string[]]$Arguments) {
 }
 Push-Location $root
 try {
+    [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+    $OutputEncoding = [Console]::OutputEncoding
     $cargoToml = Get-Content -LiteralPath 'Cargo.toml' -Raw
     $match = [regex]::Match($cargoToml, '(?m)^version\s*=\s*"([^"\r\n]+)"')
     if (-not $match.Success) { throw 'Missing package version.' }
@@ -76,4 +80,8 @@ try {
 } catch {
     [Console]::Error.WriteLine("Packaging failed: $($_.Exception.Message)")
     exit 1
-} finally { Pop-Location }
+} finally {
+    [Console]::OutputEncoding = $taskConsoleEncoding
+    $OutputEncoding = $taskPipeEncoding
+    Pop-Location
+}

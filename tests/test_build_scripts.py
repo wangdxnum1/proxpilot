@@ -12,6 +12,7 @@ POWERSHELL = shutil.which("powershell.exe")
 
 FAKE = r'''
 import json, os, pathlib, sys
+sys.stdout.reconfigure(encoding="utf-8")
 tool, *args = sys.argv[1:]
 root = pathlib.Path(os.environ["FIXTURE_ROOT"])
 with (root / "calls.jsonl").open("a") as log: log.write(json.dumps([tool, *args])+"\n")
@@ -20,7 +21,7 @@ if tool == "cargo":
     if args[0] == "test": sys.exit(4 if case == "test" else 0)
     if args[0] == "build":
         if case == "build": sys.exit(5)
-        if case != "stale": print(json.dumps({"reason":"compiler-artifact", "target":{"name":"proxpilot", "kind":["bin"]}, "executable":str(root / "custom-target/triple/release/proxpilot.exe")}))
+        if case != "stale": print(json.dumps({"reason":"compiler-artifact", "target":{"name":"proxpilot", "kind":["bin"]}, "executable":os.environ.get("ARTIFACT_PATH",str(root / "custom-target/triple/release/proxpilot.exe"))},ensure_ascii=False))
     if args[0] == "metadata": print(json.dumps({"packages":[{"name":"fixture", "version":"1", "license":"MIT"}]}))
 elif tool == "git":
     if args[:2] == ["status", "--porcelain"]: print(" M user-file" if case == "dirty" else "")
@@ -36,6 +37,16 @@ elif tool == "rustc": print("rustc 1.99.0 fixture")
 
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell scripts")
 class BuildScripts(unittest.TestCase):
+    def test_utf8_cargo_artifact_path_from_legacy_codepage_is_copied_correctly(self):
+        source = self.root / "中文 target/proxpilot.exe"
+        source.parent.mkdir()
+        source.write_bytes(b"unicode artifact")
+        wrapper = self.root / "scripts/legacy-codepage.ps1"
+        wrapper.write_text("[Console]::OutputEncoding=[Text.Encoding]::GetEncoding(936)\n& (Join-Path $PSScriptRoot 'build.ps1') -OutputDirectory (Join-Path $PSScriptRoot '../中文 bin')\nexit $LASTEXITCODE\n",encoding="utf-8-sig")
+        result = subprocess.run([POWERSHELL,"-NoProfile","-ExecutionPolicy","Bypass","-File",str(wrapper)],cwd=self.root,env=dict(self.env,ARTIFACT_PATH=str(source)),capture_output=True,encoding="utf-8",errors="replace",timeout=45)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual((self.root / "中文 bin/proxpilot.exe").read_bytes(),source.read_bytes())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="proxpilot-scripts-")
         self.root = Path(self.temp.name)

@@ -7,10 +7,14 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 }
 Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent
+$taskConsoleEncoding = [Console]::OutputEncoding
+$taskPipeEncoding = $OutputEncoding
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $root 'bin' }
 $temporary = $null
 Push-Location $root
 try {
+    [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+    $OutputEncoding = [Console]::OutputEncoding
     & (Join-Path $PSScriptRoot 'check-toolchain.ps1') | Out-Host
     & (Join-Path $root 'vendor/btls-sys/verify.ps1') | Out-Host
     $arguments = @('build', '--release', '--locked', '--message-format=json-render-diagnostics')
@@ -45,6 +49,8 @@ try {
     [Console]::Error.WriteLine("Build failed: $($_.Exception.Message)")
     exit 1
 } finally {
+    [Console]::OutputEncoding = $taskConsoleEncoding
+    $OutputEncoding = $taskPipeEncoding
     if ($temporary -and (Test-Path -LiteralPath $temporary)) { Remove-Item -LiteralPath $temporary -Force }
     Pop-Location
 }

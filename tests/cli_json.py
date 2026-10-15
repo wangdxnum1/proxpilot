@@ -46,6 +46,10 @@ class JsonOutput(unittest.TestCase):
                                env=f.environment(), capture_output=True, text=True, encoding="utf-8", timeout=15)
             self.document(r, "scan", 1)
 
+    def test_option_value_named_watch_is_not_the_command(self):
+        with Fixture([200]) as f:
+            self.document(f.run("--secret","watch","nodes","--json"),"nodes")
+
     def test_validation_failure_retains_rollback(self):
         with Fixture([403]) as f:
             d = self.document(f.run("use", "target", "--json"), "use", 2)

@@ -42,7 +42,7 @@ proxpilot watch     :: 守护模式：保持可用节点，坏了自动修
 proxpilot history   :: 查看本工具近期测量，无需内核在线
 ```
 
-**典型场景**：ChatGPT 突然打不开 → 双击 `bin\proxpilot.exe` 或运行 `proxpilot fix`，约 1 分钟后自动切到可用节点。
+**典型场景**：ChatGPT 突然打不开 → 运行 `proxpilot fix`（双击 exe 显示帮助），约 1 分钟后自动切到可用节点。
 
 ---
 

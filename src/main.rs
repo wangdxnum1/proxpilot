@@ -29,28 +29,54 @@ mod watch_policy;
 mod workflow;
 
 fn command_name() -> String {
-    std::env::args()
-        .skip(1)
-        .find(|s| {
-            matches!(
-                s.as_str(),
-                "check"
-                    | "scan"
-                    | "fix"
-                    | "use"
-                    | "watch"
-                    | "nodes"
-                    | "info"
-                    | "clients"
-                    | "config"
-                    | "history"
-                    | "recover"
-                    | "diagnose"
-                    | "browse"
-                    | "help"
-            )
-        })
-        .unwrap_or_else(|| "help".into())
+    let mut values = std::env::args().skip(1);
+    while let Some(value) = values.next() {
+        if matches!(
+            value.as_str(),
+            "--client"
+                | "--api"
+                | "--secret"
+                | "--proxy"
+                | "--group"
+                | "--url"
+                | "--max-rate"
+                | "--top"
+                | "--samples"
+                | "--concurrency"
+                | "--probe-timeout-ms"
+                | "--verify-timeout-ms"
+                | "--retries"
+                | "--interval"
+                | "--reopt"
+                | "--min-switch-interval"
+                | "--failure-cooldown"
+                | "--manual-hold"
+                | "--output"
+        ) {
+            values.next();
+            continue;
+        }
+        if matches!(
+            value.as_str(),
+            "check"
+                | "scan"
+                | "fix"
+                | "use"
+                | "watch"
+                | "nodes"
+                | "info"
+                | "clients"
+                | "config"
+                | "history"
+                | "recover"
+                | "diagnose"
+                | "browse"
+                | "help"
+        ) {
+            return value;
+        }
+    }
+    "help".into()
 }
 static CONSOLE: std::sync::OnceLock<terminal::ConsoleGuard> = std::sync::OnceLock::new();
 fn exit(code: i32) -> ! {

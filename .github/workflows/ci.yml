@@ -56,6 +56,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/cli_transactions.py --bin bin/proxpilot.exe -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/cli_json.py --bin bin/proxpilot.exe -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/cli_diagnose.py --bin bin/proxpilot.exe -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/cli_browse.py --bin bin/proxpilot.exe -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Local package with checksums, licenses and metadata
         if: matrix.rust == '1.99.0'
         run: ./scripts/release.ps1

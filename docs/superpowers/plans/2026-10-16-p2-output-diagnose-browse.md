@@ -33,10 +33,10 @@
 
 **Interfaces:** `CommandReport<T>` owns envelope/exit semantics; command data feeds text and JSON. `OutputContext` routes progress to stderr or disables it throughout helpers. `WatchEvent` adds run/sequence/time. Emitter handles BrokenPipe as output termination.
 
-- [ ] Real-exe tests for every finite command success, invalid input, core-offline, validation failure and cancellation: parse entire stdout as one object, no ANSI, nullable unknowns. Watch sequence/final-cancel and closed-pipe tests. Run; expected RED.
-- [ ] Extract reports without duplicating selection or billing logic; raw argv selects error format before parse. Exclude secret-bearing raw parser text from unsafe messages.
-- [ ] Structured scan contains full ranks/measurements/current, rates/protocol/tag sources. Text retains widths/colors/current and complete1x list. ip_only stays distinct.
-- [ ] Full Rust, JSON and transaction CLI suites green; commit `feat: render shared reports as JSON and watch events`.
+- [x] Real-exe tests for every finite command success, invalid input, core-offline, validation failure and cancellation: parse entire stdout as one object, no ANSI, nullable unknowns. Watch sequence/final-cancel and closed-pipe tests. Run; expected RED.
+- [x] Extract reports without duplicating selection or billing logic; raw argv selects error format before parse. Exclude secret-bearing raw parser text from unsafe messages.
+- [x] Structured scan contains full ranks/measurements/current, rates/protocol/tag sources. Text retains widths/colors/current and complete1x list. ip_only stays distinct.
+- [x] Full Rust, JSON and transaction CLI suites green; commit `feat: render shared reports as JSON and watch events`.
 
 ### Task 2: Readonly redacted diagnostic artifact
 
@@ -44,9 +44,9 @@
 
 **Interfaces:** `DiagnosticReport` whitelist types and report-scoped alias table. Embedded version/revision/native-manifest fingerprint/verified-at-build status; optional source integrity separately. `write_report(path,overwrite)` uses create_new by default.
 
-- [ ] Seed known secrets/password/UUID/Cookie/path/URL and malicious names/errors; assert zero secret bytes and only readonly requests. Offline core yields partial report. Vendor-absent single-exe test and existing-output/overwrite/error tests. Run; expected RED.
-- [ ] Implement aliases/redaction/partial-module errors, own recovery/history summaries and optional real source integrity. Drop unrepresentable fields with typed warnings, no raw fallback.
-- [ ] Full Rust/CLI/secret byte-scan/readonly suites green; update docs; commit `feat: generate share-safe diagnostic reports`.
+- [x] Seed known secrets/password/UUID/Cookie/path/URL and malicious names/errors; assert zero secret bytes and only readonly requests. Offline core yields partial report. Vendor-absent single-exe test and existing-output/overwrite/error tests. Run; expected RED.
+- [x] Implement aliases/redaction/partial-module errors, own recovery/history summaries and optional real source integrity. Drop unrepresentable fields with typed warnings, no raw fallback.
+- [x] Full Rust/CLI/secret byte-scan/readonly suites green; update docs; commit `feat: generate share-safe diagnostic reports`.
 
 ### Task 3: Filterable confirmed terminal browse
 
@@ -54,9 +54,9 @@
 
 **Interfaces:** `BrowseModel` owns immutable selected identity, scope revision, filters/page/details. Actions refresh/scan/filter/page/details/select/confirm/back/quit. Confirmation shows client/group/original/target/rate/verification. Session guard restores terminal; apply calls workflow::use_flow.
 
-- [ ] Test keyword/protocol/rate/line filters, pagination/full Unicode, refresh invalidation/stale ordinal/scope/member change. Inject terminal input for default cancel/yes/max-rate/dry-run/cancel cleanup and nonterminal/JSON rejection. Run; expected RED.
-- [ ] Implement lightweight menu/input and terminal guard; reread before confirmation and revalidate through P0 at apply. Require unique group or explicit choice of legal group.
-- [ ] All suites and actual terminal smoke green; update docs/roadmap; commit `feat: add confirmed terminal browsing`.
+- [x] Test keyword/protocol/rate/line filters, pagination/full Unicode, refresh invalidation/stale ordinal/scope/member change. Inject terminal input for default cancel/yes/max-rate/dry-run/cancel cleanup and nonterminal/JSON rejection. Run; expected RED.
+- [x] Implement lightweight menu/input and terminal guard; reread before confirmation and revalidate through P0 at apply. Require unique group or explicit choice of legal group.
+- [x] All suites and actual terminal smoke green; update docs/roadmap; commit `feat: add confirmed terminal browsing`.
 
 ### Task 4: Whole-goal verification and delivery
 

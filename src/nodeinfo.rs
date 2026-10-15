@@ -296,7 +296,7 @@ pub fn report_candidates(selected: &Candidates, max_rate: Option<f64>) {
     }
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, serde::Serialize)]
 pub struct NodeConfig {
     #[serde(default)]
     pub name: String,

@@ -37,7 +37,8 @@ impl Cancellation {
     }
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
-            || (self.observe_console && INTERRUPTED.load(Ordering::Acquire))
+            || (self.observe_console
+                && (INTERRUPTED.load(Ordering::Acquire) || crate::report::closed()))
     }
     pub fn check(&self) -> AppResult<()> {
         if self.is_cancelled() {

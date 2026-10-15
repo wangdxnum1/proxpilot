@@ -53,6 +53,7 @@ impl CoreApi {
         timeout: Duration,
     ) -> AppResult<CoreResponse> {
         self.request_detailed(be, method, path, body, timeout)
+            .inspect_err(crate::report::error)
     }
 
     pub fn request_detailed(

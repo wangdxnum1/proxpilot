@@ -1,7 +1,10 @@
+#[macro_use]
+mod report;
 mod appstate;
 mod checker;
 mod client_config;
 mod clients;
+mod commands;
 mod core_api;
 mod detect;
 mod diagnostics;
@@ -22,7 +25,33 @@ mod watch;
 mod watch_policy;
 mod workflow;
 
-use std::process::exit;
+fn command_name() -> String {
+    std::env::args()
+        .skip(1)
+        .find(|s| {
+            matches!(
+                s.as_str(),
+                "check"
+                    | "scan"
+                    | "fix"
+                    | "use"
+                    | "watch"
+                    | "nodes"
+                    | "info"
+                    | "clients"
+                    | "config"
+                    | "history"
+                    | "recover"
+                    | "diagnose"
+                    | "browse"
+                    | "help"
+            )
+        })
+        .unwrap_or_else(|| "help".into())
+}
+fn exit(code: i32) -> ! {
+    std::process::exit(report::finish(&command_name(), code))
+}
 
 use colored::Colorize;
 
@@ -49,6 +78,7 @@ pub struct Args {
     pub optimize: bool,
     pub watch: watch_policy::WatchSettings,
     pub detect: bool,
+    pub json: bool,
 }
 
 #[derive(Clone)]
@@ -104,6 +134,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         optimize: false,
         watch: Default::default(),
         detect: false,
+        json: false,
     };
     let mut command = false;
     let mut supported = false;
@@ -189,6 +220,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             "--dry-run" => args.dry_run = true,
             "--no-system-proxy" => args.manage_system_proxy = false,
             "--detect" => args.detect = true,
+            "--json" => args.json = true,
             "--supported" => supported = true,
             "--retry" | "--discard" => {
                 if recovery_action.is_some() {
@@ -263,8 +295,9 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
     Ok(args)
 }
 
-fn cmd_clients(supported: bool) -> Result<(), String> {
+fn cmd_clients(args: &Args, supported: bool) -> Result<(), String> {
     if supported {
+        report::data(serde_json::json!({"supported":["cutecloud","clash-verge","vvcloud","auto"]}));
         println!("cutecloud    CuteCloud    HTTP API；支持选择记忆同步");
         println!("clash-verge  Clash Verge  命名管道 / HTTP API；仅同步当前内核选择");
         println!("vvcloud     VVCloud      HTTP API；支持选择记忆同步");
@@ -272,7 +305,18 @@ fn cmd_clients(supported: bool) -> Result<(), String> {
         return Ok(());
     }
     let api = core_api::CoreApi::new()?;
-    let records = clients::discover(&api, &clients::DiscoveryPaths::current()?);
+    let records = if args.api.is_some() {
+        vec![clients::DiscoveryRecord {
+            name: "explicit".into(),
+            backend: Some(detect::detect(&api, args)?),
+            error: None,
+        }]
+    } else {
+        clients::discover(&api, &clients::DiscoveryPaths::current()?)
+    };
+    report::data(
+        serde_json::json!({"clients":records.iter().map(|r|serde_json::json!({"client":r.backend.as_ref().map(commands::backend),"available":r.backend.is_some(),"error":if r.backend.is_none(){Some(diagnostics::AppError::new(diagnostics::ErrorCode::ClientUnavailable,diagnostics::Stage::Discovery))}else{None}})).collect::<Vec<_>>()}),
+    );
     let active = if sysproxy::proxy_enabled() {
         sysproxy::registry_proxy_server()
     } else {
@@ -312,19 +356,23 @@ fn cmd_clients(supported: bool) -> Result<(), String> {
         Err("未发现可用客户端".into())
     }
 }
-fn cmd_config(command: &ConfigCommand) -> Result<(), String> {
+fn cmd_config(command: &ConfigCommand, dry_run: bool) -> Result<(), String> {
     let path = client_config::config_path()?;
     match command {
         ConfigCommand::Show => {}
-        ConfigCommand::Set(c) => client_config::save_default(&path, Some(*c))?,
-        ConfigCommand::Unset => client_config::save_default(&path, None)?,
+        ConfigCommand::Set(c) if !dry_run => client_config::save_default(&path, Some(*c))?,
+        ConfigCommand::Unset if !dry_run => client_config::save_default(&path, None)?,
+        _ => {}
     }
-    println!("{}", client_config::show_config(&path)?);
+    let value = serde_json::json!({"schema_version":1,"default_client":client_config::load_default(&path)?.map(|c|c.to_string()),"dry_run":dry_run});
+    report::data(&value);
+    println!("{}", serde_json::to_string_pretty(&value).unwrap());
     Ok(())
 }
 
 fn cmd_history(clear: bool, dry_run: bool) -> Result<(), String> {
     if clear && dry_run {
+        report::data(serde_json::json!({"cleared":false,"dry_run":true}));
         ui::dim("dry-run：将清理本工具的测量历史；未执行");
         return Ok(());
     }
@@ -336,11 +384,15 @@ fn cmd_history(clear: bool, dry_run: bool) -> Result<(), String> {
     let mut store = history::HistoryStore::current()?;
     if clear {
         store.clear()?;
+        report::data(serde_json::json!({"cleared":true}));
         ui::ok("已清理 ProxPilot 测量历史；客户端配置和当前节点保持现状");
         return Ok(());
     }
     let now = history::now();
     let rows = store.list(now)?;
+    report::data(
+        serde_json::json!({"measurements":rows,"retention_seconds":history::RETENTION_SECONDS}),
+    );
     ui::info(&format!(
         "最近测量：{} 条（30天内，最多显示100条；节点/范围使用不可逆指纹别名）",
         rows.len()
@@ -500,6 +552,7 @@ fn print_help() {
     println!("  watch          守护模式：保持可用节点，坏了自动修；加 --optimize 主动优选");
     println!();
     println!("选项:");
+    println!("  --json           本地结果 JSON；watch 为逐行事件（诊断报告另行匿名）");
     println!("  --group <名称>   指定策略组（默认优先读取客户端当前组并校验内核）");
     println!("  --url <地址>     测试网址（默认 https://chatgpt.com/）");
     println!("  --client <类型>  cutecloud / clash-verge / vvcloud / auto；覆盖保存的默认客户端");
@@ -750,6 +803,9 @@ fn cmd_nodes(be: &Backend, api: &core_api::CoreApi, args: &Args) -> i32 {
         scope.label,
         selected.names.len()
     ));
+    report::data(
+        serde_json::json!({"backend":commands::backend(be),"nodes":selected.names.iter().map(|n|commands::node(n,&proxies[n],&policy,scope.is_current(n))).collect::<Vec<_>>()}),
+    );
     for name in &selected.names {
         let info = &proxies[name];
         println!(
@@ -800,6 +856,14 @@ fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i
     let metadata = nodeinfo::load_metadata(be);
     let record = metadata.nodes.get(name);
     let config = record.map(|(config, _)| config);
+    let mut evidence = commands::node(name, live, &policy, false);
+    evidence["configuration"] = serde_json::to_value(config).unwrap();
+    evidence["groups"] = serde_json::json!(proxies
+        .iter()
+        .filter(|(_, p)| p.all.as_ref().is_some_and(|a| a.iter().any(|n| n == name)))
+        .map(|(n, _)| n)
+        .collect::<Vec<_>>());
+    report::data(evidence);
     ui::info(&format!("节点：{}", name));
     println!("  协议：{}（内核 API）", live.ptype);
     println!(
@@ -923,24 +987,46 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
                 let now = g.now.clone().unwrap_or_else(|| "未知".into());
                 ui::info(&format!("当前组「{}」→ {}", name, now));
             }
-            match checker::verify_recorded_current(
+            let current = checker::verify_current_report(
                 be,
                 agent,
                 display_group.as_deref().unwrap_or(""),
                 &args.url,
                 args.samples,
                 args.verify_timeout_ms,
-            ) {
-                checker::Verdict::Pass(t) => {
+            );
+            report::data(&current);
+            if let Some(e) = &current.history_warning {
+                report::warning(e);
+            }
+            if let Some(e) = &current.controller_error {
+                report::error(e);
+                ui::fail(&e.to_string());
+                return if e.code == diagnostics::ErrorCode::Cancelled {
+                    130
+                } else {
+                    1
+                };
+            }
+            match current.verification.availability {
+                diagnostics::Availability::Webpage => {
+                    let t = current.verification.mean_ms.unwrap_or_default() / 1000.0;
                     ui::ok(&format!("{} 可访问（平均 {:.2}s）", args.url, t));
                     0
                 }
-                checker::Verdict::PassIpOnly => {
+                diagnostics::Availability::IpOnly => {
                     ui::ok(&format!("{} 可访问（IP 检查通过）", args.url));
                     ui::dim("说明：网页返回 HTTP 403；API 检查通过，但浏览器访问仍需确认");
                     0
                 }
-                checker::Verdict::Fail(c) => {
+                diagnostics::Availability::Failed => {
+                    let c = current.verification.error.unwrap_or_else(|| {
+                        diagnostics::AppError::new(
+                            diagnostics::ErrorCode::ProbeFailed,
+                            diagnostics::Stage::Verification,
+                        )
+                    });
+                    report::error(&c);
                     if c.code == diagnostics::ErrorCode::Cancelled {
                         return 130;
                     }
@@ -1004,6 +1090,31 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         )
     ));
     let report = checker::scan_report(be, agent, &members, &args.url, &args.probe, &args.group);
+    let ranks = report.reachable();
+    let nodes: Vec<_> = report
+        .measurements
+        .iter()
+        .map(|m| {
+            let mut n = commands::node(
+                &m.node,
+                &proxies[&m.node],
+                &policy,
+                scope.is_current(&m.node),
+            );
+            n["delay_ms"] = serde_json::json!(m.delay_ms);
+            n["error"] = serde_json::json!(m.error);
+            n["attempts"] = serde_json::json!(m.attempts);
+            n["rank"] =
+                serde_json::json!(ranks.iter().position(|(_, n)| n == &m.node).map(|i| i + 1));
+            n
+        })
+        .collect();
+    report::data(
+        serde_json::json!({"backend":commands::backend(be),"nodes":nodes,"current":scope.current,"total":members.len(),"probe":report}),
+    );
+    if let Some(error) = &report.history_warning {
+        report::warning(error);
+    }
     if report.cancelled {
         ui::warn(&format!(
             "扫描已取消，已完成 {}/{}",
@@ -1014,6 +1125,7 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
     }
     let reachable = report.reachable();
     if let Some(error) = report.controller_failure() {
+        report::error(&error);
         ui::fail(&error.to_string());
         return 1;
     }
@@ -1346,10 +1458,13 @@ fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     }
     match workflow::fix_flow(be, agent, args) {
         Ok(result) => {
+            report::data(&result);
             print_commit(&result);
             0
         }
         Err(failure) => {
+            report::data(&failure);
+            report::error(&failure.error);
             ui::fail(&failure.to_string());
             failure.exit_code()
         }
@@ -1400,14 +1515,18 @@ fn print_commit(result: &switching::CommitReport) {
 fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &str) -> i32 {
     match workflow::use_flow(be, agent, args, node) {
         Ok(workflow::SelectionOutcome::DryRun { group, target }) => {
+            report::data(serde_json::json!({"status":"dry_run","group":group,"target":target}));
             ui::info(&format!("dry-run：将切换 {} → {}", group, target));
             0
         }
         Ok(workflow::SelectionOutcome::Committed { result }) => {
+            report::data(&result);
             print_commit(&result);
             0
         }
         Err(failure) => {
+            report::data(&failure);
+            report::error(&failure.error);
             ui::fail(&failure.to_string());
             failure.exit_code()
         }
@@ -1418,6 +1537,7 @@ fn cmd_recovery_record(action: RecoveryAction) -> Result<(), String> {
     match action {
         RecoveryAction::Inspect => match switching::inspect_recovery()? {
             Some(record) => {
+                report::data(&record);
                 ui::info(&format!(
                     "恢复记录：组「{}」；{}",
                     record.group,
@@ -1434,10 +1554,14 @@ fn cmd_recovery_record(action: RecoveryAction) -> Result<(), String> {
                 ));
                 ui::dim("recover --retry 校验原客户端后尝试恢复；recover --discard 仅删除本工具记录，不切换节点或修改系统代理。");
             }
-            None => ui::info("没有待恢复记录"),
+            None => {
+                report::data(serde_json::json!({"pending":false}));
+                ui::info("没有待恢复记录");
+            }
         },
         RecoveryAction::Discard => {
             switching::discard_recovery()?;
+            report::data(serde_json::json!({"discarded":true}));
             ui::info("已清理恢复记录，节点与系统代理保持现状");
         }
         RecoveryAction::Retry => unreachable!(),
@@ -1449,7 +1573,9 @@ fn cmd_retry_recovery(be: &Backend, api: &core_api::CoreApi) -> i32 {
     let control = runtime_switch::KernelSwitchControl { backend: be, api };
     match switching::retry_recovery(&control, &operation::Cancellation::global()) {
         Ok(report) => {
+            report::data(&report);
             if let Some(error) = report.error {
+                report::error(&error);
                 ui::warn(&format!("恢复未完成：{}；请查看 recover 记录", error));
                 return 1;
             }
@@ -1497,10 +1623,8 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             }
         };
     }
-    watch::run(initial, agent, args, &mut |event| {
-        watch::render_text(event);
-        true
-    })
+    let mut writer = report::EventWriter::new();
+    watch::run(initial, agent, args, &mut |event| writer.emit(event))
 }
 
 /// 控制台默认 GBK 代码页会显示乱码，切到 UTF-8（对 mintty 等无副作用）
@@ -1514,6 +1638,11 @@ fn set_console_utf8() {
 }
 
 fn main() {
+    report::initialize(std::env::args().any(|v| v == "--json"));
+    run_main();
+    exit(0);
+}
+fn run_main() {
     #[cfg(windows)]
     set_console_utf8();
     if let Err(error) = operation::install_console_handler() {
@@ -1521,12 +1650,16 @@ fn main() {
         exit(1);
     }
     let args = parse_args_from(std::env::args().skip(1)).unwrap_or_else(|e| {
+        report::error(&diagnostics::AppError::new(
+            diagnostics::ErrorCode::InvalidInput,
+            diagnostics::Stage::Configuration,
+        ));
         ui::fail(&e);
         exit(1)
     });
     let static_result = match &args.cmd {
-        Cmd::Clients(s) => Some(cmd_clients(*s)),
-        Cmd::Config(c) => Some(cmd_config(c)),
+        Cmd::Clients(s) => Some(cmd_clients(&args, *s)),
+        Cmd::Config(c) => Some(cmd_config(c, args.dry_run)),
         Cmd::History(clear) => Some(cmd_history(*clear, args.dry_run)),
         Cmd::Recover(action @ (RecoveryAction::Inspect | RecoveryAction::Discard)) => {
             Some(cmd_recovery_record(*action))

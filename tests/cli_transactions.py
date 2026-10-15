@@ -152,7 +152,7 @@ class Fixture:
     def command(self, *arguments):
         return [str(EXECUTABLE), *arguments, "--api", f"http://127.0.0.1:{self.core.server_port}",
                 "--proxy", f"http://127.0.0.1:{self.proxy.server_port}", "--group", "group",
-                "--url", self.url, "--samples", str(self.samples)]
+                "--url",self.url,"--samples",str(self.samples),"--no-system-proxy"]
     def environment(self):
         env = dict(os.environ, APPDATA=self.temporary.name, NO_COLOR="1", PROXPILOT_SPINNER="0")
         env.pop("CLICOLOR_FORCE", None)

@@ -1,6 +1,7 @@
 #[macro_use]
 mod report;
 mod appstate;
+mod browse;
 mod checker;
 mod client_config;
 mod clients;
@@ -21,6 +22,7 @@ mod scan_output;
 mod scoring;
 mod switching;
 mod sysproxy;
+mod terminal;
 mod ui;
 mod watch;
 mod watch_policy;
@@ -50,7 +52,11 @@ fn command_name() -> String {
         })
         .unwrap_or_else(|| "help".into())
 }
+static CONSOLE: std::sync::OnceLock<terminal::ConsoleGuard> = std::sync::OnceLock::new();
 fn exit(code: i32) -> ! {
+    if let Some(console) = CONSOLE.get() {
+        console.restore();
+    }
     std::process::exit(report::finish(&command_name(), code))
 }
 
@@ -99,6 +105,7 @@ pub enum Cmd {
     Recover(RecoveryAction),
     History(bool),
     Diagnose,
+    Browse,
 }
 
 #[derive(Clone, Copy)]
@@ -245,11 +252,12 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 return Ok(args);
             }
             "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" | "nodes"
-            | "info" | "recover" | "history" | "diagnose"
+            | "info" | "recover" | "history" | "diagnose" | "browse"
                 if !command =>
             {
                 command = true;
                 args.cmd = match arg.as_str() {
+                    "browse" => Cmd::Browse,
                     "diagnose" => Cmd::Diagnose,
                     "nodes" => Cmd::Nodes,
                     "recover" => Cmd::Recover(RecoveryAction::Inspect),
@@ -278,6 +286,9 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             "clear" if matches!(args.cmd, Cmd::History(false)) => args.cmd = Cmd::History(true),
             _ => return Err(format!("未知命令或参数：{}", arg)),
         }
+    }
+    if matches!(args.cmd, Cmd::Browse) && args.json {
+        return Err("browse 不能与 --json 组合".into());
     }
     if (args.output.is_some() || args.overwrite) && !matches!(args.cmd, Cmd::Diagnose) {
         return Err("--output / --overwrite 仅用于 diagnose".into());
@@ -551,6 +562,7 @@ fn print_help() {
     println!("用法: proxpilot <命令> [选项]");
     println!();
     println!("命令:");
+    println!("  browse         终端分页/筛选/详情/扫描；切换须确认，默认取消");
     println!("  diagnose       只读匿名诊断；--output <文件>，覆盖需 --overwrite；不测速/上传");
     println!("  history [clear] 查看最近测量记录或清理本工具历史（无需内核在线）");
     println!("  recover [--retry | --discard]  查看、重试恢复或仅清理恢复记录");
@@ -1657,7 +1669,10 @@ fn main() {
 }
 fn run_main() {
     #[cfg(windows)]
-    set_console_utf8();
+    {
+        CONSOLE.get_or_init(terminal::ConsoleGuard::capture);
+        set_console_utf8();
+    }
     if let Err(error) = operation::install_console_handler() {
         ui::fail(&error.to_string());
         exit(1);
@@ -1711,7 +1726,10 @@ fn run_main() {
             c
         }),
     };
-    let args = if matches!(args.cmd, Cmd::Watch | Cmd::Info(_) | Cmd::Recover(_)) {
+    let args = if matches!(
+        args.cmd,
+        Cmd::Watch | Cmd::Info(_) | Cmd::Recover(_) | Cmd::Browse
+    ) {
         args
     } else {
         runtime_group_args(&be, &agent, &args).unwrap_or_else(|e| {
@@ -1729,6 +1747,7 @@ fn run_main() {
     let code = match &args.cmd {
         Cmd::Recover(RecoveryAction::Retry) => cmd_retry_recovery(&be, &agent),
         Cmd::Recover(_) => unreachable!(),
+        Cmd::Browse => browse::run(&be, &agent, &args),
         Cmd::Nodes => cmd_nodes(&be, &agent, &args),
         Cmd::Info(name) => cmd_info(&be, &agent, &args, name),
         Cmd::Check => cmd_check(&be, &agent, &args),

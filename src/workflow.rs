@@ -382,8 +382,18 @@ pub fn use_flow(
     args: &Args,
     target: &str,
 ) -> Result<SelectionOutcome, OperationFailure> {
+    use_flow_expected(be, api, args, target, None)
+}
+pub fn use_flow_expected(
+    be: &Backend,
+    api: &CoreApi,
+    args: &Args,
+    target: &str,
+    expected: Option<&crate::switching::LiveState>,
+) -> Result<SelectionOutcome, OperationFailure> {
     let control = KernelSwitchControl { backend: be, api };
     let scope = prepare(&control, &args.group)?;
+    require_prepared_observed(&scope, &args.group, expected)?;
     let real = scope
         .proxies
         .get(target)
@@ -409,6 +419,7 @@ pub fn use_flow(
     let mut scored_candidate = None;
     let mut history_warning = None;
     let mut result = in_transaction(&control, &scope, args, |transaction| {
+        require_observed(&transaction.snapshot().state, expected)?;
         let mut history =
             crate::history::HistorySession::new(be, scope.profile, &args.group, &args.url);
         let prior = history.prior(target);

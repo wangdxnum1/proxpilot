@@ -39,6 +39,7 @@ build.bat
 proxpilot check     :: 体检：内核通不通、系统代理是否被关、ChatGPT 能否访问
 proxpilot fix       :: 一键优选：探测全部节点 → 真实验证 → 切到实测最快的
 proxpilot watch     :: 守护模式：保持可用节点，坏了自动修
+proxpilot history   :: 查看本工具近期测量，无需内核在线
 ```
 
 **典型场景**：ChatGPT 突然打不开 → 双击 `bin\proxpilot.exe` 或运行 `proxpilot fix`，约 1 分钟后自动切到可用节点。
@@ -73,6 +74,14 @@ Clash Verge 的节点切换作用于当前内核；不修改由 GUI 缓存管理
 `clients`、`scan`、`config show` 及 `check --dry-run` 不改变系统代理或当前节点。`use/fix/watch --dry-run` 也不切换节点。
 
 ## 子命令详解
+
+### `history` / `history clear` — 测量历史
+
+测量保存在 `%APPDATA%\ProxPilot\history.sqlite3`，与代理客户端数据库隔离。按客户端、已确认的配置源、订阅、组、节点和测试目标分层；已确认配置源的命名管道重启可延续，匿名 API 按规范化 endpoint 隔离。数据库只保存不可逆身份/目标指纹、时间、阶段、可用性、耗时及错误类别，不保存节点原名、用户路径、完整 URL、凭据、Cookie 或响应体。`history` 用指纹前缀展示别名，离线查看最近100条。
+
+最多保留10000条，写入时清理30天前数据；过期记录不参与查询或评分。初筛“收到响应”与网页验证分开记录。数据库锁定、只读、损坏或版本不受支持时，本轮网络操作继续并提示历史不可用，损坏文件不会被悄悄替换。验证中选择或订阅改变时不把结果归属到旧候选。
+
+`history clear` 只清理本工具数据库，使用修改锁；不连接内核，不修改代理、节点或客户端记忆。`history clear --dry-run` 只预览，不删除记录。`scan` 的默认排名仍然只看本轮延迟，历史不替代当前测量。
 
 ### `check` — 体检
 

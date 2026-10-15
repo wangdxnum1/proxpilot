@@ -289,13 +289,18 @@ pub fn use_flow(
         });
     }
     let result = in_transaction(&control, &scope, args, |transaction| {
+        let mut history =
+            crate::history::HistorySession::new(be, scope.profile, &args.group, &args.url);
         transaction.select(target)?;
-        Ok(checker::verify_access_report_with_timeout(
+        let evidence = checker::verify_access_report_with_timeout(
             &be.proxy,
             &args.url,
             args.samples,
             args.verify_timeout_ms,
-        ))
+        );
+        transaction.validate_current()?;
+        history.record_verification(be, target, &evidence);
+        Ok(evidence)
     })?;
     Ok(SelectionOutcome::Committed { result })
 }
@@ -325,10 +330,19 @@ pub fn fix_flow(
         return Err(AppError::new(ErrorCode::ClientUnavailable, Stage::Discovery).into());
     }
     in_transaction(&control, &scope, args, |transaction| {
+        let mut history =
+            crate::history::HistorySession::new(be, scope.profile, &args.group, &args.url);
         if args.manage_system_proxy {
             transaction.repair_proxy()?;
         }
-        let scan = checker::scan_report(be, api, &candidates.names, &args.url, &args.probe);
+        let scan = checker::scan_report(
+            be,
+            api,
+            &candidates.names,
+            &args.url,
+            &args.probe,
+            &args.group,
+        );
         if let Some(error) = scan.controller_failure() {
             return Err(error.clone());
         }
@@ -357,6 +371,8 @@ pub fn fix_flow(
                 args.samples,
                 args.verify_timeout_ms,
             );
+            transaction.validate_current()?;
+            history.record_verification(be, name, &evidence);
             if evidence
                 .error
                 .as_ref()
@@ -412,6 +428,8 @@ pub fn fix_flow(
             args.samples,
             args.verify_timeout_ms,
         );
+        transaction.validate_current()?;
+        history.record_verification(be, best, &final_evidence);
         if prior.availability == Availability::Webpage
             && final_evidence.availability != Availability::Webpage
         {

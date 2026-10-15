@@ -5,6 +5,7 @@ mod clients;
 mod core_api;
 mod detect;
 mod diagnostics;
+mod history;
 mod http;
 mod mihomo;
 mod nodeinfo;
@@ -60,6 +61,7 @@ pub enum Cmd {
     Nodes,
     Info(String),
     Recover(RecoveryAction),
+    History(bool),
 }
 
 #[derive(Clone, Copy)]
@@ -189,13 +191,14 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 return Ok(args);
             }
             "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" | "nodes"
-            | "info" | "recover"
+            | "info" | "recover" | "history"
                 if !command =>
             {
                 command = true;
                 args.cmd = match arg.as_str() {
                     "nodes" => Cmd::Nodes,
                     "recover" => Cmd::Recover(RecoveryAction::Inspect),
+                    "history" => Cmd::History(false),
                     "info" => Cmd::Info(value(&mut it, "info")?),
                     "check" => Cmd::Check,
                     "scan" => Cmd::Scan,
@@ -217,6 +220,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                     _ => unreachable!(),
                 }
             }
+            "clear" if matches!(args.cmd, Cmd::History(false)) => args.cmd = Cmd::History(true),
             _ => return Err(format!("未知命令或参数：{}", arg)),
         }
     }
@@ -299,6 +303,64 @@ fn cmd_config(command: &ConfigCommand) -> Result<(), String> {
     println!("{}", client_config::show_config(&path)?);
     Ok(())
 }
+
+fn cmd_history(clear: bool, dry_run: bool) -> Result<(), String> {
+    if clear && dry_run {
+        ui::dim("dry-run：将清理本工具的测量历史；未执行");
+        return Ok(());
+    }
+    let _ownership = if clear {
+        Some(operation::MutationLock::acquire()?)
+    } else {
+        None
+    };
+    let mut store = history::HistoryStore::current()?;
+    if clear {
+        store.clear()?;
+        ui::ok("已清理 ProxPilot 测量历史；客户端配置和当前节点保持现状");
+        return Ok(());
+    }
+    let now = history::now();
+    let rows = store.list(now)?;
+    ui::info(&format!(
+        "最近测量：{} 条（30天内，最多显示100条；节点/范围使用不可逆指纹别名）",
+        rows.len()
+    ));
+    for row in rows {
+        let stage = if row.measurement.stage == diagnostics::Stage::Probe {
+            "初筛"
+        } else {
+            "网页验证"
+        };
+        let grade = match row.measurement.availability {
+            Some(diagnostics::Availability::Webpage) => "网页通过",
+            Some(diagnostics::Availability::IpOnly) => "仅IP通过",
+            Some(diagnostics::Availability::Failed) => "未通过",
+            None => {
+                if row.measurement.delay_ms.is_some() {
+                    "收到响应"
+                } else {
+                    "探测失败"
+                }
+            }
+        };
+        let delay = row
+            .measurement
+            .delay_ms
+            .map(|ms| format!("{ms:.0}ms"))
+            .unwrap_or_else(|| "—".into());
+        println!(
+            "  {}秒前  范围#{}  节点#{}  {} · {} · {}",
+            now.saturating_sub(row.timestamp),
+            &row.scope[..12],
+            &row.node[..12],
+            stage,
+            grade,
+            delay
+        );
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -379,6 +441,7 @@ fn print_help() {
     println!("用法: proxpilot <命令> [选项]");
     println!();
     println!("命令:");
+    println!("  history [clear] 查看最近测量记录或清理本工具历史（无需内核在线）");
     println!("  recover [--retry | --discard]  查看、重试恢复或仅清理恢复记录");
     println!("  clients [--supported]  查看发现的客户端 / 支持的类型");
     println!("  config show | set default-client <类型> | unset default-client");
@@ -811,8 +874,10 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
                 let now = g.now.clone().unwrap_or_else(|| "未知".into());
                 ui::info(&format!("当前组「{}」→ {}", name, now));
             }
-            match checker::verify_access_with_timeout(
-                &be.proxy,
+            match checker::verify_recorded_current(
+                be,
+                agent,
+                display_group.as_deref().unwrap_or(""),
                 &args.url,
                 args.samples,
                 args.verify_timeout_ms,
@@ -889,7 +954,7 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
             members.len()
         )
     ));
-    let report = checker::scan_report(be, agent, &members, &args.url, &args.probe);
+    let report = checker::scan_report(be, agent, &members, &args.url, &args.probe, &args.group);
     if report.cancelled {
         ui::warn(&format!(
             "扫描已取消，已完成 {}/{}",
@@ -1504,8 +1569,14 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
                 continue;
             }
         }
-        let v1 =
-            checker::verify_access_with_timeout(&be.proxy, &args.url, 1, args.verify_timeout_ms);
+        let v1 = checker::verify_recorded_current(
+            be,
+            agent,
+            &args.group,
+            &args.url,
+            1,
+            args.verify_timeout_ms,
+        );
         let mut broken = !v1.is_ok();
         let mut last_code = match &v1 {
             checker::Verdict::Fail(error) => error.to_string(),
@@ -1516,8 +1587,10 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             if cancellation.wait(Duration::from_secs(5)).is_err() {
                 return 130;
             }
-            let v2 = checker::verify_access_with_timeout(
-                &be.proxy,
+            let v2 = checker::verify_recorded_current(
+                be,
+                agent,
+                &args.group,
                 &args.url,
                 1,
                 args.verify_timeout_ms,
@@ -1593,6 +1666,7 @@ fn main() {
     let static_result = match &args.cmd {
         Cmd::Clients(s) => Some(cmd_clients(*s)),
         Cmd::Config(c) => Some(cmd_config(c)),
+        Cmd::History(clear) => Some(cmd_history(*clear, args.dry_run)),
         Cmd::Recover(action @ (RecoveryAction::Inspect | RecoveryAction::Discard)) => {
             Some(cmd_recovery_record(*action))
         }
@@ -1643,7 +1717,7 @@ fn main() {
         Cmd::Fix => cmd_fix(&be, &agent, &args),
         Cmd::Use(n) => cmd_use(&be, &agent, &args, n),
         Cmd::Watch => cmd_watch(&be, &agent, &args),
-        Cmd::Clients(_) | Cmd::Config(_) => unreachable!(),
+        Cmd::Clients(_) | Cmd::Config(_) | Cmd::History(_) => unreachable!(),
         Cmd::Help => {
             print_help();
             0

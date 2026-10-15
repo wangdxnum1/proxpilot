@@ -287,6 +287,21 @@ impl<'a, C: SwitchControl + ?Sized> SwitchTransaction<'a, C> {
         self.journal.store(&self.record)
     }
 
+    pub fn validate_current(&self) -> AppResult<()> {
+        self.cancellation.check()?;
+        self.ensure_active()?;
+        let state = checked_state(self.control, &self.record, false)?;
+        if self.record.pending.is_some()
+            || state.selection.as_deref() != Some(&self.record.expected)
+        {
+            return Err(AppError::new(
+                ErrorCode::SelectionConflict,
+                Stage::Switching,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn commit(&mut self, verification: &VerificationReport) -> AppResult<CommitReport> {
         self.cancellation.check()?;
         self.ensure_active()?;
@@ -307,15 +322,7 @@ impl<'a, C: SwitchControl + ?Sized> SwitchTransaction<'a, C> {
                 Stage::Verification,
             ));
         }
-        let state = checked_state(self.control, &self.record, false)?;
-        if self.record.pending.is_some()
-            || state.selection.as_deref() != Some(&self.record.expected)
-        {
-            return Err(AppError::new(
-                ErrorCode::SelectionConflict,
-                Stage::Switching,
-            ));
-        }
+        self.validate_current()?;
         // Persist the commit decision first: a failed journal deletion must never
         // cause the next invocation to undo an already verified committed choice.
         let mut committed = self.record.clone();

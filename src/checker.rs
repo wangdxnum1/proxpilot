@@ -85,6 +85,15 @@ impl Verdict {
     pub fn is_ok(&self) -> bool {
         !matches!(self, Verdict::Fail(_))
     }
+    pub fn from_report(report: VerificationReport) -> Self {
+        match report.availability {
+            Availability::Webpage => Self::Pass(report.mean_ms.unwrap_or_default() / 1000.0),
+            Availability::IpOnly => Self::PassIpOnly,
+            Availability::Failed => Self::Fail(report.error.unwrap_or_else(|| {
+                AppError::new(ErrorCode::TransportUnknown, Stage::Verification)
+            })),
+        }
+    }
 }
 
 fn is_openai_url(url: &str) -> bool {
@@ -191,16 +200,56 @@ pub fn verify_access_with_timeout(
     samples: usize,
     timeout_ms: u32,
 ) -> Verdict {
-    let report = verify_access_report_with_timeout(proxy, url, samples, timeout_ms);
-    match report.availability {
-        Availability::Webpage => Verdict::Pass(report.mean_ms.unwrap_or_default() / 1000.0),
-        Availability::IpOnly => Verdict::PassIpOnly,
-        Availability::Failed => Verdict::Fail(
-            report
-                .error
-                .unwrap_or_else(|| AppError::new(ErrorCode::TransportUnknown, Stage::Verification)),
-        ),
+    Verdict::from_report(verify_access_report_with_timeout(
+        proxy, url, samples, timeout_ms,
+    ))
+}
+
+pub fn verify_recorded_current(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+    group: &str,
+    url: &str,
+    samples: usize,
+    timeout_ms: u32,
+) -> Verdict {
+    use crate::switching::SwitchControl;
+    let control = crate::runtime_switch::KernelSwitchControl { backend: be, api };
+    let before = if group.is_empty() {
+        None
+    } else {
+        control.state(group).ok()
+    };
+    let report = verify_access_report_with_timeout(&be.proxy, url, samples, timeout_ms);
+    if !report
+        .error
+        .as_ref()
+        .is_some_and(|e| e.code == ErrorCode::Cancelled)
+    {
+        if let Some(mut before) = before {
+            match control.state(group) {
+                Ok(mut after) => {
+                    before.members.sort();
+                    after.members.sort();
+                    if before.identity == after.identity
+                        && before.profile == after.profile
+                        && before.members == after.members
+                        && before.selection == after.selection
+                    {
+                        if let Some(node) = before.selection {
+                            let mut history =
+                                crate::history::HistorySession::new(be, before.profile, group, url);
+                            history.record_verification(be, &node, &report);
+                        }
+                    } else {
+                        ui::warn("验证期间客户端或选择发生变化，未将本轮测量计入节点历史");
+                    }
+                }
+                Err(_) => ui::warn("验证后无法核对当前节点，未将本轮测量计入历史"),
+            }
+        }
     }
+    Verdict::from_report(report)
 }
 
 pub fn is_real_node(info: &ProxyInfo, name: &str) -> bool {
@@ -227,6 +276,26 @@ impl ScanReport {
 }
 
 pub fn scan_report(
+    be: &Backend,
+    agent: &crate::core_api::CoreApi,
+    members: &[String],
+    url: &str,
+    options: &crate::probe_scheduler::ProbeOptions,
+    group: &str,
+) -> ScanReport {
+    let mut history = crate::history::HistorySession::new(
+        be,
+        crate::appstate::current_profile_id(be),
+        group,
+        url,
+    );
+    let mut report = scan_network_report(be, agent, members, url, options);
+    history.record_probes(be, &report);
+    report.history_warning = history.warning;
+    report
+}
+
+fn scan_network_report(
     be: &Backend,
     agent: &crate::core_api::CoreApi,
     members: &[String],
@@ -280,7 +349,7 @@ fn scan_with_concurrency(
     url: &str,
     concurrency: usize,
 ) -> Vec<(i64, String)> {
-    scan_report(
+    scan_network_report(
         be,
         agent,
         members,

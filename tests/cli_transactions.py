@@ -1,8 +1,10 @@
 """Offline acceptance against the actual exe; Python is a developer/CI tool only."""
 import argparse
+from contextlib import closing
 import http.server
 import json
 import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import tempfile
@@ -148,6 +150,68 @@ class Fixture:
 
 
 class Transactions(unittest.TestCase):
+    def test_external_switch_during_verification_is_not_attributed_to_candidate_history(self):
+        with Fixture([200]) as fixture:
+            def externally_changed():
+                fixture.selected = "external"
+                return 200
+            fixture.responses = [externally_changed]
+            result = fixture.run("use", "target")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(fixture.selected, "external")
+            self.assertEqual([value for method,value in fixture.requests if method == "PUT"], ["target"])
+            path = Path(fixture.temporary.name) / "ProxPilot/history.sqlite3"
+            with closing(sqlite3.connect(path)) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM measurements").fetchone()[0], 0)
+
+    def test_history_records_probe_and_verification_offline_and_clears_only_own_rows(self):
+        with Fixture([200]) as fixture:
+            for command in (("scan",), ("use", "target")):
+                result = fixture.run(*command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            path = Path(fixture.temporary.name) / "ProxPilot/history.sqlite3"
+            self.assertTrue(path.exists())
+            with closing(sqlite3.connect(path)) as db:
+                evidence = [json.loads(row[0]) for row in db.execute("SELECT evidence FROM measurements")]
+            self.assertEqual(sum(row["stage"] == "probe" for row in evidence), 2)
+            self.assertEqual(sum(row["stage"] == "verification" for row in evidence), 1)
+            count = len(fixture.requests)
+            listed = fixture.run("history")
+            self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+            self.assertEqual(len(fixture.requests), count)
+            self.assertNotIn("target", listed.stdout)
+            preview = fixture.run("history", "clear", "--dry-run")
+            self.assertEqual(preview.returncode, 0, preview.stdout + preview.stderr)
+            with closing(sqlite3.connect(path)) as db: self.assertEqual(db.execute("SELECT count(*) FROM measurements").fetchone()[0], 3)
+            cleared = fixture.run("history", "clear")
+            self.assertEqual(cleared.returncode, 0, cleared.stdout + cleared.stderr)
+            self.assertEqual(len(fixture.requests), count)
+            self.assertEqual(fixture.selected, "target")
+            with closing(sqlite3.connect(path)) as db: self.assertEqual(db.execute("SELECT count(*) FROM measurements").fetchone()[0], 0)
+
+    def test_corrupt_history_never_breaks_scan_or_replaces_evidence(self):
+        with Fixture([200]) as fixture:
+            path = Path(fixture.temporary.name) / "ProxPilot/history.sqlite3"
+            path.parent.mkdir()
+            path.write_bytes(b"corrupt-history-evidence")
+            scanned = fixture.run("scan")
+            self.assertEqual(scanned.returncode, 0, scanned.stdout + scanned.stderr)
+            self.assertEqual(path.read_bytes(), b"corrupt-history-evidence")
+            listed = fixture.run("history")
+            self.assertEqual(listed.returncode, 1, listed.stdout + listed.stderr)
+            self.assertEqual(path.read_bytes(), b"corrupt-history-evidence")
+
+    def test_locked_history_degrades_without_breaking_scan(self):
+        with Fixture([200]) as fixture:
+            self.assertEqual(fixture.run("scan").returncode, 0)
+            path = Path(fixture.temporary.name) / "ProxPilot/history.sqlite3"
+            with closing(sqlite3.connect(path)) as db:
+                db.execute("BEGIN EXCLUSIVE")
+                scanned = fixture.run("scan")
+                self.assertEqual(scanned.returncode, 0, scanned.stdout + scanned.stderr)
+                self.assertEqual(db.execute("SELECT count(*) FROM measurements").fetchone()[0], 2)
+                db.rollback()
+
     def test_global_controller_failure_is_environment_error_and_auth_is_not_retried(self):
         for status in (401, 503):
             with self.subTest(status=status), Fixture([200]) as fixture:

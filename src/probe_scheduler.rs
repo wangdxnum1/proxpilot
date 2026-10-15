@@ -47,6 +47,7 @@ pub struct ProbeRun {
     pub concurrency_limit: usize,
     pub windows: Vec<usize>,
     pub controller_error: Option<AppError>,
+    pub history_warning: Option<AppError>,
 }
 fn transient(error: &AppError) -> bool {
     error.retryable
@@ -197,6 +198,7 @@ pub fn run(
         concurrency_limit: limit,
         windows,
         controller_error: controller_error.into_inner().unwrap(),
+        history_warning: None,
     }
 }
 

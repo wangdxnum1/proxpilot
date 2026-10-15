@@ -10,8 +10,10 @@ mod mihomo;
 mod nodeinfo;
 mod operation;
 mod procinfo;
+mod runtime_switch;
 mod scan_output;
 mod sysproxy;
+mod switching;
 mod ui;
 
 use std::process::exit;

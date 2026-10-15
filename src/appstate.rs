@@ -36,6 +36,91 @@ pub fn current_group(be: &crate::Backend) -> Option<String> {
     current_group_from_database(&path)
 }
 
+pub fn current_profile_id(be: &crate::Backend) -> Option<i64> {
+    let base = std::env::var_os("APPDATA")?;
+    let path = db_path(be.kind?, std::path::Path::new(&base))?;
+    active_profile_id(path.parent()?)
+}
+
+pub fn sync_selection_captured(
+    be: &crate::Backend,
+    profile: Option<i64>,
+    group: &str,
+    node: &str,
+) -> crate::diagnostics::AppResult<crate::switching::MemorySync> {
+    use crate::{client_config::ClientKind, switching::MemorySync};
+    let Some(kind) = be.kind else {
+        return Ok(MemorySync::NotAvailable);
+    };
+    if kind == ClientKind::ClashVerge {
+        return Ok(MemorySync::ClientManaged);
+    }
+    let (Some(profile), Some(base)) = (profile, std::env::var_os("APPDATA")) else {
+        return Ok(MemorySync::NotAvailable);
+    };
+    let Some(path) = db_path(kind, std::path::Path::new(&base)) else {
+        return Ok(MemorySync::NotAvailable);
+    };
+    sync_database_captured(&path, profile, group, node)
+}
+
+fn sync_database_captured(
+    path: &std::path::Path,
+    profile: i64,
+    group: &str,
+    node: &str,
+) -> crate::diagnostics::AppResult<crate::switching::MemorySync> {
+    use crate::{
+        diagnostics::{AppError, ErrorCode, Stage},
+        switching::MemorySync,
+    };
+    use rusqlite::OptionalExtension;
+    let failure = || AppError::new(ErrorCode::StateUnavailable, Stage::State);
+    let directory = path.parent().ok_or_else(failure)?;
+    let check_profile = || {
+        if active_profile_id(directory) == Some(profile) {
+            Ok(())
+        } else {
+            Err(AppError::new(ErrorCode::ProfileChanged, Stage::State))
+        }
+    };
+    check_profile()?;
+    let mut con = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|_| failure())?;
+    con.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|_| failure())?;
+    let transaction = con
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| failure())?;
+    let existing: Option<Option<String>> = transaction
+        .query_row(
+            "SELECT selected_map FROM profiles WHERE id=?1",
+            [profile],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| failure())?;
+    let Some(Some(original)) = existing else {
+        return Ok(MemorySync::NoMatchingGroup);
+    };
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&original).map_err(|_| failure())?;
+    if !map.contains_key(group) {
+        return Ok(MemorySync::NoMatchingGroup);
+    }
+    map.insert(group.into(), serde_json::Value::String(node.into()));
+    check_profile()?;
+    let count = transaction.execute(
+        "UPDATE profiles SET selected_map=?1, current_group_name=?2 WHERE id=?3 AND selected_map=?4",
+        rusqlite::params![serde_json::Value::Object(map).to_string(), group, profile, original],
+    ).map_err(|_| failure())?;
+    if count != 1 {
+        return Err(failure());
+    }
+    transaction.commit().map_err(|_| failure())?;
+    Ok(MemorySync::Synced)
+}
+
 fn current_group_from_database(path: &std::path::Path) -> Option<String> {
     let profile = active_profile_id(path.parent()?)?;
     let con = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
@@ -131,6 +216,54 @@ fn sync_database(path: &std::path::Path, group: &str, node: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_profile_cannot_write_into_a_new_subscription() {
+        let root = std::env::temp_dir().join(format!(
+            "proxpilot-captured-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("database.sqlite");
+        let con = Connection::open(&path).unwrap();
+        con.execute_batch(r#"CREATE TABLE profiles(id INTEGER PRIMARY KEY, selected_map TEXT, current_group_name TEXT);
+            INSERT INTO profiles VALUES(1,'{"AI":"original-1"}','AI');
+            INSERT INTO profiles VALUES(2,'{"AI":"original-2"}','AI');"#).unwrap();
+        let write_profile = |id| {
+            std::fs::write(root.join("shared_preferences.json"),
+            serde_json::json!({"flutter.config":serde_json::json!({"currentProfileId":id}).to_string()}).to_string()).unwrap()
+        };
+        write_profile(2);
+        assert_eq!(
+            sync_database_captured(&path, 1, "AI", "verified")
+                .unwrap_err()
+                .code,
+            crate::diagnostics::ErrorCode::ProfileChanged
+        );
+        let read = |id| {
+            con.query_row(
+                "SELECT selected_map FROM profiles WHERE id=?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert!(read(1).contains("original-1"));
+        assert!(read(2).contains("original-2"));
+        write_profile(1);
+        assert_eq!(
+            sync_database_captured(&path, 1, "AI", "verified").unwrap(),
+            crate::switching::MemorySync::Synced
+        );
+        assert!(read(1).contains("verified"));
+        assert!(read(2).contains("original-2"));
+        drop(con);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn current_group_and_sync_follow_active_profile_without_cross_subscription_writes() {
         let root = std::env::temp_dir().join(format!(

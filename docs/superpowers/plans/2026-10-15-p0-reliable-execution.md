@@ -59,10 +59,10 @@
 
 **Interfaces:** `Cancellation::new/global/cancel/is_cancelled/check/wait`, per-user `MutationLock::acquire() -> AppResult<MutationLock>`, encrypted `RecoveryJournal::load/store/remove` for a serializable snapshot/pending target. Cancellation handler only sets an atomic flag; cleanup ignores normal cancellation. Use a held exclusive Windows file handle, not lock-file presence, to prevent simultaneous mutations across sessions.
 
-- [ ] Add failing tests for cancellable waits, two live lock holders, lock release on process death, DPAPI journal round-trip, malformed/truncated journal and atomic replacement.
-- [ ] Run them and observe failures before implementation.
-- [ ] Implement control handler and bounded waits, lock and encrypted/atomic journal. Store no API secret; use current runtime config on recovery. Do not treat an old lock filename as a live owner.
-- [ ] Run targeted subprocess/temporary-directory tests and the full suite; commit.
+- [x] Add failing tests for cancellable waits, two live lock holders, lock release on process death, DPAPI journal round-trip, malformed/truncated journal and atomic replacement.
+- [x] Run them and observe failures before implementation.
+- [x] Implement control handler and bounded waits, lock and encrypted/atomic journal. Store no API secret; use current runtime config on recovery. Do not treat an old lock filename as a live owner.
+- [x] Run targeted subprocess/temporary-directory tests and the full suite; commit.
 
 ### Task 4: Switching transaction and conflict-aware rollback
 
@@ -70,10 +70,10 @@
 
 **Interfaces:** A mockable `SwitchControl` exposes identity/profile snapshot, read direct selection and switch; `SwitchTransaction::begin`, `select`, `commit`, `rollback` return typed reports. Explicit finalization reports restored/skipped-conflict/failed separately. `appstate` exposes captured-profile sync and returns a result instead of printing from inside the operation.
 
-- [ ] Write failing simulated-core tests for final PUT/verification failure, restoration failure, nested original group, response-lost PUT, external third selection and changed profile. Assert final core/memory state and request sequence.
-- [ ] Run targeted tests and record failures.
-- [ ] Implement pending-target logging before PUT, pre/post read-back, original-selection validation, captured-profile checks and post-verification memory commit. Add proxy snapshot/conditional restore using a test registry key, preserving bypass and external updates.
-- [ ] Run targeted tests and full suite; commit. No claim of compare-and-swap atomicity against external GUIs.
+- [x] Write failing simulated-core tests for final PUT/verification failure, restoration failure, nested original group, response-lost PUT, external third selection and changed profile. Assert final core/memory state and request sequence.
+- [x] Run targeted tests and record failures.
+- [x] Implement pending-target logging before PUT, pre/post read-back, original-selection validation, captured-profile checks and post-verification memory commit. Add proxy snapshot/conditional restore using a test registry key, preserving bypass and external updates.
+- [x] Run targeted tests and full suite; commit. No claim of compare-and-swap atomicity against external GUIs.
 
 ### Task 5: Integrate fix/use/watch and cancellable probes
 

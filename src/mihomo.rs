@@ -50,6 +50,15 @@ pub fn get_proxies(
     be: &Backend,
     api: &crate::core_api::CoreApi,
 ) -> Result<HashMap<String, ProxyInfo>, String> {
+    get_proxies_detailed(be, api)
+        .map(|(proxies, _)| proxies)
+        .map_err(Into::into)
+}
+
+pub fn get_proxies_detailed(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+) -> AppResult<(HashMap<String, ProxyInfo>, Option<u32>)> {
     let response = api.request(
         be,
         reqwest::Method::GET,
@@ -57,9 +66,9 @@ pub fn get_proxies(
         None,
         std::time::Duration::from_secs(10),
     )?;
-    let parsed: ProxiesMap =
-        serde_json::from_slice(&response.body).map_err(|_| "节点 API JSON 解析失败".to_string())?;
-    Ok(parsed.proxies)
+    let parsed: ProxiesMap = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))?;
+    Ok((parsed.proxies, response.server_pid))
 }
 
 pub fn get_version(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {

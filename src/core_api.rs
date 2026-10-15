@@ -29,6 +29,7 @@ impl fmt::Display for ApiEndpoint {
 pub struct CoreResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    pub server_pid: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -90,7 +91,26 @@ impl CoreApi {
                     .bytes()
                     .map_err(|e| AppError::from_reqwest(&e, Stage::Controller))?
                     .to_vec();
-                CoreResponse { status, body }
+                let server_pid = reqwest::Url::parse(base).ok().and_then(|url| {
+                    let host = url.host_str()?.trim_matches(['[', ']']);
+                    let local = host == "localhost"
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback());
+                    local
+                        .then(|| {
+                            crate::procinfo::find_listener_pid_at(
+                                host,
+                                url.port_or_known_default().unwrap_or(80),
+                            )
+                        })
+                        .flatten()
+                });
+                CoreResponse {
+                    status,
+                    body,
+                    server_pid,
+                }
             }
             ApiEndpoint::NamedPipe(pipe) => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -113,16 +133,17 @@ impl CoreApi {
                                 }
                             }
                         };
+                        use std::os::windows::io::AsRawHandle;
+                        let mut pid = 0;
+                        let identified = unsafe {
+                            windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(
+                                stream.as_raw_handle(),
+                                &mut pid,
+                            )
+                        } != 0;
+                        let server_pid = identified.then_some(pid);
                         if let Some(kind) = be.kind {
-                            use std::os::windows::io::AsRawHandle;
-                            let mut pid = 0;
-                            let success = unsafe {
-                                windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId(
-                                    stream.as_raw_handle(),
-                                    &mut pid,
-                                )
-                            };
-                            if success == 0
+                            if !identified
                                 || crate::procinfo::identify_pid(Some(pid)).name
                                     != kind.display_name()
                             {
@@ -172,7 +193,11 @@ impl CoreApi {
                                 })?
                                 .to_bytes()
                                 .to_vec();
-                            Ok(CoreResponse { status, body })
+                            Ok(CoreResponse {
+                                status,
+                                body,
+                                server_pid,
+                            })
                         }
                         .await;
                         connection.abort();

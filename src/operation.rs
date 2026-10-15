@@ -57,6 +57,12 @@ impl Cancellation {
             std::thread::sleep(remaining.min(Duration::from_millis(25)));
         }
     }
+
+    pub async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 }
 
 pub fn install_console_handler() -> AppResult<()> {
@@ -72,7 +78,10 @@ pub fn install_console_handler() -> AppResult<()> {
     static INSTALLED: OnceLock<AppResult<()>> = OnceLock::new();
     INSTALLED
         .get_or_init(|| {
-            if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+            if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0
+                && unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                    != windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE
+            {
                 Err(state_error())
             } else {
                 Ok(())

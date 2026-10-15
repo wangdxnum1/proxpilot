@@ -6,13 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use colored::Colorize;
-
 use crate::detect::Backend;
 use crate::diagnostics::{AppError, Availability, ErrorCode, Stage, VerificationReport};
 use crate::mihomo::{self, ProxyInfo};
 use crate::ui;
-use crate::Args;
 
 /// 机场放在节点列表里的假节点（套餐信息占位）
 const FAKE_NODES: [&str; 13] = [
@@ -40,8 +37,6 @@ const SKIP_TYPES: [&str; 7] = [
     "Compatible",
     "Pass",
 ];
-/// 最多深度验证多少个通过探测的节点
-const MAX_VERIFY: usize = 5;
 
 pub fn parse_addr(addr: &str) -> (String, u16) {
     let value = if addr.contains("://") {
@@ -132,6 +127,10 @@ pub fn verify_access_report(proxy: &str, url: &str, samples: usize) -> Verificat
             }
             Ok((status, _)) => report.error = Some(AppError::website_status(status)),
             Err(error) => {
+                if error.code == ErrorCode::Cancelled {
+                    report.error = Some(error);
+                    return report;
+                }
                 transport_failed = true;
                 report.error = Some(error);
             }
@@ -147,10 +146,14 @@ pub fn verify_access_report(proxy: &str, url: &str, samples: usize) -> Verificat
         && report.error.as_ref().and_then(|error| error.http_status) == Some(403);
     if may_cross_check {
         spinner.set_text("网页返回 403，交叉检查 OpenAI API 响应...");
-        if matches!(
-            probe.test_detailed("https://api.openai.com/v1/models"),
-            Ok((401, _))
-        ) {
+        let cross_check = probe.test_detailed("https://api.openai.com/v1/models");
+        if let Err(error) = &cross_check {
+            if error.code == ErrorCode::Cancelled {
+                report.error = Some(error.clone());
+                return report;
+            }
+        }
+        if matches!(cross_check, Ok((401, _))) {
             for k in 0..2 {
                 spinner.set_text(format!(
                     "API 返回未授权响应，复测隧道稳定性（{}/2）...",
@@ -195,16 +198,6 @@ pub fn scan_concurrency(node_count: usize) -> usize {
         .min(node_count)
 }
 
-/// 按 CPU 数量并发探测节点可达性，返回 (探测延迟, 节点名) 升序。
-pub fn scan_reachable(
-    be: &Backend,
-    agent: &crate::core_api::CoreApi,
-    members: &[String],
-    url: &str,
-) -> Vec<(i64, String)> {
-    scan_with_concurrency(be, agent, members, url, scan_concurrency(members.len()))
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ProbeMeasurement {
     pub node: String,
@@ -215,6 +208,7 @@ pub struct ProbeMeasurement {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ScanReport {
     pub measurements: Vec<ProbeMeasurement>,
+    pub cancelled: bool,
 }
 
 impl ScanReport {
@@ -250,6 +244,7 @@ pub fn scan_reachable_report(
     scan_report_with_concurrency(be, agent, members, url, scan_concurrency(members.len()))
 }
 
+#[cfg(test)]
 fn scan_with_concurrency(
     be: &Backend,
     agent: &crate::core_api::CoreApi,
@@ -267,6 +262,7 @@ fn scan_report_with_concurrency(
     url: &str,
     concurrency: usize,
 ) -> ScanReport {
+    let cancellation = crate::operation::Cancellation::global();
     let total = members.len();
     let next = AtomicUsize::new(0);
     let done = Arc::new(AtomicUsize::new(0));
@@ -278,8 +274,15 @@ fn scan_report_with_concurrency(
             let measurements = &measurements;
             let done = &done;
             let spinner = &spinner;
+            let cancellation = &cancellation;
             s.spawn(move || {
-                while let Some(name) = members.get(next.fetch_add(1, Ordering::Relaxed)) {
+                while !cancellation.is_cancelled() {
+                    let Some(name) = members.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
                     let (delay_ms, error) = match mihomo::probe_delay(be, agent, name, url, 4000) {
                         Ok(delay) => (Some(delay), None),
                         Err(error) => (None, Some(error)),
@@ -298,138 +301,10 @@ fn scan_report_with_concurrency(
     drop(spinner);
     let mut measurements = measurements.into_inner().unwrap();
     measurements.sort_by(|a, b| a.node.cmp(&b.node));
-    ScanReport { measurements }
-}
-
-/// 完整优选：探测 → 逐个切换实测 → 停在实测最快的节点。全部失败则恢复原节点。
-pub fn fix_flow(
-    be: &Backend,
-    agent: &crate::core_api::CoreApi,
-    args: &Args,
-) -> Result<String, String> {
-    let proxies = mihomo::get_proxies(be, agent)?;
-    let group = proxies
-        .get(&args.group)
-        .ok_or_else(|| mihomo::missing_group(&proxies, &args.group))?;
-    let orig = group.now.clone().unwrap_or_else(|| "未知".into());
-    ui::info(&format!("当前组「{}」→ {}", args.group, orig));
-
-    let policy = crate::nodeinfo::BillingPolicy::for_backend(be, &proxies);
-    policy.report();
-    let selected = crate::nodeinfo::candidates_with_policy(
-        &proxies,
-        &group.all.clone().unwrap_or_default(),
-        args.max_rate,
-        &policy,
-    );
-    crate::nodeinfo::report_candidates(&selected, args.max_rate);
-    let mut members = selected.names;
-    if members.is_empty() {
-        return Err("没有符合条件的真实节点；未进行节点切换，请检查倍率限制或策略组".into());
+    ScanReport {
+        measurements,
+        cancelled: cancellation.is_cancelled(),
     }
-    let total = members.len();
-    // 按最近一次测速延迟排序，快的先测
-    members.sort_by_key(|n: &String| {
-        let d = proxies
-            .get(n)
-            .and_then(|p| p.history.last())
-            .map(|h| h.delay)
-            .unwrap_or(0);
-        if d > 0 {
-            d
-        } else {
-            90_000
-        }
-    });
-    ui::info(&format!(
-        "组内真实节点 {} 个，{} 路并发探测可达性...",
-        total,
-        scan_concurrency(total)
-    ));
-
-    let reachable = scan_reachable(be, agent, &members, &args.url);
-    ui::info(&format!("探测完成：可达 {}/{}", reachable.len(), total));
-    if reachable.is_empty() {
-        return Err("所有节点都无法访问测试网址".into());
-    }
-
-    let verify_n = args.top.min(reachable.len());
-    ui::info(&format!(
-        "对探测最快的 {} 个节点做真实访问验证（每个测 {} 次，全部 200 才算通过）...",
-        verify_n, args.samples
-    ));
-    let mut verified: Vec<(f64, String, bool)> = Vec::new(); // (耗时, 节点, 是否仅 IP 通过)
-    let mut last_error = "没有完成候选验证".to_string();
-    for (d, name) in reachable.iter().take(args.top) {
-        if let Err(e) = mihomo::switch_group(be, agent, &args.group, name) {
-            ui::warn(&format!("跳过 {}（{}）", name, e));
-            continue;
-        }
-        match verify_access(&be.proxy, &args.url, args.samples) {
-            Verdict::Pass(t) => {
-                ui::ok(&format!("{} · 探测 {}ms · 实测平均 {:.2}s", name, d, t));
-                verified.push((t, name.clone(), false));
-            }
-            Verdict::PassIpOnly => {
-                ui::ok(&format!(
-                    "{} · 探测 {}ms · IP 检查通过（网页 HTTP 403，浏览器访问仍需确认）",
-                    name, d
-                ));
-                // 信任级低于真实 200：排序永远排在实测通过节点之后
-                verified.push((f64::MAX, name.clone(), true));
-            }
-            Verdict::Fail(code) => {
-                last_error = code.to_string();
-                ui::fail(&format!("{} · 探测 {}ms · 验证未通过（{}）", name, d, code));
-            }
-        }
-        if verified.len() >= MAX_VERIFY {
-            break;
-        }
-    }
-
-    if verified.is_empty() {
-        let _ = mihomo::switch_group(be, agent, &args.group, &orig);
-        return Err(format!(
-            "前 {} 个候选未通过网站验证（最后错误：{}）；请按错误类别检查网络或目标网站",
-            verify_n, last_error
-        ));
-    }
-
-    verified.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    let (best_t, best_name, best_soft) = verified[0].clone();
-    // 验证过程把组切到了最后一个候选，最终停在最优节点上
-    mihomo::switch_group(be, agent, &args.group, &best_name)?;
-    crate::appstate::sync_selection(be, &args.group, &best_name);
-
-    println!();
-    ui::info("实测通过的节点（按实测延迟排序）：");
-    for (t, n, soft) in &verified {
-        if *soft {
-            println!("      {} IP检查通过  {}", "≈".yellow(), n);
-        } else {
-            println!("      {} {:>6.2}s  {}", "✔".green(), t, n);
-        }
-    }
-    println!();
-    if best_name == orig {
-        ui::ok(&format!(
-            "当前节点即最优：{}，未改动",
-            best_name.green().bold()
-        ));
-    } else {
-        ui::ok(&format!(
-            "已切换 {} → {}",
-            args.group,
-            best_name.green().bold()
-        ));
-    }
-    if best_soft {
-        ui::dim("该节点 IP 检查通过，但网页仍返回 HTTP 403；浏览器访问需实际确认");
-    } else {
-        ui::dim(&format!("最优实测延迟 {:.2}s", best_t));
-    }
-    Ok(best_name)
 }
 
 #[cfg(test)]
@@ -582,8 +457,9 @@ mod rate_policy_tests {
         )
         .unwrap();
         assert!(
-            fix_flow(&be, &crate::core_api::CoreApi::new().unwrap(), &args)
+            crate::workflow::fix_flow(&be, &crate::core_api::CoreApi::new().unwrap(), &args)
                 .unwrap_err()
+                .to_string()
                 .contains("未进行节点切换")
         );
         assert!(server.join().unwrap().starts_with("GET /proxies "));

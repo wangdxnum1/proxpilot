@@ -91,10 +91,62 @@ pub struct RollbackReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CommitReport {
+    pub group: String,
+    pub original: String,
     pub selected: String,
     pub verification: VerificationReport,
     pub memory: Option<MemorySync>,
     pub warnings: Vec<AppError>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoverySummary {
+    pub group: String,
+    pub original: Option<String>,
+    pub expected: String,
+    pub pending: Option<String>,
+    pub committed: bool,
+    pub profile: Option<i64>,
+}
+
+pub fn inspect_recovery() -> AppResult<Option<RecoverySummary>> {
+    RecoveryJournal::current()?
+        .load::<RecoveryRecord>()?
+        .map(|record| {
+            if record.schema_version != 1 {
+                return Err(AppError::new(ErrorCode::StateUnavailable, Stage::State));
+            }
+            Ok(RecoverySummary {
+                group: record.snapshot.group,
+                original: record.snapshot.state.selection,
+                expected: record.expected,
+                pending: record.pending,
+                committed: record.committed,
+                profile: record.snapshot.state.profile,
+            })
+        })
+        .transpose()
+}
+
+pub fn discard_recovery() -> AppResult<()> {
+    let _ownership = MutationLock::acquire()?;
+    RecoveryJournal::current()?.remove()
+}
+
+pub fn retry_recovery<C: SwitchControl + ?Sized>(
+    control: &C,
+    cancellation: &Cancellation,
+) -> AppResult<RollbackReport> {
+    cancellation.check()?;
+    let _ownership = MutationLock::acquire()?;
+    let journal = RecoveryJournal::current()?;
+    match journal.load::<RecoveryRecord>()? {
+        Some(record) => Ok(restore_record(control, &journal, &record)),
+        None => Ok(RollbackReport {
+            status: RollbackStatus::Unchanged,
+            error: None,
+        }),
+    }
 }
 
 pub struct SwitchTransaction<'a, C: SwitchControl + ?Sized> {
@@ -286,6 +338,14 @@ impl<'a, C: SwitchControl + ?Sized> SwitchTransaction<'a, C> {
             warnings.push(error);
         }
         Ok(CommitReport {
+            group: self.record.snapshot.group.clone(),
+            original: self
+                .record
+                .snapshot
+                .state
+                .selection
+                .clone()
+                .unwrap_or_default(),
             selected: self.record.expected.clone(),
             verification: verification.clone(),
             memory,

@@ -5,8 +5,6 @@
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-use crate::ui;
-
 fn db_path(kind: crate::client_config::ClientKind, base: &std::path::Path) -> Option<PathBuf> {
     use crate::client_config::ClientKind;
     let directory = match kind {
@@ -136,83 +134,6 @@ fn current_group_from_database(path: &std::path::Path) -> Option<String> {
     group.filter(|g| !g.trim().is_empty())
 }
 
-/// 同步目标客户端的选择记录；失败不影响已完成的内核切换。
-pub fn sync_selection(be: &crate::Backend, group: &str, node: &str) {
-    let Some(kind) = be.kind else {
-        return;
-    };
-    if kind == crate::client_config::ClientKind::ClashVerge {
-        ui::dim("Clash Verge：当前内核选择已更新；重启后的持久化由客户端管理，不写 profiles.yaml");
-        return;
-    }
-    let Some(base) = std::env::var_os("APPDATA") else {
-        return;
-    };
-    let Some(path) = db_path(kind, std::path::Path::new(&base)) else {
-        return;
-    };
-    match sync_database(&path, group, node) {
-        Ok(true) => ui::dim(&format!(
-            "已同步 {} 的本地选择记录；客户端重启后的行为由其自身管理",
-            kind.display_name()
-        )),
-        Ok(false) => ui::dim(&format!(
-            "未找到记录此策略组的 {} profile，未同步选择记忆",
-            kind.display_name()
-        )),
-        Err(e) => ui::dim(&format!("同步客户端记忆失败（不影响切换本身）：{}", e)),
-    }
-}
-
-fn sync_database(path: &std::path::Path, group: &str, node: &str) -> Result<bool, String> {
-    let directory = path.parent().ok_or("数据库目录无效")?;
-    let profile = active_profile_id(directory);
-    // When preferences exist, never fall back to another subscription if
-    // the active profile cannot be read.
-    if directory.join("shared_preferences.json").exists() && profile.is_none() {
-        return Ok(false);
-    }
-    let con = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| e.to_string())?;
-    con.busy_timeout(std::time::Duration::from_secs(2))
-        .map_err(|e| e.to_string())?;
-    let mut stmt = con
-        .prepare("SELECT id, selected_map FROM profiles WHERE (?1 IS NULL OR id = ?1)")
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<(i64, String)> = stmt
-        .query_map([profile], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    for (id, sm) in rows {
-        let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&sm)
-        else {
-            continue;
-        };
-        // 只更新确实记录了这个组的 profile（定位到正确的订阅）
-        if !map.contains_key(group) {
-            continue;
-        }
-        map.insert(
-            group.to_string(),
-            serde_json::Value::String(node.to_string()),
-        );
-        let new_sm = serde_json::Value::Object(map).to_string();
-        con.execute(
-            "UPDATE profiles SET selected_map = ?1, current_group_name = ?2 WHERE id = ?3",
-            rusqlite::params![new_sm, group, id],
-        )
-        .map_err(|e| e.to_string())?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +215,10 @@ mod tests {
             current_group_from_database(&path).as_deref(),
             Some("Shared")
         );
-        assert!(sync_database(&path, "Shared", "new").unwrap());
+        assert_eq!(
+            sync_database_captured(&path, 2, "Shared", "new").unwrap(),
+            crate::switching::MemorySync::Synced
+        );
         let maps: Vec<String> = con
             .prepare("SELECT selected_map FROM profiles ORDER BY id")
             .unwrap()
@@ -314,10 +238,13 @@ mod tests {
         assert_eq!(current_group_from_database(&path).as_deref(), Some("Other"));
         write_profile(999);
         assert!(current_group_from_database(&path).is_none());
-        assert!(!sync_database(&path, "Shared", "wrong").unwrap());
+        assert_eq!(
+            sync_database_captured(&path, 999, "Shared", "wrong").unwrap(),
+            crate::switching::MemorySync::NoMatchingGroup
+        );
         std::fs::write(&prefs, "invalid").unwrap();
         assert!(current_group_from_database(&path).is_none());
-        assert!(!sync_database(&path, "Shared", "wrong").unwrap());
+        assert!(sync_database_captured(&path, 999, "Shared", "wrong").is_err());
         assert!(current_group_from_database(&root.join("missing.sqlite")).is_none());
         assert!(!root.join("missing.sqlite").exists());
         drop(con);
@@ -343,7 +270,11 @@ mod tests {
         let vv = db_path(ClientKind::VvCloud, &root).unwrap();
         let cute = db_path(ClientKind::CuteCloud, &root).unwrap();
         assert_ne!(vv, cute);
-        assert!(sync_database(&vv, "Proxy", "new").unwrap());
+        std::fs::write(vv.parent().unwrap().join("shared_preferences.json"), serde_json::json!({"flutter.config": serde_json::json!({"currentProfileId":1}).to_string()}).to_string()).unwrap();
+        assert_eq!(
+            sync_database_captured(&vv, 1, "Proxy", "new").unwrap(),
+            crate::switching::MemorySync::Synced
+        );
         let con = Connection::open(cute).unwrap();
         let saved: String = con
             .query_row("SELECT selected_map FROM profiles", [], |r| r.get(0))
@@ -360,13 +291,17 @@ mod tests {
     #[test]
     fn updates_only_the_profile_with_matching_group() {
         let path = std::env::temp_dir().join(format!(
-            "proxpilot-db-{}-{}.sqlite",
+            "proxpilot-db-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        std::fs::create_dir_all(&path).unwrap();
+        let root = path;
+        let path = root.join("database.sqlite");
+        std::fs::write(root.join("shared_preferences.json"), serde_json::json!({"flutter.config": serde_json::json!({"currentProfileId":2}).to_string()}).to_string()).unwrap();
         let con = Connection::open(&path).unwrap();
         con.execute_batch(
             "CREATE TABLE profiles(id INTEGER,selected_map TEXT,current_group_name TEXT);",
@@ -382,8 +317,14 @@ mod tests {
             [r#"{"VVCloud":"old"}"#],
         )
         .unwrap();
-        assert!(sync_database(&path, "VVCloud", "日本 🛰").unwrap());
-        assert!(!sync_database(&path, "Missing", "other").unwrap());
+        assert_eq!(
+            sync_database_captured(&path, 2, "VVCloud", "日本 🛰").unwrap(),
+            crate::switching::MemorySync::Synced
+        );
+        assert_eq!(
+            sync_database_captured(&path, 2, "Missing", "other").unwrap(),
+            crate::switching::MemorySync::NoMatchingGroup
+        );
         let values: Vec<String> = con
             .prepare("SELECT selected_map FROM profiles ORDER BY id")
             .unwrap()
@@ -397,6 +338,6 @@ mod tests {
             "日本 🛰"
         );
         drop(con);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

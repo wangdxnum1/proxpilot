@@ -12,6 +12,18 @@ pub struct KernelSwitchControl<'a> {
     pub api: &'a CoreApi,
 }
 
+impl KernelSwitchControl<'_> {
+    pub fn identity(&self, pid: Option<u32>) -> String {
+        format!(
+            "{}|{}|{}|{:?}",
+            self.backend.kind.map(|k| k.name()).unwrap_or("explicit"),
+            self.backend.source,
+            self.backend.api,
+            pid
+        )
+    }
+}
+
 impl SwitchControl for KernelSwitchControl<'_> {
     fn proxy_snapshot(&self) -> AppResult<Option<crate::sysproxy::ProxySnapshot>> {
         crate::sysproxy::snapshot().map(Some)
@@ -42,13 +54,7 @@ impl SwitchControl for KernelSwitchControl<'_> {
             .filter(|p| p.all.is_some())
             .ok_or_else(|| AppError::new(ErrorCode::ProfileChanged, Stage::Switching))?;
         Ok(LiveState {
-            identity: format!(
-                "{}|{}|{}|{:?}",
-                self.backend.kind.map(|k| k.name()).unwrap_or("explicit"),
-                self.backend.source,
-                self.backend.api,
-                pid
-            ),
+            identity: self.identity(pid),
             profile: before,
             members: group_info.all.clone().unwrap_or_default(),
             selection: group_info.now.clone(),

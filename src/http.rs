@@ -501,9 +501,18 @@ impl BrowserProbe {
     }
 
     pub fn test_detailed(&self, url: &str) -> AppResult<(u16, f64)> {
+        self.test_with_cancellation(url, &crate::operation::Cancellation::global())
+    }
+
+    pub fn test_with_cancellation(
+        &self,
+        url: &str,
+        cancellation: &crate::operation::Cancellation,
+    ) -> AppResult<(u16, f64)> {
+        cancellation.check()?;
         self.runtime.block_on(async {
             let start = Instant::now();
-            let code = tokio::time::timeout(Duration::from_secs(12), async {
+            let request = tokio::time::timeout(Duration::from_secs(12), async {
                 let preferred = self.prefer_safari.get();
                 let (code, challenge) = self.request(url, preferred).await?;
                 // 普通 403 或断连不重试；只对服务端明确标记的 Challenge 使用候补。
@@ -516,9 +525,12 @@ impl BrowserProbe {
                 } else {
                     Ok(code)
                 }
-            })
-            .await
-            .map_err(|_| AppError::new(ErrorCode::Timeout, Stage::Verification))??;
+            });
+            let code = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(AppError::new(ErrorCode::Cancelled, Stage::Verification)),
+                result = request => result.map_err(|_| AppError::new(ErrorCode::Timeout, Stage::Verification))??,
+            };
             Ok((code, start.elapsed().as_secs_f64()))
         })
     }

@@ -12,7 +12,7 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 wreq = { version = "0.16", default-features = false, features = ["webpki-roots", "tokio-rt", "cookies", "gzip", "brotli", "deflate", "zstd", "socks"] }
 wreq-util = { version = "0.2", default-features = false, features = ["emulation"] }
-tokio = { version = "1", features = ["rt", "time", "net"] }
+tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

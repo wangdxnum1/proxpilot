@@ -12,12 +12,12 @@ mod operation;
 mod procinfo;
 mod runtime_switch;
 mod scan_output;
-mod sysproxy;
 mod switching;
+mod sysproxy;
 mod ui;
+mod workflow;
 
 use std::process::exit;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
@@ -37,6 +37,7 @@ pub struct Args {
     pub top: usize,
     pub samples: usize,
     pub dry_run: bool,
+    pub manage_system_proxy: bool,
     pub interval: u64,
     pub reopt: u64,
     pub optimize: bool,
@@ -55,6 +56,14 @@ pub enum Cmd {
     Config(ConfigCommand),
     Nodes,
     Info(String),
+    Recover(RecoveryAction),
+}
+
+#[derive(Clone, Copy)]
+pub enum RecoveryAction {
+    Inspect,
+    Retry,
+    Discard,
 }
 
 #[derive(Clone)]
@@ -79,6 +88,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         top: 12,
         samples: 2,
         dry_run: false,
+        manage_system_proxy: true,
         interval: 300,
         reopt: 7200,
         optimize: false,
@@ -86,6 +96,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
     };
     let mut command = false;
     let mut supported = false;
+    let mut recovery_action = None;
     fn value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
         let v = it.next().ok_or_else(|| format!("{} 缺少参数值", flag))?;
         if v.starts_with("--") {
@@ -137,19 +148,31 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             }
             "--optimize" => args.optimize = true,
             "--dry-run" => args.dry_run = true,
+            "--no-system-proxy" => args.manage_system_proxy = false,
             "--detect" => args.detect = true,
             "--supported" => supported = true,
+            "--retry" | "--discard" => {
+                if recovery_action.is_some() {
+                    return Err("--retry 与 --discard 不能重复或同时使用".into());
+                }
+                recovery_action = Some(if arg == "--retry" {
+                    RecoveryAction::Retry
+                } else {
+                    RecoveryAction::Discard
+                });
+            }
             "--help" | "-h" | "help" => {
                 args.cmd = Cmd::Help;
                 return Ok(args);
             }
             "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" | "nodes"
-            | "info"
+            | "info" | "recover"
                 if !command =>
             {
                 command = true;
                 args.cmd = match arg.as_str() {
                     "nodes" => Cmd::Nodes,
+                    "recover" => Cmd::Recover(RecoveryAction::Inspect),
                     "info" => Cmd::Info(value(&mut it, "info")?),
                     "check" => Cmd::Check,
                     "scan" => Cmd::Scan,
@@ -179,6 +202,13 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             args.cmd = Cmd::Clients(true);
         } else {
             return Err("--supported 仅用于 clients 命令".into());
+        }
+    }
+    if let Some(action) = recovery_action {
+        if matches!(args.cmd, Cmd::Recover(_)) {
+            args.cmd = Cmd::Recover(action);
+        } else {
+            return Err("--retry / --discard 仅用于 recover 命令".into());
         }
     }
     if args.samples == 0 || args.interval == 0 || args.reopt == 0 {
@@ -302,6 +332,7 @@ fn print_help() {
     println!("用法: proxpilot <命令> [选项]");
     println!();
     println!("命令:");
+    println!("  recover [--retry | --discard]  查看、重试恢复或仅清理恢复记录");
     println!("  clients [--supported]  查看发现的客户端 / 支持的类型");
     println!("  config show | set default-client <类型> | unset default-client");
     println!("  nodes          列出组内真实节点的协议、倍率和名称标签（不测速）");
@@ -326,6 +357,7 @@ fn print_help() {
     println!("  --optimize      watch 启动时及定时主动优选（默认关闭）");
     println!("  --reopt <秒>     --optimize 的定时优选间隔（默认 7200）");
     println!("  --dry-run        只探测报告，不切换");
+    println!("  --no-system-proxy 保持系统代理现状（适用于 TUN 或手动代理）");
     println!("  --detect         自动探测（兼容 --client auto）");
     println!("默认：未配置时使用 auto；系统代理开启时要求唯一匹配，关闭时要求唯一可用内核。");
     println!();
@@ -687,16 +719,25 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
     }
     ui::ok("内核运行中，代理端口可用");
 
-    if sysproxy::matches(&be.proxy) {
+    if !args.manage_system_proxy {
+        ui::dim("系统代理保持现状（--no-system-proxy）");
+    } else if sysproxy::matches(&be.proxy) {
         ui::ok("系统代理已开启");
     } else {
         ui::warn("系统代理未开启或指向其他客户端（浏览器不走代理）——其他代理软件退出时常干这事");
         if args.dry_run {
             ui::dim("dry-run：不自动修复");
         } else {
-            match sysproxy::enable_for(&be.proxy) {
+            let control = runtime_switch::KernelSwitchControl {
+                backend: be,
+                api: agent,
+            };
+            match workflow::repair_system_proxy(&control) {
                 Ok(()) => ui::ok("已自动重新打开系统代理"),
-                Err(e) => ui::fail(&format!("自动打开失败：{}", e)),
+                Err(e) => {
+                    ui::fail(&format!("自动打开失败：{}", e));
+                    return e.exit_code();
+                }
             }
         }
     }
@@ -730,6 +771,9 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
                     0
                 }
                 checker::Verdict::Fail(c) => {
+                    if c.code == diagnostics::ErrorCode::Cancelled {
+                        return 130;
+                    }
                     let cs = c.to_string();
                     ui::fail(&format!(
                         "{} 不可访问（{}）—— 运行 proxpilot fix 自动优选切换",
@@ -780,6 +824,14 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
         checker::scan_concurrency(members.len())
     ));
     let report = checker::scan_reachable_report(be, agent, &members, &args.url);
+    if report.cancelled {
+        ui::warn(&format!(
+            "扫描已取消，已完成 {}/{}",
+            report.measurements.len(),
+            members.len()
+        ));
+        return 130;
+    }
     let reachable = report.reachable();
     if let Some(error) = report.controller_failure() {
         ui::fail(&error.to_string());
@@ -1109,103 +1161,131 @@ mod rate_tests {
 
 fn cmd_fix(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     if args.dry_run {
-        ui::warn("dry-run 模式：只探测报告，不切换");
+        ui::warn("dry-run：只探测报告，不切换");
         return cmd_scan(be, agent, args);
     }
-    if !checker::core_alive(&be.proxy) {
-        ui::fail("内核代理端口不通，请确认客户端已启动；若使用的不是 CuteCloud，加 --detect 自动探测或用 --api 指定");
-        return 1;
-    }
-    if sysproxy::matches(&be.proxy) {
-        ui::ok("系统代理已开启");
-    } else {
-        ui::warn("系统代理未开启或指向其他客户端，自动重新打开");
-        match sysproxy::enable_for(&be.proxy) {
-            Ok(()) => ui::ok("系统代理已开启"),
-            Err(e) => ui::fail(&format!("打开失败：{}", e)),
-        }
-    }
-    println!();
-    match checker::fix_flow(be, agent, args) {
-        Ok(_) => {
-            match checker::verify_access(&be.proxy, &args.url, 1) {
-                checker::Verdict::Pass(t) => {
-                    ui::ok(&format!("最终确认：{} → HTTP 200（{:.2}s）", args.url, t))
-                }
-                checker::Verdict::PassIpOnly => {
-                    ui::ok(&format!("最终确认：{} 可访问（IP 检查通过）", args.url))
-                }
-                checker::Verdict::Fail(c) => {
-                    ui::warn(&format!("最终确认异常（{}），可重跑 proxpilot fix", c))
-                }
-            }
+    match workflow::fix_flow(be, agent, args) {
+        Ok(result) => {
+            print_commit(&result);
             0
         }
-        Err(e) => {
-            ui::fail(&e);
-            2
+        Err(failure) => {
+            ui::fail(&failure.to_string());
+            failure.exit_code()
         }
     }
 }
 
-fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &str) -> i32 {
-    if node.is_empty() {
-        ui::fail("用法: proxpilot use <节点名>（节点名含空格请加引号）");
-        return 1;
-    }
-    let proxies = match mihomo::get_proxies(be, agent) {
-        Ok(p) => p,
-        Err(e) => {
-            ui::fail(&e);
-            return 1;
+fn print_commit(result: &switching::CommitReport) {
+    ui::ok(&format!("已确认 {} → {}", result.group, result.selected));
+    match result.verification.availability {
+        diagnostics::Availability::Webpage => ui::ok(&format!(
+            "网页验证通过（平均 {:.2}s）",
+            result.verification.mean_ms.unwrap_or_default() / 1000.0
+        )),
+        diagnostics::Availability::IpOnly => {
+            ui::warn("仅 IP 交叉检查通过；网页仍未通过验证，浏览器访问需实际确认")
         }
-    };
-    if !proxies
-        .get(&args.group)
-        .and_then(|p| p.all.as_ref())
-        .is_some_and(|members| members.iter().any(|n| n == node))
-        || !proxies
-            .get(node)
-            .is_some_and(|p| checker::is_real_node(p, node))
-    {
-        ui::fail("指定节点不是该策略组中的真实节点");
-        return 1;
+        diagnostics::Availability::Failed => ui::fail("网站验证失败"),
     }
-    let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
-    policy.report();
-    if !policy.permitted(node, args.max_rate) {
-        ui::fail("指定节点超过倍率上限或倍率未知；未切换");
-        return 1;
+    match result.memory {
+        Some(switching::MemorySync::Synced) => ui::dim("已同步当前订阅的选择记忆"),
+        Some(switching::MemorySync::ClientManaged) => ui::dim("重启后的选择持久化由客户端管理"),
+        Some(switching::MemorySync::NotAvailable) => {
+            ui::dim("来源或订阅不可确认，未同步客户端选择记忆")
+        }
+        Some(switching::MemorySync::NoMatchingGroup) => {
+            ui::dim("当前订阅未记录该策略组，未写入选择记忆")
+        }
+        None => {}
     }
-    if args.dry_run {
-        ui::info(&format!("dry-run：将切换 {} → {}", args.group, node));
-        return 0;
+    for warning in &result.warnings {
+        ui::warn(&warning.to_string());
     }
-    match mihomo::switch_group(be, agent, &args.group, node) {
-        Ok(()) => {
-            ui::ok(&format!("已切换 {} → {}", args.group, node));
-            appstate::sync_selection(be, &args.group, node);
-            match checker::verify_access(&be.proxy, &args.url, args.samples) {
-                checker::Verdict::Pass(t) => {
-                    ui::ok(&format!("验证通过：{} 平均 {:.2}s", args.url, t));
+}
+
+fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &str) -> i32 {
+    match workflow::use_flow(be, agent, args, node) {
+        Ok(workflow::SelectionOutcome::DryRun { group, target }) => {
+            ui::info(&format!("dry-run：将切换 {} → {}", group, target));
+            0
+        }
+        Ok(workflow::SelectionOutcome::Committed { result }) => {
+            print_commit(&result);
+            0
+        }
+        Err(failure) => {
+            ui::fail(&failure.to_string());
+            failure.exit_code()
+        }
+    }
+}
+
+fn cmd_recovery_record(action: RecoveryAction) -> Result<(), String> {
+    match action {
+        RecoveryAction::Inspect => match switching::inspect_recovery()? {
+            Some(record) => {
+                ui::info(&format!(
+                    "恢复记录：组「{}」；{}",
+                    record.group,
+                    if record.committed {
+                        "已提交，仅需清理记录"
+                    } else {
+                        "尚未完成恢复"
+                    }
+                ));
+                ui::info(&format!(
+                    "原选择：{}；上次写入：{}",
+                    record.original.as_deref().unwrap_or("不可确认"),
+                    record.pending.as_deref().unwrap_or(&record.expected)
+                ));
+                ui::dim("recover --retry 校验原客户端后尝试恢复；recover --discard 仅删除本工具记录，不切换节点或修改系统代理。");
+            }
+            None => ui::info("没有待恢复记录"),
+        },
+        RecoveryAction::Discard => {
+            switching::discard_recovery()?;
+            ui::info("已清理恢复记录，节点与系统代理保持现状");
+        }
+        RecoveryAction::Retry => unreachable!(),
+    }
+    Ok(())
+}
+
+fn cmd_retry_recovery(be: &Backend, api: &core_api::CoreApi) -> i32 {
+    let control = runtime_switch::KernelSwitchControl { backend: be, api };
+    match switching::retry_recovery(&control, &operation::Cancellation::global()) {
+        Ok(report) => {
+            if let Some(error) = report.error {
+                ui::warn(&format!("恢复未完成：{}；请查看 recover 记录", error));
+                return 1;
+            }
+            match report.status {
+                switching::RollbackStatus::Restored => {
+                    ui::ok("已恢复原选择与本次操作改变的代理配置");
                     0
                 }
-                checker::Verdict::PassIpOnly => {
-                    ui::ok(&format!(
-                        "验证通过：{} IP 检查通过（浏览器访问仍需确认）",
-                        args.url
-                    ));
+                switching::RollbackStatus::Unchanged => {
+                    ui::info("原选择未变化，恢复记录已处理");
                     0
                 }
-                checker::Verdict::Fail(c) => {
-                    ui::warn(&format!("切换成功但 {} 未通过验证（{}）", args.url, c));
-                    2
+                switching::RollbackStatus::SkippedConflict => {
+                    ui::warn("发现外部状态变化，保留现状和恢复记录");
+                    1
+                }
+                switching::RollbackStatus::Failed => {
+                    ui::fail("恢复失败，恢复记录已保留");
+                    1
                 }
             }
         }
-        Err(e) => {
-            ui::fail(&e);
-            1
+        Err(error) => {
+            ui::fail(&error.to_string());
+            if error.code == diagnostics::ErrorCode::Cancelled {
+                130
+            } else {
+                1
+            }
         }
     }
 }
@@ -1273,16 +1353,25 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             }
         };
     }
+    let cancellation = operation::Cancellation::global();
     let mut current = initial.clone();
     let mut last_opt: Option<Instant> = None;
     let mut cycle: u64 = 0;
     loop {
+        if cancellation.is_cancelled() {
+            return 130;
+        }
         cycle += 1;
         match clients::refresh(&current, args, agent) {
             Ok(next) => current = next,
             Err(e) => {
                 ui::warn(&format!("目标客户端暂不可用：{}", e));
-                thread::sleep(Duration::from_secs(args.interval));
+                if cancellation
+                    .wait(Duration::from_secs(args.interval))
+                    .is_err()
+                {
+                    return 130;
+                }
                 continue;
             }
         }
@@ -1291,7 +1380,12 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
             Ok(proxies) => proxies,
             Err(e) => {
                 ui::warn(&format!("读取实时策略组失败，等待重试：{}", e));
-                thread::sleep(Duration::from_secs(args.interval));
+                if cancellation
+                    .wait(Duration::from_secs(args.interval))
+                    .is_err()
+                {
+                    return 130;
+                }
                 continue;
             }
         };
@@ -1310,7 +1404,12 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
         let args = &cycle_args;
         if !checker::core_alive(&be.proxy) {
             ui::warn("内核未运行，等待中...");
-            thread::sleep(Duration::from_secs(args.interval));
+            if cancellation
+                .wait(Duration::from_secs(args.interval))
+                .is_err()
+            {
+                return 130;
+            }
             continue;
         }
         let policy = nodeinfo::BillingPolicy::for_backend(be, &proxies);
@@ -1319,9 +1418,25 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
                 ui::warn("当前选择不符合倍率上限；默认保持可用节点，下次故障修复或主动优选只使用合规候选");
             }
         }
-        if !sysproxy::matches(&be.proxy) {
+        if args.manage_system_proxy && !sysproxy::matches(&be.proxy) {
             ui::warn("系统代理被关闭或指向其他客户端，自动重新打开");
-            let _ = sysproxy::enable_for(&be.proxy);
+            let control = runtime_switch::KernelSwitchControl {
+                backend: be,
+                api: agent,
+            };
+            if let Err(error) = workflow::repair_system_proxy(&control) {
+                ui::warn(&format!("系统代理修复未完成：{}", error));
+                if error.error.code == diagnostics::ErrorCode::Cancelled {
+                    return 130;
+                }
+                if cancellation
+                    .wait(Duration::from_secs(args.interval))
+                    .is_err()
+                {
+                    return 130;
+                }
+                continue;
+            }
         }
         let v1 = checker::verify_access(&be.proxy, &args.url, 1);
         let mut broken = !v1.is_ok();
@@ -1331,7 +1446,9 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
         };
         if broken {
             // 5 秒后复测一次，避免偶发误报
-            thread::sleep(Duration::from_secs(5));
+            if cancellation.wait(Duration::from_secs(5)).is_err() {
+                return 130;
+            }
             let v2 = checker::verify_access(&be.proxy, &args.url, 1);
             broken = !v2.is_ok();
             if let checker::Verdict::Fail(c) = v2 {
@@ -1350,14 +1467,33 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
                 }
             };
             ui::warn(&format!("[周期 {}] {}，开始优选...", cycle, reason));
-            if let Err(e) = checker::fix_flow(be, agent, args) {
-                ui::fail(&e);
+            match workflow::fix_flow(be, agent, args) {
+                Ok(result) => print_commit(&result),
+                Err(e) => {
+                    ui::fail(&e.to_string());
+                    if e.error.code == diagnostics::ErrorCode::Cancelled {
+                        return 130;
+                    }
+                }
             }
             last_opt = Some(Instant::now());
         } else {
-            ui::dim(&format!("[周期 {}] 正常（HTTP 200）", cycle));
+            ui::dim(&format!(
+                "[周期 {}] {}",
+                cycle,
+                if matches!(v1, checker::Verdict::PassIpOnly) {
+                    "仅 IP 交叉检查通过，浏览器仍需确认"
+                } else {
+                    "网页验证通过（HTTP 200）"
+                }
+            ));
         }
-        thread::sleep(Duration::from_secs(args.interval));
+        if cancellation
+            .wait(Duration::from_secs(args.interval))
+            .is_err()
+        {
+            return 130;
+        }
     }
 }
 
@@ -1374,6 +1510,10 @@ fn set_console_utf8() {
 fn main() {
     #[cfg(windows)]
     set_console_utf8();
+    if let Err(error) = operation::install_console_handler() {
+        ui::fail(&error.to_string());
+        exit(1);
+    }
     let args = parse_args_from(std::env::args().skip(1)).unwrap_or_else(|e| {
         ui::fail(&e);
         exit(1)
@@ -1381,6 +1521,9 @@ fn main() {
     let static_result = match &args.cmd {
         Cmd::Clients(s) => Some(cmd_clients(*s)),
         Cmd::Config(c) => Some(cmd_config(c)),
+        Cmd::Recover(action @ (RecoveryAction::Inspect | RecoveryAction::Discard)) => {
+            Some(cmd_recovery_record(*action))
+        }
         _ => None,
     };
     if let Some(result) = static_result {
@@ -1397,17 +1540,30 @@ fn main() {
     ui::banner();
     let (be, agent) = match setup(&args) {
         Ok(x) => x,
-        Err(c) => exit(c),
+        Err(c) => exit(if operation::Cancellation::global().is_cancelled() {
+            130
+        } else {
+            c
+        }),
     };
-    let args = if matches!(args.cmd, Cmd::Watch | Cmd::Info(_)) {
+    let args = if matches!(args.cmd, Cmd::Watch | Cmd::Info(_) | Cmd::Recover(_)) {
         args
     } else {
         runtime_group_args(&be, &agent, &args).unwrap_or_else(|e| {
             ui::fail(&e);
-            exit(1)
+            exit(if operation::Cancellation::global().is_cancelled() {
+                130
+            } else {
+                1
+            })
         })
     };
+    if operation::Cancellation::global().is_cancelled() {
+        exit(130);
+    }
     let code = match &args.cmd {
+        Cmd::Recover(RecoveryAction::Retry) => cmd_retry_recovery(&be, &agent),
+        Cmd::Recover(_) => unreachable!(),
         Cmd::Nodes => cmd_nodes(&be, &agent, &args),
         Cmd::Info(name) => cmd_info(&be, &agent, &args, name),
         Cmd::Check => cmd_check(&be, &agent, &args),

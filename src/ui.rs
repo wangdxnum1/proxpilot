@@ -21,7 +21,9 @@ impl Spinner {
     pub fn start(msg: &str) -> Spinner {
         // TTY 下启用；设 PROXPILOT_SPINNER=1 可强制开启（特殊终端/调试用）
         let enabled = io::stdout().is_terminal()
-            || std::env::var("PROXPILOT_SPINNER").map(|v| v == "1").unwrap_or(false);
+            || std::env::var("PROXPILOT_SPINNER")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         let mut s = Spinner {
             done: Arc::new(AtomicBool::new(false)),
             text: Arc::new(Mutex::new(msg.to_string())),
@@ -75,8 +77,16 @@ impl Drop for Spinner {
 }
 
 pub fn banner() {
-    println!("{}", format!("ProxPilot · 代理优选助手 v{}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", "节点检测 · 智能优选 · 自动切换 · 全时守护（Clash/mihomo 系）".dimmed());
+    println!(
+        "{}",
+        format!("ProxPilot · 代理优选助手 v{}", env!("CARGO_PKG_VERSION"))
+            .cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        "节点检测 · 智能优选 · 自动切换 · 全时守护（Clash/mihomo 系）".dimmed()
+    );
     println!();
 }
 

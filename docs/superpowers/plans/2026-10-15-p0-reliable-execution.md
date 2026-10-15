@@ -81,10 +81,10 @@
 
 **Interfaces:** `fix_flow` and explicit use share the transaction service and return committed outcome plus warnings. Main registers cancellation once, maps final report to exit code and only then exits. Browser requests and scheduler waits observe Cancellation; active blocking API calls keep bounded timeouts.
 
-- [ ] Write failing integration tests for `use` validation failure (restores original), `fix` final verification failure (nonzero), Ctrl+C during testing (130 plus recovery), and dry-run/no eligible candidates (zero mutation requests).
-- [ ] Observe RED, then integrate the service without changing client selection or billing semantics.
-- [ ] Bring final confirmation inside the transaction; remove premature appstate writes, ignored rollback results and misleading success messages. watch acquires locks per mutation, not while idle.
-- [ ] Run all local transport and subprocess tests and commit.
+- [x] Write failing integration tests for `use` validation failure (restores original), `fix` final verification failure (nonzero), Ctrl+C during testing (130 plus recovery), and dry-run/no eligible candidates (zero mutation requests).
+- [x] Observe RED, then integrate the service without changing client selection or billing semantics.
+- [x] Bring final confirmation inside the transaction; remove premature appstate writes, ignored rollback results and misleading success messages. watch acquires locks per mutation, not while idle.
+- [x] Run all local transport and subprocess tests and commit.
 
 ### Task 6: Reproducible build and failure-safe packaging/release
 
@@ -92,16 +92,16 @@
 
 **Interfaces:** Build entry returns nonzero for every failed phase, locates this invocation's Cargo artifact for configured target directory/triple, and verifies copy hash. Packaging defaults to local artifacts; explicit publish creates a draft release only after clean-tree/version/tag/identity gates, tests, integrity and build; it does not stage or commit arbitrary files.
 
-- [ ] Write script subprocess tests with fake cargo/git/gh for build, copy, push and upload failures; stale artifact and custom target directory must fail rather than silently deliver another exe.
-- [ ] Implement locked builds, Rust 1.99.0 pin with 1.98.0 CI coverage, SHA256 metadata/licenses and ASCII/UTF-8 output. Preserve original native provenance and verify hashes.
-- [ ] Add clean `windows-2025-vs2026` CI: report tool versions; verify native files; test; build release; run local smoke/JSON-independent CLI fixtures; upload checksummed artifact. Ensure native consumer needs no CMake/NASM/libclang invocation.
-- [ ] Run local tests, script fault injections and fresh target build. Push to the development branch when needed to execute CI, inspect the actual run, fix until green; do not create a public release as part of testing.
-- [ ] Commit verified build changes and save actual CI evidence in the roadmap/ledger.
+- [x] Write script subprocess tests with fake cargo/git/gh for build, copy, push and upload failures; stale artifact and custom target directory must fail rather than silently deliver another exe.
+- [x] Implement locked builds, Rust 1.99.0 pin with 1.98.0 CI coverage, SHA256 metadata/licenses and ASCII/UTF-8 output. Preserve original native provenance and verify hashes.
+- [x] Add clean `windows-2025-vs2026` CI: report tool versions; verify native files; test; build release; run local smoke/JSON-independent CLI fixtures; upload checksummed artifact. Ensure native consumer needs no CMake/NASM/libclang invocation.
+- [x] Run local tests, script fault injections and fresh target build. Push to the development branch when needed to execute CI, inspect the actual run, fix until green; do not create a public release as part of testing.
+- [x] Commit verified build changes and save actual CI evidence in the roadmap/ledger.
 
 ### Task 7: P0 verification and P1 handoff
 
 **Files:** Update roadmap, user documentation, changelog and execution ledger.
 
-- [ ] Check every P0 spec acceptance item against actual tests/CI results, run full suite and release build, verify bin hash.
-- [ ] Record remaining P1/P2 as incomplete and write their implementation plans from approved specs; user has delegated the recommended choices, so continue execution without another confirmation gate.
-- [ ] Keep new scan layout and no-mutation modes covered as shared regressions. A fresh whole-branch reviewer is required after all stages, before final integration and push.
+- [x] Check every P0 spec acceptance item against actual tests/CI results, run full suite and release build, verify bin hash.
+- [x] Record remaining P1/P2 as incomplete and write their implementation plans from approved specs; user has delegated the recommended choices, so continue execution without another confirmation gate.
+- [x] Keep new scan layout and no-mutation modes covered as shared regressions. A fresh whole-branch reviewer is required after all stages, before final integration and push.

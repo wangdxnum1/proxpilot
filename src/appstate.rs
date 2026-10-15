@@ -182,6 +182,15 @@ mod tests {
         );
         assert!(read(1).contains("verified"));
         assert!(read(2).contains("original-2"));
+        con.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        assert_eq!(
+            sync_database_captured(&path, 1, "AI", "blocked")
+                .unwrap_err()
+                .code,
+            crate::diagnostics::ErrorCode::StateUnavailable
+        );
+        con.execute_batch("ROLLBACK").unwrap();
+        assert!(read(1).contains("verified"));
         drop(con);
         std::fs::remove_dir_all(root).unwrap();
     }

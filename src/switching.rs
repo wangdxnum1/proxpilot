@@ -532,6 +532,9 @@ mod tests {
         fail_restore: Cell<bool>,
         proxy: RefCell<Option<ProxySnapshot>>,
         fail_proxy_write: Cell<bool>,
+        hold_journal: RefCell<Option<std::path::PathBuf>>,
+        held_file: RefCell<Option<std::fs::File>>,
+        fail_memory: Cell<bool>,
     }
     impl SwitchControl for Core {
         fn proxy_snapshot(&self) -> AppResult<Option<ProxySnapshot>> {
@@ -591,6 +594,19 @@ mod tests {
             snapshot: &SwitchSnapshot,
             target: &str,
         ) -> crate::diagnostics::AppResult<MemorySync> {
+            if let Some(path) = self.hold_journal.borrow().as_ref() {
+                use std::os::windows::fs::OpenOptionsExt;
+                *self.held_file.borrow_mut() = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(3)
+                        .open(path)
+                        .unwrap(),
+                );
+            }
+            if self.fail_memory.get() {
+                return Err(AppError::new(ErrorCode::StateUnavailable, Stage::State));
+            }
             self.persisted
                 .borrow_mut()
                 .push((snapshot.state.profile, target.into()));
@@ -614,6 +630,9 @@ mod tests {
             fail_restore: Cell::new(false),
             proxy: RefCell::new(None),
             fail_proxy_write: Cell::new(false),
+            hold_journal: RefCell::new(None),
+            held_file: RefCell::new(None),
+            fail_memory: Cell::new(false),
         };
         run(&core, &root);
         std::fs::remove_dir_all(root).unwrap();
@@ -626,6 +645,29 @@ mod tests {
             samples_passed: 2,
             error: None,
         }
+    }
+
+    #[test]
+    fn committed_selection_survives_failed_memory_and_journal_deletion() {
+        scenario(|core, root| {
+            let mut txn =
+                SwitchTransaction::begin_at(core, "group", Cancellation::new(), root).unwrap();
+            txn.select("good").unwrap();
+            *core.hold_journal.borrow_mut() = Some(root.join("recovery.bin"));
+            core.fail_memory.set(true);
+            let report = txn.commit(&passed()).unwrap();
+            assert_eq!(report.warnings.len(), 2);
+            assert!(report.memory.is_none());
+            assert!(root.join("recovery.bin").exists());
+            assert_eq!(core.selected.borrow().as_deref(), Some("good"));
+            drop(txn);
+            core.held_file.borrow_mut().take();
+            let mut next =
+                SwitchTransaction::begin_at(core, "group", Cancellation::new(), root).unwrap();
+            assert_eq!(core.selected.borrow().as_deref(), Some("good"));
+            assert_eq!(&*core.writes.borrow(), &["good"]);
+            assert_eq!(next.rollback().status, RollbackStatus::Unchanged);
+        });
     }
 
     #[test]

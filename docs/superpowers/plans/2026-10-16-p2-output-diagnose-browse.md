@@ -62,7 +62,7 @@
 
 **Files:** Roadmap/help/README/CHANGELOG/evidence records.
 
-- [ ] Audit P0/P1/P2 acceptance against real Rust/script/CLI/terminal output and clean CI; release build; check original checkout for unrelated changes.
-- [ ] Create review packages; dispatch one fresh reviewer on most-capable model with all three plans/specs/rulings. Grade by effect. Fix Important/Critical with RED→GREEN regressions/full suite; ledger deferred minors.
-- [ ] Integrate reviewed branch into original development checkout, preserve user files, rebuild original bin and verify hashes; commit/push authorized original branch and inspect final CI.
-- [ ] Complete goal only after full implementation, original-bin delivery and push. Link exhaustive rulings/deferred findings in an auditable document; state material unverified external behavior.
+- [x] Audit P0/P1/P2 acceptance against real Rust/script/CLI/terminal output and clean CI; release build; check original checkout for unrelated changes.
+- [x] Create review packages; dispatch one fresh reviewer on most-capable model with all three plans/specs/rulings. Grade by effect. Fix Important/Critical with RED→GREEN regressions/full suite; ledger deferred minors.
+- [x] Integrate reviewed branch into original development checkout, preserve user files, rebuild original bin and verify hashes; commit/push authorized original branch and inspect final CI.
+- [x] Complete goal only after full implementation, original-bin delivery and push. Link exhaustive rulings/deferred findings in an auditable document; state material unverified external behavior.

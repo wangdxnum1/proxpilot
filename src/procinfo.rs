@@ -2,12 +2,17 @@
 
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, NO_ERROR,
+};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
     MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -60,7 +65,43 @@ fn listener_table(family: u32) -> Option<Vec<u32>> {
 
 /// 找到监听指定端口的进程 PID
 pub fn find_listener_pid(port: u16) -> Option<u32> {
+    find_listener_for(port, None)
+}
+pub fn find_listener_pid_at(host: &str, port: u16) -> Option<u32> {
+    use std::net::ToSocketAddrs;
+    let targets: Vec<_> = (host.trim_matches(['[', ']']), port)
+        .to_socket_addrs()
+        .ok()?
+        .map(|a| a.ip())
+        .collect();
+    let found: std::collections::HashSet<_> = targets
+        .iter()
+        .filter_map(|ip| {
+            find_listener_for(port, Some(*ip)).or_else(|| {
+                // 没有匹配的 IPv4 监听时，IPv4 连接仅可能由 IPv6 wildcard 双栈监听接收。
+                // 后续直连 API 成功才视为可用，IPv6-only 接口的 IPv4 请求会失败。
+                if ip.is_ipv4() {
+                    find_listener_for(
+                        port,
+                        Some(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+                    )
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    if found.len() == 1 {
+        found.into_iter().next()
+    } else {
+        None
+    }
+}
+fn find_listener_for(port: u16, target: Option<std::net::IpAddr>) -> Option<u32> {
     for family in [AF_INET, AF_INET6] {
+        if target.is_some_and(|ip| ip.is_ipv4() != (family == AF_INET)) {
+            continue;
+        }
         let Some(table) = listener_table(family as u32) else {
             continue;
         };
@@ -80,16 +121,28 @@ pub fn find_listener_pid(port: u16) -> Option<u32> {
         for i in 0..count.min(available) {
             // 已校验缓冲区边界，表行均为 POD 整数；不创建未对齐引用。
             let row = unsafe { table.as_ptr().cast::<u8>().add(offset + i * row_size) };
-            let (local_port, pid) = unsafe {
+            let (local_port, pid, address) = unsafe {
                 if family == AF_INET {
                     let row = row.cast::<MIB_TCPROW_OWNER_PID>().read_unaligned();
-                    (row.dwLocalPort, row.dwOwningPid)
+                    (
+                        row.dwLocalPort,
+                        row.dwOwningPid,
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                            row.dwLocalAddr.to_le_bytes(),
+                        )),
+                    )
                 } else {
                     let row = row.cast::<MIB_TCP6ROW_OWNER_PID>().read_unaligned();
-                    (row.dwLocalPort, row.dwOwningPid)
+                    (
+                        row.dwLocalPort,
+                        row.dwOwningPid,
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(row.ucLocalAddr)),
+                    )
                 }
             };
-            if u16::from_be(local_port as u16) == port {
+            if u16::from_be(local_port as u16) == port
+                && target.is_none_or(|ip| address.is_unspecified() || address == ip)
+            {
                 return Some(pid);
             }
         }
@@ -116,8 +169,70 @@ fn image_path(pid: u32) -> Option<String> {
 
 /// 识别监听该端口的是哪家客户端
 pub fn identify_client(port: u16) -> ClientInfo {
-    let pid = find_listener_pid(port);
-    let (path, process) = match pid {
+    identify_pid(find_listener_pid(port))
+}
+
+fn process_tree() -> std::collections::HashMap<u32, (u32, String)> {
+    let mut processes = std::collections::HashMap::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return processes;
+        }
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut present = Process32FirstW(snapshot, &mut entry);
+        while present != 0 {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            processes.insert(
+                entry.th32ProcessID,
+                (
+                    entry.th32ParentProcessID,
+                    String::from_utf16_lossy(&entry.szExeFile[..len]),
+                ),
+            );
+            present = Process32NextW(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+    }
+    processes
+}
+
+fn client_name_from_process_tree(
+    pid: u32,
+    processes: &std::collections::HashMap<u32, (u32, String)>,
+) -> String {
+    let mut next = pid;
+    let mut seen = std::collections::HashSet::new();
+    let fallback = processes
+        .get(&pid)
+        .map(|(_, name)| client_display_name("", name))
+        .unwrap_or_else(|| "未知客户端".into());
+    for _ in 0..16 {
+        if !seen.insert(next) {
+            break;
+        }
+        let Some((parent, process)) = processes.get(&next) else {
+            break;
+        };
+        let name = client_display_name("", process);
+        if matches!(
+            name.as_str(),
+            "CuteCloud" | "VVCloud" | "Clash Verge" | "Clash for Windows"
+        ) {
+            return name;
+        }
+        next = *parent;
+    }
+    fallback
+}
+
+pub fn identify_pid(pid: Option<u32>) -> ClientInfo {
+    let (path, mut process) = match pid {
         Some(p) => {
             let path = image_path(p).unwrap_or_default();
             let process = Path::new(&path)
@@ -128,7 +243,22 @@ pub fn identify_client(port: u16) -> ClientInfo {
         }
         None => (String::new(), String::new()),
     };
-    let name = client_display_name(&path, &process);
+    let mut name = client_display_name(&path, &process);
+    if path.is_empty() || matches!(name.as_str(), "FlClash" | "mihomo" | "Clash 内核") {
+        if let Some(pid) = pid {
+            let processes = process_tree();
+            let parent_name = client_name_from_process_tree(pid, &processes);
+            if parent_name != "未知客户端" {
+                name = parent_name;
+            }
+            if process.is_empty() {
+                process = processes
+                    .get(&pid)
+                    .map(|(_, p)| p.clone())
+                    .unwrap_or_default();
+            }
+        }
+    }
     ClientInfo {
         name,
         process,
@@ -140,6 +270,8 @@ pub fn client_display_name(path: &str, process: &str) -> String {
     let l = format!("{} {}", path, process).to_lowercase();
     if l.contains("cutecloud") {
         "CuteCloud".into()
+    } else if l.contains("vvcloud") {
+        "VVCloud".into()
     } else if l.contains("flclash") {
         "FlClash".into()
     } else if l.contains("verge") {
@@ -161,6 +293,43 @@ pub fn client_display_name(path: &str, process: &str) -> String {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn service_parent_identifies_cutecloud_when_core_path_is_unreadable() {
+        let processes = std::collections::HashMap::from([
+            (100, (200, "FlClashCore.exe".to_string())),
+            (200, (300, "CuteCloudHelperService.exe".to_string())),
+            (300, (0, "services.exe".to_string())),
+        ]);
+        assert_eq!(client_name_from_process_tree(100, &processes), "CuteCloud");
+        assert_eq!(client_name_from_process_tree(999, &processes), "未知客户端");
+        let unrelated = std::collections::HashMap::from([
+            (100, (200, "FlClashCore.exe".to_string())),
+            (200, (0, "services.exe".to_string())),
+            (300, (0, "CuteCloud.exe".to_string())),
+        ]);
+        assert_eq!(client_name_from_process_tree(100, &unrelated), "FlClash");
+        let cycle = std::collections::HashMap::from([
+            (100, (200, "FlClashCore.exe".to_string())),
+            (200, (100, "services.exe".to_string())),
+        ]);
+        assert_eq!(client_name_from_process_tree(100, &cycle), "FlClash");
+    }
+
+    #[test]
+    fn identifies_vvcloud_core_before_generic_mihomo() {
+        assert_eq!(
+            client_display_name(
+                r"C:\Program Files\VVCloud\VVCloudCore.exe",
+                "VVCloudCore.exe"
+            ),
+            "VVCloud"
+        );
+        assert_eq!(
+            client_display_name(r"C:\Program Files\VVCloud\mihomo.exe", "mihomo.exe"),
+            "VVCloud"
+        );
+    }
 
     #[test]
     fn identifies_current_ipv4_listener_and_process_without_commands() {
@@ -186,5 +355,24 @@ mod tests {
             find_listener_pid(listener.local_addr().unwrap().port()),
             Some(std::process::id())
         );
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    #[test]
+    fn same_port_distinct_addresses_resolve_without_family_confusion() {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let _v6 = std::net::TcpListener::bind(("::1", port)).unwrap();
+        assert_eq!(
+            super::find_listener_pid_at("127.0.0.1", port),
+            Some(std::process::id())
+        );
+        assert_eq!(
+            super::find_listener_pid_at("::1", port),
+            Some(std::process::id())
+        );
+        assert_eq!(super::find_listener_pid_at("127.0.0.2", port), None);
     }
 }

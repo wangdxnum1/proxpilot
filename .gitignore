@@ -3,6 +3,8 @@
 
 # 编译输出（build.bat 产物，如需入库可删除此行）
 /bin/
+/dist/
+__pycache__/
 
 # 调试符号
 *.pdb

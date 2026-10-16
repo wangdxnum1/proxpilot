@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::diagnostics::{AppError, AppResult, ErrorCode, Stage};
 use crate::Backend;
 
 #[derive(Deserialize, Clone)]
@@ -18,6 +19,8 @@ pub struct ProxyInfo {
     pub all: Option<Vec<String>>,
     #[serde(default)]
     pub history: Vec<DelayRecord>,
+    #[serde(default)]
+    pub udp: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -32,95 +35,148 @@ struct ProxiesMap {
     proxies: HashMap<String, ProxyInfo>,
 }
 
-fn api_response(
-    req: reqwest::blocking::RequestBuilder,
-) -> Result<reqwest::blocking::Response, String> {
-    let response = req.send().map_err(|e| format!("API 请求失败: {}", e))?;
-    if !response.status().is_success() {
-        return Err(format!("API 请求失败: HTTP {}", response.status()));
-    }
-    Ok(response)
+fn api_json_detailed(be: &Backend, api: &crate::core_api::CoreApi, path: &str) -> AppResult<Value> {
+    let response = api.request(
+        be,
+        reqwest::Method::GET,
+        path,
+        None,
+        std::time::Duration::from_secs(10),
+    )?;
+    serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))
 }
-
+fn text_result<T>(result: AppResult<T>) -> Result<T, String> {
+    result
+        .inspect_err(crate::report::error)
+        .map_err(|error| error.to_string())
+}
 pub fn get_proxies(
     be: &Backend,
-    agent: &reqwest::blocking::Client,
+    api: &crate::core_api::CoreApi,
 ) -> Result<HashMap<String, ProxyInfo>, String> {
-    let mut req = agent.get(format!("{}/proxies", be.api));
-    if let Some(s) = &be.secret {
-        req = req.bearer_auth(s);
+    text_result(get_proxies_detailed(be, api).map(|(proxies, _)| proxies))
+}
+pub fn get_proxies_detailed(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+) -> AppResult<(HashMap<String, ProxyInfo>, Option<u32>)> {
+    let response = api.request(
+        be,
+        reqwest::Method::GET,
+        "/proxies",
+        None,
+        std::time::Duration::from_secs(10),
+    )?;
+    let parsed: ProxiesMap = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))?;
+    Ok((parsed.proxies, response.server_pid))
+}
+pub fn get_version_detailed(be: &Backend, api: &crate::core_api::CoreApi) -> AppResult<String> {
+    api_json_detailed(be, api, "/version")?
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))
+}
+pub fn get_version(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
+    text_result(get_version_detailed(be, api))
+}
+pub fn get_mode(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
+    text_result(api_json_detailed(be, api, "/configs").and_then(|v| {
+        v.get("mode")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))
+    }))
+}
+pub fn get_runtime_proxy_detailed(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+) -> AppResult<String> {
+    let value = api_json_detailed(be, api, "/configs")?;
+    for (name, scheme) in [
+        ("mixed-port", "http"),
+        ("port", "http"),
+        ("socks-port", "socks5h"),
+    ] {
+        if let Some(port) = value
+            .get(name)
+            .and_then(Value::as_u64)
+            .filter(|p| *p > 0 && *p <= 65535)
+        {
+            return Ok(format!("{}://127.0.0.1:{}", scheme, port));
+        }
     }
-    let resp = api_response(req)?;
-    let body = resp.text().map_err(|e| e.to_string())?;
-    let parsed: ProxiesMap =
-        serde_json::from_str(&body).map_err(|e| format!("JSON 解析失败: {}", e))?;
-    Ok(parsed.proxies)
+    let mut error = AppError::new(ErrorCode::InvalidResponse, Stage::Controller);
+    error.message = "目标内核没有可用的 mixed/HTTP/SOCKS 代理端口，请用 --proxy 指定".into();
+    Err(error)
+}
+pub fn get_runtime_proxy(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
+    text_result(get_runtime_proxy_detailed(be, api))
 }
 
-pub fn get_version(be: &Backend, agent: &reqwest::blocking::Client) -> Result<String, String> {
-    let mut req = agent.get(format!("{}/version", be.api));
-    if let Some(s) = &be.secret {
-        req = req.bearer_auth(s);
-    }
-    let resp = api_response(req)?;
-    let body = resp.text().map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    Ok(v.get("version")
-        .and_then(|x| x.as_str())
-        .unwrap_or("unknown")
-        .to_string())
-}
-
-/// 让内核对指定节点做一次延迟测试（任意 HTTP 响应都算成功，含 403）
 pub fn probe_delay(
     be: &Backend,
-    agent: &reqwest::blocking::Client,
+    api: &crate::core_api::CoreApi,
     node: &str,
     url: &str,
     timeout_ms: u32,
-) -> Option<i64> {
-    let u = format!(
-        "{}/proxies/{}/delay?url={}&timeout={}",
-        be.api,
+) -> AppResult<i64> {
+    probe_delay_detailed(be, api, node, url, timeout_ms)
+}
+
+pub fn probe_delay_detailed(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+    node: &str,
+    url: &str,
+    timeout_ms: u32,
+) -> AppResult<i64> {
+    let path = format!(
+        "/proxies/{}/delay?url={}&timeout={}",
         enc_path(node),
         enc(url),
         timeout_ms
     );
-    let mut req = agent.get(&u);
-    if let Some(s) = &be.secret {
-        req = req.bearer_auth(s);
-    }
-    let resp = api_response(req).ok()?;
-    let body = resp.text().ok()?;
-    let v: Value = serde_json::from_str(&body).ok()?;
-    let d = v.get("delay")?.as_i64()?;
-    if d > 0 {
-        Some(d)
-    } else {
-        None
-    }
+    let response = api.request(
+        be,
+        reqwest::Method::GET,
+        &path,
+        None,
+        std::time::Duration::from_millis(u64::from(timeout_ms) + 2000),
+    )?;
+    let value: Value = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Probe))?;
+    value
+        .get("delay")
+        .and_then(Value::as_i64)
+        .filter(|d| *d > 0)
+        .ok_or_else(|| AppError::new(ErrorCode::ProbeFailed, Stage::Probe))
 }
 
 pub fn switch_group(
     be: &Backend,
-    agent: &reqwest::blocking::Client,
+    api: &crate::core_api::CoreApi,
     group: &str,
     node: &str,
 ) -> Result<(), String> {
-    let u = format!("{}/proxies/{}", be.api, enc_path(group));
-    let body = serde_json::json!({ "name": node }).to_string();
-    let mut req = agent.put(&u).header("Content-Type", "application/json");
-    if let Some(s) = &be.secret {
-        req = req.bearer_auth(s);
-    }
-    let resp = api_response(req.body(body)).map_err(|e| format!("切换失败: {}", e))?;
-    let _ = resp.text();
+    let path = format!("/proxies/{}", enc_path(group));
+    let body = serde_json::to_vec(&serde_json::json!({"name": node})).map_err(|e| e.to_string())?;
+    let response = api.request(
+        be,
+        reqwest::Method::PUT,
+        &path,
+        Some(body),
+        std::time::Duration::from_secs(10),
+    )?;
+    debug_assert!((200..300).contains(&response.status));
     Ok(())
 }
 
-/// 百分号编码（用于路径段，保留 /）
+/// 百分号编码（用于单个路径段）
 pub fn enc_path(s: &str) -> String {
-    enc_impl(s, true)
+    enc_impl(s, false)
 }
 
 /// 百分号编码（用于查询值，编码所有特殊字符）
@@ -145,12 +201,14 @@ fn enc_impl(s: &str, keep_slash: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{api_client, test_support::serve};
+    use crate::core_api::CoreApi;
+    use crate::http::test_support::serve;
 
     fn backend(api: String) -> Backend {
         Backend {
+            kind: None,
             client: "test".into(),
-            api,
+            api: api.into(),
             secret: Some("test-secret".into()),
             proxy: "http://127.0.0.1:1".into(),
             source: "test".into(),
@@ -169,7 +227,7 @@ mod tests {
         )
         .into_bytes()]);
         assert_eq!(
-            get_version(&backend(url), &api_client().unwrap()).unwrap(),
+            get_version(&backend(url), &CoreApi::new().unwrap()).unwrap(),
             "test-core"
         );
         assert!(server.join().unwrap()[0]
@@ -182,14 +240,130 @@ mod tests {
         let (url, server) = serve(vec![
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         ]);
-        assert!(switch_group(&backend(url), &api_client().unwrap(), "AI服务", "node").is_err());
+        assert!(switch_group(&backend(url), &CoreApi::new().unwrap(), "AI服务", "node").is_err());
         server.join().unwrap();
     }
 
     #[test]
     fn redirected_switch_is_not_reported_as_success() {
         let (url, server) = serve(vec![b"HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()]);
-        assert!(switch_group(&backend(url), &api_client().unwrap(), "AI服务", "node").is_err());
+        assert!(switch_group(&backend(url), &CoreApi::new().unwrap(), "AI服务", "node").is_err());
         server.join().unwrap();
+    }
+}
+
+pub fn missing_group(proxies: &HashMap<String, ProxyInfo>, name: &str) -> String {
+    let mut groups: Vec<_> = proxies
+        .iter()
+        .filter(|(_, p)| p.all.is_some())
+        .map(|(n, _)| n.as_str())
+        .collect();
+    groups.sort();
+    format!(
+        "找不到组「{}」；可用组：{}。请用 --group 指定",
+        name,
+        groups.join("、")
+    )
+}
+
+/// 从实时组引用图选择唯一顶层业务组；GLOBAL 是合成总览，不参与业务组引用。
+pub fn resolve_group(
+    proxies: &HashMap<String, ProxyInfo>,
+    explicit: &str,
+) -> Result<String, String> {
+    if !explicit.is_empty() {
+        return if proxies.get(explicit).is_some_and(|p| p.all.is_some()) {
+            Ok(explicit.into())
+        } else {
+            Err(missing_group(proxies, explicit))
+        };
+    }
+    let mut groups: Vec<&str> = proxies
+        .iter()
+        .filter(|(name, p)| name.as_str() != "GLOBAL" && p.all.is_some())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if groups.is_empty() {
+        return if proxies.get("GLOBAL").is_some_and(|p| p.all.is_some()) {
+            Ok("GLOBAL".into())
+        } else {
+            Err("目标客户端没有可用策略组，请检查运行配置".into())
+        };
+    }
+    groups.sort();
+    let referenced: std::collections::HashSet<&str> = groups
+        .iter()
+        .flat_map(|name| {
+            proxies[*name]
+                .all
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+        })
+        .collect();
+    let roots: Vec<&str> = groups
+        .iter()
+        .copied()
+        .filter(|name| !referenced.contains(name))
+        .collect();
+    match roots.as_slice() {
+        [name] => Ok((*name).into()),
+        _ => Err(format!(
+            "无法唯一确定目标策略组；可用组：{}。请用 --group 显式指定",
+            groups.join("、")
+        )),
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    fn groups(value: serde_json::Value) -> HashMap<String, ProxyInfo> {
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn unique_business_root_ignores_global_and_nested_groups() {
+        let proxies = groups(serde_json::json!({
+            "GLOBAL":{"type":"Selector","all":["VVCloud","自动选择","故障转移"]},
+            "VVCloud":{"type":"Selector","all":["自动选择","故障转移","日本 🛰"]},
+            "自动选择":{"type":"URLTest","all":["日本 🛰"]},
+            "故障转移":{"type":"Fallback","all":["日本 🛰"]},
+            "日本 🛰":{"type":"SS"}
+        }));
+        assert_eq!(resolve_group(&proxies, "").unwrap(), "VVCloud");
+        assert_eq!(resolve_group(&proxies, "自动选择").unwrap(), "自动选择");
+        assert!(resolve_group(&proxies, "日本 🛰").is_err());
+        assert!(resolve_group(&proxies, "AI服务").is_err());
+    }
+    #[test]
+    fn multiple_roots_or_cycles_require_explicit_choice() {
+        let mut proxies =
+            groups(serde_json::json!({"AI服务":{"all":["node"]},"流媒体":{"all":["node"]}}));
+        let error = resolve_group(&proxies, "").unwrap_err();
+        assert!(error.contains("AI服务") && error.contains("流媒体"));
+        assert_eq!(resolve_group(&proxies, "AI服务").unwrap(), "AI服务");
+        proxies = groups(serde_json::json!({"A":{"all":["B"]},"B":{"all":["A"]}}));
+        assert!(resolve_group(&proxies, "").is_err());
+    }
+    #[test]
+    fn no_groups_and_global_only_are_handled() {
+        assert!(resolve_group(&HashMap::new(), "").is_err());
+        assert_eq!(
+            resolve_group(
+                &groups(serde_json::json!({"GLOBAL":{"all":["DIRECT"]}})),
+                ""
+            )
+            .unwrap(),
+            "GLOBAL"
+        );
+    }
+    #[test]
+    fn topology_is_recomputed_after_runtime_changes() {
+        let first = groups(serde_json::json!({"Old":{"all":["node"]}}));
+        let second = groups(serde_json::json!({"New":{"all":["node"]}}));
+        assert_eq!(resolve_group(&first, "").unwrap(), "Old");
+        assert_eq!(resolve_group(&second, "").unwrap(), "New");
+        assert!(resolve_group(&second, "Old").is_err());
     }
 }

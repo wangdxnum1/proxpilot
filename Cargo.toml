@@ -1,25 +1,42 @@
 [package]
 name = "proxpilot"
-version = "0.2.2"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.98"
-description = "代理领航员：节点检测、智能优选、自动切换、全时守护（支持 Clash/mihomo 系客户端）"
+description = "代理优选助手：节点检测、智能优选、自动切换、全时守护（支持 Clash/mihomo 系客户端）"
 
 [dependencies]
+# Pin the ABI of the bundled native libraries and pregenerated bindings.
+btls-sys = "=0.5.6"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider", "http2", "json", "gzip", "brotli", "deflate", "cookies", "socks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 wreq = { version = "0.16", default-features = false, features = ["webpki-roots", "tokio-rt", "cookies", "gzip", "brotli", "deflate", "zstd", "socks"] }
 wreq-util = { version = "0.2", default-features = false, features = ["emulation"] }
-tokio = { version = "1", features = ["rt", "time", "net"] }
+tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
 http-body-util = "0.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_System_Console", "Win32_Networking_WinInet"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+bytes = "1"
+serde_yaml_ng = "0.10"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_Networking_WinInet"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 colored = "2"
 winreg = "0.52"
 rusqlite = { version = "0.32", features = ["bundled"] }
+unicode-width = "0.2"
+unicode-segmentation = "1.13"
+btls = { version = "=0.5.6", default-features = false }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+
+[build-dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+serde_json = "1"
 
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
+
+[patch.crates-io]
+btls-sys = { path = "vendor/btls-sys" }

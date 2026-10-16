@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "btls_sys_version": "0.5.6",
+  "upstream_commit": "4edbf5d716ba014384569ac5c631cea83827abfc",
+  "target": "x86_64-pc-windows-msvc",
+  "profile": "Release",
+  "crt": "static /MT",
+  "compiler": "MSVC 19.51.36260.0 (toolset 14.51.36231, Visual Studio 2026)",
+  "features": [],
+  "files": {
+    "lib/crypto.lib": {
+      "size": 7247328,
+      "sha256": "6c95260fd28003a8fac9364e5bc30ce640ce7f73513ae0574a8beb9fe47f1558"
+    },
+    "lib/ssl.lib": {
+      "size": 5288090,
+      "sha256": "952fe774b661db38aea64b0400f3a8ae3386e25cf915bc2b42185dcb5c6f83e5"
+    },
+    "bindings.rs": {
+      "size": 858784,
+      "sha256": "37f9589fd9d636ebac64cc5411b32b1cdebdf2068d2f6d5924bd816136951ab9"
+    },
+    "LICENSE-BORINGSSL": {
+      "size": 13115,
+      "sha256": "827c8d8fc207c2392794eef9e00fe246f9f61fdcc132556c275be3dd8c3cd97f"
+    }
+  }
+}

@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
+use crate::diagnostics::{AppError, AppResult, ErrorCode, Stage};
 use http_body_util::BodyExt;
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::redirect;
@@ -192,10 +193,13 @@ mod tests {
         let (proxy, server) = serve(vec![
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort".to_vec(),
         ]);
-        assert!(BrowserProbe::new(&proxy)
+        let error = BrowserProbe::new(&proxy)
             .unwrap()
             .test("http://browser-test.invalid/")
-            .is_err());
+            .unwrap_err();
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["code"], "response_transfer");
+        assert!(value["http_status"].is_null());
         server.join().unwrap();
     }
 
@@ -255,12 +259,39 @@ mod tests {
         let (proxy, server) = serve(vec![
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         ]);
-        assert!(BrowserProbe::new(&proxy)
+        let error = BrowserProbe::new(&proxy)
             .unwrap()
             .test("https://browser-test.invalid/")
-            .is_err());
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProxyConnect);
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("CONNECT browser-test.invalid:443 HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn tls_handshake_error_keeps_category_without_secret_url() {
+        let listener = listener();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut stream = accept(&listener);
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("CONNECT "));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            let mut hello = [0u8; 2048];
+            assert!(stream.read(&mut hello).unwrap() > 0);
+            stream.write_all(b"not-a-TLS-record").unwrap();
+        });
+        let error = BrowserProbe::new(&proxy)
+            .unwrap()
+            .test("https://tls-test.invalid/path?token=secret-test-value")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Tls);
+        let serialized = serde_json::to_string(&error).unwrap();
+        assert!(!serialized.contains("secret-test-value"));
+        assert!(!serialized.contains("tls-test.invalid"));
+        server.join().unwrap();
     }
 
     #[test]
@@ -392,19 +423,26 @@ pub struct BrowserProbe {
     safari_cookies: Arc<Jar>,
     prefer_safari: Cell<bool>,
     runtime: Runtime,
+    timeout: Duration,
 }
 
 impl BrowserProbe {
-    pub fn new(proxy: &str) -> Result<Self, String> {
+    pub fn new(proxy: &str) -> AppResult<Self> {
+        Self::new_with_timeout(proxy, 12000)
+    }
+
+    pub fn new_with_timeout(proxy: &str, timeout_ms: u32) -> AppResult<Self> {
         Ok(Self {
-            proxy: wreq::Proxy::all(proxy).map_err(|e| e.to_string())?,
+            timeout: Duration::from_millis(u64::from(timeout_ms)),
+            proxy: wreq::Proxy::all(proxy)
+                .map_err(|e| AppError::from_wreq(&e, Stage::Configuration))?,
             cookies: Arc::new(Jar::default()),
             safari_cookies: Arc::new(Jar::default()),
             prefer_safari: Cell::new(false),
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| e.to_string())?,
+                .map_err(|_| AppError::new(ErrorCode::StateUnavailable, Stage::Verification))?,
         })
     }
 
@@ -429,24 +467,26 @@ impl BrowserProbe {
                 self.cookies.clone()
             })
             .redirect(wreq::redirect::Policy::limited(10))
-            .timeout(Duration::from_secs(12))
-            .connect_timeout(Duration::from_secs(8))
+            .timeout(self.timeout)
+            .connect_timeout(self.timeout.min(Duration::from_secs(8)))
     }
 
-    async fn request(&self, url: &str, safari: bool) -> Result<(u16, bool), String> {
+    async fn request(&self, url: &str, safari: bool) -> AppResult<(u16, bool)> {
         // 每次重建 Client，HTTP/1 和 HTTP/2 均不会复用前一个节点的隧道。
         let builder = if safari {
             self.builder_for(Profile::Safari26, Platform::MacOS)
         } else {
             self.builder()
         };
-        let client = builder.build().map_err(|e| e.to_string())?;
+        let client = builder
+            .build()
+            .map_err(|e| AppError::from_wreq(&e, Stage::Verification))?;
         let response = client
             .get(url)
             .header(wreq::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| AppError::from_wreq(&e, Stage::Verification))?;
         response.forbid_recycle();
         let code = response.status().as_u16();
         let challenge = response
@@ -456,16 +496,29 @@ impl BrowserProbe {
             .is_some_and(|v| v.eq_ignore_ascii_case("challenge"));
         let mut body = wreq::Body::from(response);
         while let Some(frame) = body.frame().await {
-            frame.map_err(|e| e.to_string())?;
+            frame.map_err(|_| AppError::new(ErrorCode::ResponseTransfer, Stage::Verification))?;
         }
         Ok((code, challenge))
     }
 
-    /// 最多尝试两个浏览器配置，整体 12 秒超时；耗时包含候补请求。
-    pub fn test(&self, url: &str) -> Result<(u16, f64), String> {
+    /// 最多两个浏览器配置共享配置的整体超时；耗时包含候补请求。
+    pub fn test(&self, url: &str) -> AppResult<(u16, f64)> {
+        self.test_detailed(url)
+    }
+
+    pub fn test_detailed(&self, url: &str) -> AppResult<(u16, f64)> {
+        self.test_with_cancellation(url, &crate::operation::Cancellation::global())
+    }
+
+    pub fn test_with_cancellation(
+        &self,
+        url: &str,
+        cancellation: &crate::operation::Cancellation,
+    ) -> AppResult<(u16, f64)> {
+        cancellation.check()?;
         self.runtime.block_on(async {
             let start = Instant::now();
-            let code = tokio::time::timeout(Duration::from_secs(12), async {
+            let request = tokio::time::timeout(self.timeout, async {
                 let preferred = self.prefer_safari.get();
                 let (code, challenge) = self.request(url, preferred).await?;
                 // 普通 403 或断连不重试；只对服务端明确标记的 Challenge 使用候补。
@@ -474,13 +527,16 @@ impl BrowserProbe {
                     if alternative == 200 {
                         self.prefer_safari.set(!preferred);
                     }
-                    Ok::<u16, String>(alternative)
+                    Ok::<u16, AppError>(alternative)
                 } else {
                     Ok(code)
                 }
-            })
-            .await
-            .map_err(|_| "实测超过整体 12 秒超时".to_string())??;
+            });
+            let code = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(AppError::new(ErrorCode::Cancelled, Stage::Verification)),
+                result = request => result.map_err(|_| AppError::new(ErrorCode::Timeout, Stage::Verification))??,
+            };
             Ok((code, start.elapsed().as_secs_f64()))
         })
     }

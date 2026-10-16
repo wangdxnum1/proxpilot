@@ -8,6 +8,25 @@ use colored::Colorize;
 
 const SPIN_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Display only: requests retain the original URL and authentication settings.
+pub fn display_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return "[无效地址]".into();
+    };
+    if url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+    {
+        return value.to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 /// 动态进度指示器：终端里原地刷新（旋转符 + 当前步骤 + 已耗时），
 /// 输出被重定向/管道时自动禁用，保持日志干净。Drop 时自动清屏收尾。
 pub struct Spinner {
@@ -20,8 +39,11 @@ pub struct Spinner {
 impl Spinner {
     pub fn start(msg: &str) -> Spinner {
         // TTY 下启用；设 PROXPILOT_SPINNER=1 可强制开启（特殊终端/调试用）
-        let enabled = io::stdout().is_terminal()
-            || std::env::var("PROXPILOT_SPINNER").map(|v| v == "1").unwrap_or(false);
+        let enabled = !crate::report::machine()
+            && (io::stdout().is_terminal()
+                || std::env::var("PROXPILOT_SPINNER")
+                    .map(|v| v == "1")
+                    .unwrap_or(false));
         let mut s = Spinner {
             done: Arc::new(AtomicBool::new(false)),
             text: Arc::new(Mutex::new(msg.to_string())),
@@ -75,8 +97,16 @@ impl Drop for Spinner {
 }
 
 pub fn banner() {
-    println!("{}", format!("ProxPilot · 代理领航员 v{}", env!("CARGO_PKG_VERSION")).cyan().bold());
-    println!("{}", "节点检测 · 智能优选 · 自动切换 · 全时守护（Clash/mihomo 系）".dimmed());
+    println!(
+        "{}",
+        format!("ProxPilot · 代理优选助手 v{}", env!("CARGO_PKG_VERSION"))
+            .cyan()
+            .bold()
+    );
+    println!(
+        "{}",
+        "节点检测 · 智能优选 · 自动切换 · 全时守护（Clash/mihomo 系）".dimmed()
+    );
     println!();
 }
 

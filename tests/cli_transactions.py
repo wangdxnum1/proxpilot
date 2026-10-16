@@ -179,6 +179,38 @@ class Fixture:
 
 
 class Transactions(unittest.TestCase):
+    def test_scan_refills_a_slot_before_the_slowest_peer_finishes(self):
+        release, third_started = threading.Event(), threading.Event()
+        gate_lock = threading.Lock()
+        with Fixture([200]) as fixture:
+            fixture.nodes = ["original", "target", "extra"]
+            calls = 0
+            def gate():
+                nonlocal calls
+                with gate_lock:
+                    index = calls
+                    calls += 1
+                if index == 0:
+                    release.wait(20)
+                elif index == 2:
+                    third_started.set()
+            fixture.delay_gate = gate
+            process = fixture.background("scan", "--json", "--concurrency", "2", "--probe-timeout-ms", "30000")
+            try:
+                self.assertTrue(third_started.wait(8), "idle slot waited for slow peer")
+                release.set()
+                out, err = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, out + err)
+                result = json.loads(out)["data"]["probe"]
+                self.assertEqual(len(result["measurements"]), 3)
+                self.assertLessEqual(result["peak_concurrency"], 2)
+                self.assertEqual(fixture.selected, "original")
+                self.assertFalse(any(method == "PUT" for method, _ in fixture.requests))
+            finally:
+                release.set()
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
     def test_all_probe_api_errors_are_environment_errors_even_when_version_endpoint_is_healthy(self):
         with Fixture([200]) as fixture:
             fixture.probe_status = 503

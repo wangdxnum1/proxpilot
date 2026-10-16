@@ -3,7 +3,10 @@ param([string]$Target, [string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -lt 6) {
     # A caller running pwsh may pass incompatible PS7 module paths to Desktop.
-    $env:PSModulePath = (($env:PSModulePath -split ';' | Where-Object { $_ -notmatch '\\PowerShell\\(?:7(?:\\|$)|Modules(?:\\|$))' }) -join ';')
+    $env:PSModulePath = (($env:PSModulePath -split ';' | Where-Object {
+        $_ -notmatch '\\PowerShell\\(?:7(?:\\|$)|Modules(?:\\|$))' -and
+        $_ -notmatch '\\WindowsApps\\microsoft\.powershell'
+    }) -join ';')
 }
 Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent

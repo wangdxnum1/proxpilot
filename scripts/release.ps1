@@ -2,7 +2,10 @@
 param([switch]$PublishDraft, [string]$Remote = 'origin', [string]$Target = 'x86_64-pc-windows-msvc')
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion.Major -lt 6) {
-    $env:PSModulePath = (($env:PSModulePath -split ';' | Where-Object { $_ -notmatch '\\PowerShell\\(?:7(?:\\|$)|Modules(?:\\|$))' }) -join ';')
+    $env:PSModulePath = (($env:PSModulePath -split ';' | Where-Object {
+        $_ -notmatch '\\PowerShell\\(?:7(?:\\|$)|Modules(?:\\|$))' -and
+        $_ -notmatch '\\WindowsApps\\microsoft\.powershell'
+    }) -join ';')
 }
 Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent

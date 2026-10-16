@@ -1,10 +1,31 @@
 import json
 import re
+import threading
 import unittest
 from cli_transactions import Fixture, remaining
 from conpty import Terminal
 
 class Browse(unittest.TestCase):
+    def test_scan_shows_partial_progress_while_another_node_is_pending(self):
+        release = threading.Event()
+        with Fixture([200]) as f:
+            calls = 0
+            def gate():
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    release.wait(20)
+            f.delay_gate = gate
+            with Terminal(f.command("scan", "--concurrency", "1", "--probe-timeout-ms", "30000"), f.environment()) as tty:
+                try:
+                    tty.expect("已测 1/2")
+                    tty.expect("可达 1 · 未通过 0 · 重试 0")
+                    self.assertEqual(f.selected, "original")
+                    self.assertFalse(any(method == "PUT" for method, _ in f.requests))
+                finally:
+                    release.set()
+                self.assertEqual(tty.wait(), 0)
+
     def test_requires_terminal_and_rejects_json(self):
         with Fixture([200]) as f:
             r=f.run("browse","--json")

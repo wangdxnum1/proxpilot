@@ -32,6 +32,7 @@ impl Cancellation {
             ..Self::new()
         }
     }
+    #[cfg(test)]
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Release);
     }

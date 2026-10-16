@@ -1,11 +1,11 @@
-//! Bounded windows with cancellation and retries counted separately from unique nodes.
+//! Rolling bounded workers with cancellation and retries counted separately from unique nodes.
 use crate::{
     diagnostics::{AppError, AppResult, ErrorCode},
     operation::Cancellation,
 };
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Mutex,
+    Condvar, Mutex,
 };
 use std::time::Duration;
 
@@ -45,6 +45,7 @@ pub struct ProbeRun {
     pub retries: usize,
     pub peak_concurrency: usize,
     pub concurrency_limit: usize,
+    /// Concurrency targets at startup and after adaptive changes (legacy JSON field name).
     pub windows: Vec<usize>,
     pub controller_error: Option<AppError>,
     pub history_warning: Option<AppError>,
@@ -62,6 +63,16 @@ fn transient(error: &AppError) -> bool {
                 | ErrorCode::TransportUnknown
         )
 }
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeProgress {
+    pub total: usize,
+    pub completed: usize,
+    pub reachable: usize,
+    pub failed: usize,
+    pub retries: usize,
+}
+
+#[cfg(test)]
 pub fn run(
     nodes: &[String],
     options: &ProbeOptions,
@@ -69,126 +80,218 @@ pub fn run(
     cancel: &Cancellation,
     probe: impl Fn(&str, u32) -> AppResult<i64> + Sync,
 ) -> ProbeRun {
+    run_with_progress(nodes, options, cpu, cancel, probe, |_| {})
+}
+
+struct Dispatch {
+    next: usize,
+    active: usize,
+    concurrency: usize,
+    samples: usize,
+    failures: usize,
+    clean_windows: usize,
+    windows: Vec<usize>,
+}
+impl Dispatch {
+    fn new(limit: usize) -> Self {
+        Self {
+            next: 0,
+            active: 0,
+            concurrency: limit,
+            samples: 0,
+            failures: 0,
+            clean_windows: 0,
+            windows: if limit == 0 { vec![] } else { vec![limit] },
+        }
+    }
+    fn observe(&mut self, had_transient: bool, limit: usize) {
+        self.samples += 1;
+        self.failures += usize::from(had_transient);
+        if self.samples < self.concurrency {
+            return;
+        }
+        let previous = self.concurrency;
+        if self.failures * 2 >= self.samples {
+            self.concurrency = (self.concurrency / 2).max(1);
+            self.clean_windows = 0;
+        } else if self.failures == 0 {
+            self.clean_windows += 1;
+            if self.clean_windows == 2 {
+                self.concurrency = (self.concurrency + 2).min(limit);
+                self.clean_windows = 0;
+            }
+        } else {
+            self.clean_windows = 0;
+        }
+        if previous != self.concurrency {
+            self.windows.push(self.concurrency);
+        }
+        self.samples = 0;
+        self.failures = 0;
+    }
+}
+
+pub fn run_with_progress(
+    nodes: &[String],
+    options: &ProbeOptions,
+    cpu: usize,
+    cancel: &Cancellation,
+    probe: impl Fn(&str, u32) -> AppResult<i64> + Sync,
+    on_progress: impl Fn(ProbeProgress) + Sync,
+) -> ProbeRun {
+    let progress = Mutex::new(ProbeProgress {
+        total: nodes.len(),
+        completed: 0,
+        reachable: 0,
+        failed: 0,
+        retries: 0,
+    });
+    on_progress(*progress.lock().unwrap());
     let limit = options.limit(cpu, nodes.len());
-    let mut concurrency = if options.concurrency.is_some() {
-        limit
-    } else {
-        limit.min(8)
-    };
+    let dispatch = Mutex::new(Dispatch::new(limit));
+    let available = Condvar::new();
     let retries = AtomicUsize::new(0);
     let active = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
     let fatal = AtomicBool::new(false);
     let controller_error = Mutex::new(None);
-    let mut measurements = Vec::new();
-    let mut windows = Vec::new();
-    let mut cursor = 0;
-    let mut clean_windows = 0;
-    while cursor < nodes.len()
-        && concurrency > 0
-        && !cancel.is_cancelled()
-        && !fatal.load(Ordering::Acquire)
-    {
-        let end = (cursor + concurrency).min(nodes.len());
-        windows.push(end - cursor);
-        let batch = Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            for name in &nodes[cursor..end] {
-                if cancel.is_cancelled() || fatal.load(Ordering::Acquire) {
-                    break;
-                }
-                let (probe, batch, retries, active, peak, fatal, controller_error) = (
-                    &probe,
-                    &batch,
-                    &retries,
-                    &active,
-                    &peak,
-                    &fatal,
-                    &controller_error,
-                );
-                scope.spawn(move || {
-                    let mut attempts = 0;
-                    let mut had_transient = false;
-                    let outcome = loop {
-                        if let Err(error) = cancel.check() {
-                            break Err(error);
-                        }
-                        if fatal.load(Ordering::Acquire) {
+    let measurements = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..limit {
+            let (
+                probe,
+                on_progress,
+                progress,
+                dispatch,
+                available,
+                retries,
+                active,
+                peak,
+                fatal,
+                controller_error,
+                measurements,
+            ) = (
+                &probe,
+                &on_progress,
+                &progress,
+                &dispatch,
+                &available,
+                &retries,
+                &active,
+                &peak,
+                &fatal,
+                &controller_error,
+                &measurements,
+            );
+            scope.spawn(move || loop {
+                let name = {
+                    let mut state = dispatch.lock().unwrap();
+                    loop {
+                        if cancel.is_cancelled()
+                            || fatal.load(Ordering::Acquire)
+                            || state.next >= nodes.len()
+                        {
                             return;
                         }
-                        if attempts > 0 {
-                            retries.fetch_add(1, Ordering::Relaxed);
+                        if state.active < state.concurrency {
+                            let name = &nodes[state.next];
+                            state.next += 1;
+                            state.active += 1;
+                            break name;
                         }
-                        attempts += 1;
-                        let in_flight = active.fetch_add(1, Ordering::AcqRel) + 1;
-                        peak.fetch_max(in_flight, Ordering::AcqRel);
-                        let result = probe(name, options.timeout_ms);
-                        active.fetch_sub(1, Ordering::AcqRel);
-                        let Err(error) = &result else {
-                            break result;
-                        };
-                        if matches!(
-                            error.code,
-                            ErrorCode::ControllerAuth | ErrorCode::IdentityMismatch
-                        ) {
-                            fatal.store(true, Ordering::Release);
-                            let mut stored = controller_error.lock().unwrap();
-                            if stored.is_none() {
-                                *stored = Some(error.clone());
-                            }
-                            break result;
-                        }
-                        had_transient |= transient(error);
-                        if !transient(error) || attempts > options.retries {
-                            break result;
-                        }
-                        if let Err(error) =
-                            cancel.wait(Duration::from_millis(200u64 << (attempts - 1)))
-                        {
-                            break Err(error);
-                        }
-                        if fatal.load(Ordering::Acquire) {
-                            break result;
-                        }
+                        // Timed waits also observe cancellation when no worker completes.
+                        state = available
+                            .wait_timeout(state, Duration::from_millis(25))
+                            .unwrap()
+                            .0;
+                    }
+                };
+                let mut attempts = 0;
+                let mut had_transient = false;
+                let outcome = loop {
+                    if let Err(error) = cancel.check() {
+                        break Some(Err(error));
+                    }
+                    if fatal.load(Ordering::Acquire) {
+                        break None;
+                    }
+                    if attempts > 0 {
+                        retries.fetch_add(1, Ordering::Relaxed);
+                        let mut progress = progress.lock().unwrap();
+                        progress.retries += 1;
+                        on_progress(*progress);
+                    }
+                    attempts += 1;
+                    let in_flight = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(in_flight, Ordering::AcqRel);
+                    let result = probe(name, options.timeout_ms);
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    let Err(error) = &result else {
+                        break Some(result);
                     };
+                    if matches!(
+                        error.code,
+                        ErrorCode::ControllerAuth | ErrorCode::IdentityMismatch
+                    ) {
+                        fatal.store(true, Ordering::Release);
+                        let mut stored = controller_error.lock().unwrap();
+                        if stored.is_none() {
+                            *stored = Some(error.clone());
+                        }
+                        available.notify_all();
+                        break Some(result);
+                    }
+                    had_transient |= transient(error);
+                    if !transient(error) || attempts > options.retries {
+                        break Some(result);
+                    }
+                    if let Err(error) = cancel.wait(Duration::from_millis(200u64 << (attempts - 1)))
+                    {
+                        break Some(Err(error));
+                    }
+                    if fatal.load(Ordering::Acquire) {
+                        break Some(result);
+                    }
+                };
+                let mut completed = false;
+                if let Some(outcome) = outcome {
                     let (delay_ms, error) = match outcome {
                         Ok(delay) => (Some(delay), None),
                         Err(error) => (None, Some(error)),
                     };
-                    batch.lock().unwrap().push((
-                        ProbeMeasurement {
-                            node: name.clone(),
-                            delay_ms,
-                            error,
-                            attempts,
-                        },
-                        had_transient,
-                    ));
-                });
-            }
-        });
-        let batch = batch.into_inner().unwrap();
-        if options.concurrency.is_none()
-            && end - cursor == concurrency
-            && batch.len() == concurrency
-        {
-            let failed = batch.iter().filter(|(_, transient)| *transient).count();
-            if failed * 2 >= concurrency {
-                concurrency = (concurrency / 2).max(1);
-                clean_windows = 0;
-            } else if failed == 0 {
-                clean_windows += 1;
-                if clean_windows == 2 {
-                    concurrency = (concurrency + 2).min(limit);
-                    clean_windows = 0;
+                    completed = !error
+                        .as_ref()
+                        .is_some_and(|e| e.code == ErrorCode::Cancelled);
+                    let reachable = delay_ms.is_some();
+                    measurements.lock().unwrap().push(ProbeMeasurement {
+                        node: name.clone(),
+                        delay_ms,
+                        error,
+                        attempts,
+                    });
+                    if completed {
+                        // Serialize notifications so counts cannot move backwards.
+                        let mut progress = progress.lock().unwrap();
+                        progress.completed += 1;
+                        if reachable {
+                            progress.reachable += 1;
+                        } else {
+                            progress.failed += 1;
+                        }
+                        on_progress(*progress);
+                    }
                 }
-            } else {
-                clean_windows = 0;
-            }
+                let mut state = dispatch.lock().unwrap();
+                state.active -= 1;
+                if completed && options.concurrency.is_none() {
+                    state.observe(had_transient, limit);
+                }
+                // A completed node immediately frees a slot, independent of slow peers.
+                available.notify_all();
+            });
         }
-        measurements.extend(batch.into_iter().map(|(measurement, _)| measurement));
-        cursor = end;
-    }
+    });
+    let mut measurements = measurements.into_inner().unwrap();
     measurements.sort_by(|a, b| a.node.cmp(&b.node));
     ProbeRun {
         measurements,
@@ -196,7 +299,7 @@ pub fn run(
         retries: retries.into_inner(),
         peak_concurrency: peak.into_inner(),
         concurrency_limit: limit,
-        windows,
+        windows: dispatch.into_inner().unwrap().windows,
         controller_error: controller_error.into_inner().unwrap(),
         history_warning: None,
     }
@@ -211,6 +314,138 @@ mod tests {
 
     fn names(n: usize) -> Vec<String> {
         (0..n).map(|n| n.to_string()).collect()
+    }
+    #[test]
+    fn free_slot_starts_next_node_before_a_slow_peer_finishes() {
+        let (sent, received) = std::sync::mpsc::channel();
+        let received = Mutex::new(received);
+        let report = run(
+            &names(3),
+            &ProbeOptions {
+                concurrency: Some(2),
+                retries: 0,
+                ..Default::default()
+            },
+            2,
+            &Cancellation::new(),
+            |node, _| {
+                if node == "0" {
+                    assert!(
+                        received
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(2))
+                            .is_ok(),
+                        "an idle slot must run node 2 while node 0 is still pending"
+                    );
+                } else if node == "2" {
+                    sent.send(()).unwrap();
+                }
+                Ok(10)
+            },
+        );
+        assert_eq!(report.measurements.len(), 3);
+        assert_eq!(report.peak_concurrency, 2);
+    }
+
+    #[test]
+    fn automatic_scan_uses_its_computed_capacity_immediately() {
+        let started = AtomicUsize::new(0);
+        let report = run(
+            &names(16),
+            &ProbeOptions {
+                retries: 0,
+                ..Default::default()
+            },
+            8,
+            &Cancellation::new(),
+            |_, _| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while started.load(Ordering::SeqCst) < 16 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "automatic scans must not leave available capacity idle"
+                    );
+                    std::thread::yield_now();
+                }
+                Ok(10)
+            },
+        );
+        assert_eq!(report.peak_concurrency, 16);
+    }
+    #[test]
+    fn progress_counts_final_nodes_once_and_reports_retries_separately() {
+        let updates = Mutex::new(Vec::new());
+        let attempts = AtomicUsize::new(0);
+        let report = run_with_progress(
+            &names(2),
+            &ProbeOptions {
+                concurrency: Some(1),
+                retries: 1,
+                ..Default::default()
+            },
+            2,
+            &Cancellation::new(),
+            |name, _| {
+                if name == "1" {
+                    Err(AppError::new(ErrorCode::ProbeFailed, Stage::Probe))
+                } else if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(AppError::new(ErrorCode::Timeout, Stage::Probe))
+                } else {
+                    Ok(20)
+                }
+            },
+            |progress| updates.lock().unwrap().push(progress),
+        );
+        let updates = updates.into_inner().unwrap();
+        assert_eq!(updates[0].completed, 0);
+        assert!(updates.iter().any(|p| p.completed == 0 && p.retries == 1));
+        assert!(updates
+            .windows(2)
+            .all(|pair| pair[0].completed <= pair[1].completed));
+        for progress in &updates {
+            assert_eq!(progress.total, 2);
+            assert_eq!(progress.completed, progress.reachable + progress.failed);
+            assert!(progress.completed <= progress.total);
+        }
+        let last = updates.last().unwrap();
+        assert_eq!(
+            (last.completed, last.reachable, last.failed, last.retries),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(report.measurements.len(), 2);
+    }
+
+    #[test]
+    fn progress_arrives_before_the_slowest_node_in_a_window_finishes() {
+        let (finished, first_result) = std::sync::mpsc::channel();
+        let first_result = Mutex::new(first_result);
+        run_with_progress(
+            &names(2),
+            &ProbeOptions {
+                concurrency: Some(2),
+                retries: 0,
+                ..Default::default()
+            },
+            2,
+            &Cancellation::new(),
+            |name, _| {
+                if name == "1" {
+                    first_result
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap();
+                }
+                Ok(20)
+            },
+            |progress| {
+                if progress.completed == 1 {
+                    finished.send(()).unwrap();
+                }
+            },
+        );
     }
     #[test]
     fn limits_respect_cpu_global_cap_explicit_override_and_empty_input() {
@@ -283,29 +518,31 @@ mod tests {
         }
     }
     #[test]
-    fn automatic_windows_shrink_grow_and_ignore_partial_tail() {
-        let calls = AtomicUsize::new(0);
-        let report = run(
-            &names(31),
-            &ProbeOptions {
-                retries: 0,
-                ..Default::default()
-            },
-            32,
-            &Cancellation::new(),
-            |_, _| {
-                let index = calls.fetch_add(1, Ordering::SeqCst);
-                if index < 12 {
-                    Err(AppError::new(ErrorCode::Timeout, Stage::Probe))
-                } else {
-                    Ok(10)
-                }
-            },
-        );
-        assert_eq!(report.windows, [8, 4, 2, 2, 4, 4, 6, 1]);
-        assert_eq!(report.measurements.len(), 31);
-        assert!(report.peak_concurrency <= 8);
-        assert_eq!(report.concurrency_limit, 31);
+    fn automatic_completion_samples_shrink_grow_and_ignore_partial_tail() {
+        let mut dispatch = Dispatch::new(8);
+        for _ in 0..12 {
+            dispatch.observe(true, 32);
+        }
+        assert_eq!(dispatch.concurrency, 2);
+        for _ in 0..12 {
+            dispatch.observe(false, 32);
+        }
+        assert_eq!(dispatch.concurrency, 6);
+        assert_eq!(dispatch.windows, [8, 4, 2, 4, 6]);
+        for _ in 0..5 {
+            dispatch.observe(true, 32);
+        }
+        assert_eq!(dispatch.concurrency, 6);
+        dispatch.observe(true, 32);
+        assert_eq!(dispatch.concurrency, 3);
+        for _ in 0..100 {
+            dispatch.observe(true, 32);
+        }
+        assert_eq!(dispatch.concurrency, 1);
+        for _ in 0..2000 {
+            dispatch.observe(false, 32);
+        }
+        assert_eq!(dispatch.concurrency, 32);
     }
     #[test]
     fn fixed_parallelism_caps_active_requests_and_retry_does_not_duplicate_nodes() {

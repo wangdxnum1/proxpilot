@@ -27,7 +27,6 @@ impl fmt::Display for ApiEndpoint {
 }
 
 pub struct CoreResponse {
-    pub status: u16,
     pub body: Vec<u8>,
     pub server_pid: Option<u32>,
 }
@@ -107,11 +106,7 @@ impl CoreApi {
                         })
                         .flatten()
                 });
-                CoreResponse {
-                    status,
-                    body,
-                    server_pid,
-                }
+                CoreResponse { body, server_pid }
             }
             ApiEndpoint::NamedPipe(pipe) => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -194,11 +189,7 @@ impl CoreApi {
                                 })?
                                 .to_bytes()
                                 .to_vec();
-                            Ok(CoreResponse {
-                                status,
-                                body,
-                                server_pid,
-                            })
+                            Ok(CoreResponse { body, server_pid })
                         }
                         .await;
                         connection.abort();
@@ -344,12 +335,12 @@ mod tests {
     fn named_pipe_switch_preserves_unicode_body_and_encodes_group_segment() {
         let (endpoint, server) =
             pipe_server(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(), Duration::ZERO);
-        crate::mihomo::switch_group(
-            &backend(endpoint),
-            &CoreApi::new().unwrap(),
-            "组/🛰",
-            "日本 节点🛰",
-        )
+        use crate::switching::SwitchControl;
+        crate::runtime_switch::KernelSwitchControl {
+            backend: &backend(endpoint),
+            api: &CoreApi::new().unwrap(),
+        }
+        .select("组/🛰", "日本 节点🛰")
         .unwrap();
         let request = server.join().unwrap();
         assert!(request.starts_with(&format!(

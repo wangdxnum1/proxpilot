@@ -7,6 +7,13 @@ from cli_transactions import Fixture, EXECUTABLE, remaining, console_break
 
 
 class JsonOutput(unittest.TestCase):
+    def test_text_connection_summary_does_not_echo_proxy_credentials(self):
+        with Fixture([200]) as f:
+            proxy=f"http://private-user:private-password@127.0.0.1:{f.proxy.server_port}"
+            r=subprocess.run(f.command("scan")+["--proxy",proxy],env=f.environment(),capture_output=True,text=True,encoding="utf-8",timeout=10)
+            self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+            self.assertNotIn("private-user",r.stdout)
+            self.assertNotIn("private-password",r.stdout)
     def test_cancel_overrides_prior_partial_controller_error(self):
         import threading
         started,release=threading.Event(),threading.Event()

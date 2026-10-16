@@ -133,11 +133,16 @@ pub fn verify_access_report_with_timeout(
             return report;
         }
     };
-    let spinner = ui::Spinner::start(&format!("实测 {}（第 1/{} 次）", url, n));
+    let spinner = ui::Spinner::start(&format!("实测 {}（第 1/{} 次）", ui::display_url(url), n));
     let mut total = 0.0;
     let mut transport_failed = false;
     for sample in 0..n {
-        spinner.set_text(format!("实测 {}（第 {}/{} 次）", url, sample + 1, n));
+        spinner.set_text(format!(
+            "实测 {}（第 {}/{} 次）",
+            ui::display_url(url),
+            sample + 1,
+            n
+        ));
         match probe.test_detailed(url) {
             Ok((200, seconds)) => {
                 total += seconds;

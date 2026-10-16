@@ -1,6 +1,19 @@
 //! Shared node evidence consumed by terminal, JSON and browse presenters.
 use crate::{mihomo::ProxyInfo, nodeinfo::BillingPolicy};
 use serde_json::{json, Value};
+pub fn endpoint(api: &crate::core_api::ApiEndpoint) -> String {
+    match api {
+        crate::core_api::ApiEndpoint::Http(url) => crate::ui::display_url(url),
+        _ => api.to_string(),
+    }
+}
+pub fn endpoint_text(value: &str) -> String {
+    if reqwest::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+        crate::ui::display_url(value)
+    } else {
+        value.to_string()
+    }
+}
 pub fn node(name: &str, info: &ProxyInfo, policy: &BillingPolicy, current: bool) -> Value {
     let rate = policy.resolve(name);
     json!({"name":name,"protocol":info.ptype,"protocol_source":"kernel_api",

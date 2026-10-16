@@ -387,8 +387,8 @@ fn cmd_clients(args: &Args, supported: bool) -> Result<(), CommandFailure> {
                 "{} [{}]  API={}  出口={}  {}",
                 record.name,
                 be.kind.map(|k| k.name()).unwrap_or("mihomo"),
-                be.api,
-                be.proxy,
+                commands::endpoint(&be.api),
+                ui::display_url(&be.proxy),
                 if active
                     .as_deref()
                     .is_some_and(|r| clients::proxy_matches(&be.proxy, r))
@@ -668,21 +668,29 @@ fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
                 "{} · 内核 {} · {}",
                 be.client,
                 be.version.as_deref().unwrap_or("版本未知"),
-                be.proxy
+                ui::display_url(&be.proxy)
             ),
             scan_output::terminal_width(),
         );
     } else {
         ui::info(&format!("目标客户端：{}", be.client.green().bold()));
-        ui::info(&format!("内核 API：{}（{}）", be.api, be.source));
+        ui::info(&format!(
+            "内核 API：{}（{}）",
+            commands::endpoint(&be.api),
+            be.source
+        ));
         if let Some(v) = &be.version {
             ui::dim(&format!("内核版本 {}", v));
         }
-        ui::info(&format!("代理出口：{}", be.proxy));
+        ui::info(&format!("代理出口：{}", ui::display_url(&be.proxy)));
     }
     if !be.alternatives.is_empty() {
         for (c, a) in &be.alternatives {
-            ui::dim(&format!("同时发现：{}（{}）—— 用 --api 可指定", c, a));
+            ui::dim(&format!(
+                "同时发现：{}（{}）—— 用 --api 可指定",
+                c,
+                commands::endpoint_text(a)
+            ));
         }
     }
     println!();
@@ -1093,11 +1101,18 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
             match current.verification.availability {
                 diagnostics::Availability::Webpage => {
                     let t = current.verification.mean_ms.unwrap_or_default() / 1000.0;
-                    ui::ok(&format!("{} 可访问（平均 {:.2}s）", args.url, t));
+                    ui::ok(&format!(
+                        "{} 可访问（平均 {:.2}s）",
+                        ui::display_url(&args.url),
+                        t
+                    ));
                     0
                 }
                 diagnostics::Availability::IpOnly => {
-                    ui::ok(&format!("{} 可访问（IP 检查通过）", args.url));
+                    ui::ok(&format!(
+                        "{} 可访问（IP 检查通过）",
+                        ui::display_url(&args.url)
+                    ));
                     ui::dim("说明：网页返回 HTTP 403；API 检查通过，但浏览器访问仍需确认");
                     0
                 }
@@ -1115,7 +1130,8 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
                     let cs = c.to_string();
                     ui::fail(&format!(
                         "{} 不可访问（{}）—— 运行 proxpilot fix 自动优选切换",
-                        args.url, cs
+                        ui::display_url(&args.url),
+                        cs
                     ));
                     2
                 }

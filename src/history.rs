@@ -291,6 +291,7 @@ impl HistoryStore {
         }
         Ok(Self { connection })
     }
+    #[cfg(test)]
     pub fn record(
         &mut self,
         scope: &HistoryScope,

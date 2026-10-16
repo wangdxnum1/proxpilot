@@ -67,33 +67,6 @@ pub fn core_alive(proxy: &str) -> bool {
     }
 }
 
-/// 访问判定结果
-#[derive(Debug, Clone)]
-pub enum Verdict {
-    /// 全部 200，平均耗时（秒）
-    Pass(f64),
-    /// chatgpt.com 返回 403，但 api.openai.com IP 检查通过（401）：
-    /// 仅作为备选信号，不能保证浏览器通过 Cloudflare 验证
-    PassIpOnly,
-    /// 不可访问；保留传输类别，HTTP 状态可为空。
-    Fail(AppError),
-}
-
-impl Verdict {
-    pub fn is_ok(&self) -> bool {
-        !matches!(self, Verdict::Fail(_))
-    }
-    pub fn from_report(report: VerificationReport) -> Self {
-        match report.availability {
-            Availability::Webpage => Self::Pass(report.mean_ms.unwrap_or_default() / 1000.0),
-            Availability::IpOnly => Self::PassIpOnly,
-            Availability::Failed => Self::Fail(report.error.unwrap_or_else(|| {
-                AppError::new(ErrorCode::TransportUnknown, Stage::Verification)
-            })),
-        }
-    }
-}
-
 fn is_openai_url(url: &str) -> bool {
     reqwest::Url::parse(url).ok().is_some_and(|url| {
         matches!(url.scheme(), "http" | "https")
@@ -108,10 +81,6 @@ fn is_openai_url(url: &str) -> bool {
 }
 
 /// 实测报告保留状态与失败类别；IP-only 不能冒充网页通过。
-pub fn verify_access_report(proxy: &str, url: &str, samples: usize) -> VerificationReport {
-    verify_access_report_with_timeout(proxy, url, samples, 12000)
-}
-
 pub fn verify_access_report_with_timeout(
     proxy: &str,
     url: &str,
@@ -193,21 +162,6 @@ pub fn verify_access_report_with_timeout(
     report
 }
 
-pub fn verify_access(proxy: &str, url: &str, samples: usize) -> Verdict {
-    verify_access_with_timeout(proxy, url, samples, 12000)
-}
-
-pub fn verify_access_with_timeout(
-    proxy: &str,
-    url: &str,
-    samples: usize,
-    timeout_ms: u32,
-) -> Verdict {
-    Verdict::from_report(verify_access_report_with_timeout(
-        proxy, url, samples, timeout_ms,
-    ))
-}
-
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CurrentVerification {
     pub verification: VerificationReport,
@@ -215,23 +169,6 @@ pub struct CurrentVerification {
     pub stable: bool,
     pub controller_error: Option<AppError>,
     pub history_warning: Option<AppError>,
-}
-
-pub fn verify_recorded_current(
-    be: &Backend,
-    api: &crate::core_api::CoreApi,
-    group: &str,
-    url: &str,
-    samples: usize,
-    timeout_ms: u32,
-) -> Verdict {
-    let result = verify_current_report(be, api, group, url, samples, timeout_ms);
-    if let Some(error) = &result.controller_error {
-        ui::warn(&format!("验证期间控制接口不可用，未归属节点历史：{error}"));
-    } else if !group.is_empty() && !result.stable {
-        ui::warn("验证期间客户端或选择发生变化，未将本轮测量计入节点历史");
-    }
-    Verdict::from_report(result.verification)
 }
 
 pub fn verify_current_report(

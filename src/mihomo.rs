@@ -18,15 +18,7 @@ pub struct ProxyInfo {
     #[serde(default)]
     pub all: Option<Vec<String>>,
     #[serde(default)]
-    pub history: Vec<DelayRecord>,
-    #[serde(default)]
     pub udp: Option<bool>,
-}
-
-#[derive(Deserialize, Clone, Copy)]
-pub struct DelayRecord {
-    #[serde(default)]
-    pub delay: i64,
 }
 
 #[derive(Deserialize)]
@@ -79,9 +71,6 @@ pub fn get_version_detailed(be: &Backend, api: &crate::core_api::CoreApi) -> App
         .map(str::to_string)
         .ok_or_else(|| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))
 }
-pub fn get_version(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
-    text_result(get_version_detailed(be, api))
-}
 pub fn get_mode(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
     text_result(api_json_detailed(be, api, "/configs").and_then(|v| {
         v.get("mode")
@@ -112,10 +101,6 @@ pub fn get_runtime_proxy_detailed(
     error.message = "目标内核没有可用的 mixed/HTTP/SOCKS 代理端口，请用 --proxy 指定".into();
     Err(error)
 }
-pub fn get_runtime_proxy(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
-    text_result(get_runtime_proxy_detailed(be, api))
-}
-
 pub fn probe_delay(
     be: &Backend,
     api: &crate::core_api::CoreApi,
@@ -155,25 +140,6 @@ pub fn probe_delay_detailed(
         .ok_or_else(|| AppError::new(ErrorCode::ProbeFailed, Stage::Probe))
 }
 
-pub fn switch_group(
-    be: &Backend,
-    api: &crate::core_api::CoreApi,
-    group: &str,
-    node: &str,
-) -> Result<(), String> {
-    let path = format!("/proxies/{}", enc_path(group));
-    let body = serde_json::to_vec(&serde_json::json!({"name": node})).map_err(|e| e.to_string())?;
-    let response = api.request(
-        be,
-        reqwest::Method::PUT,
-        &path,
-        Some(body),
-        std::time::Duration::from_secs(10),
-    )?;
-    debug_assert!((200..300).contains(&response.status));
-    Ok(())
-}
-
 /// 百分号编码（用于单个路径段）
 pub fn enc_path(s: &str) -> String {
     enc_impl(s, false)
@@ -203,6 +169,7 @@ mod tests {
     use super::*;
     use crate::core_api::CoreApi;
     use crate::http::test_support::serve;
+    use crate::switching::SwitchControl;
 
     fn backend(api: String) -> Backend {
         Backend {
@@ -227,7 +194,7 @@ mod tests {
         )
         .into_bytes()]);
         assert_eq!(
-            get_version(&backend(url), &CoreApi::new().unwrap()).unwrap(),
+            get_version_detailed(&backend(url), &CoreApi::new().unwrap()).unwrap(),
             "test-core"
         );
         assert!(server.join().unwrap()[0]
@@ -240,14 +207,24 @@ mod tests {
         let (url, server) = serve(vec![
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         ]);
-        assert!(switch_group(&backend(url), &CoreApi::new().unwrap(), "AI服务", "node").is_err());
+        assert!(crate::runtime_switch::KernelSwitchControl {
+            backend: &backend(url),
+            api: &CoreApi::new().unwrap(),
+        }
+        .select("AI服务", "node")
+        .is_err());
         server.join().unwrap();
     }
 
     #[test]
     fn redirected_switch_is_not_reported_as_success() {
         let (url, server) = serve(vec![b"HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()]);
-        assert!(switch_group(&backend(url), &CoreApi::new().unwrap(), "AI服务", "node").is_err());
+        assert!(crate::runtime_switch::KernelSwitchControl {
+            backend: &backend(url),
+            api: &CoreApi::new().unwrap(),
+        }
+        .select("AI服务", "node")
+        .is_err());
         server.join().unwrap();
     }
 }

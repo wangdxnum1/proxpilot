@@ -113,7 +113,7 @@ mod tests {
         ]);
         let result = BrowserProbe::new(&proxy)
             .unwrap()
-            .test("http://browser-test.invalid/page")
+            .test_detailed("http://browser-test.invalid/page")
             .unwrap();
         assert_eq!(result.0, 403);
         let request = server.join().unwrap().remove(0).to_lowercase();
@@ -139,7 +139,13 @@ mod tests {
         ]);
         let probe = BrowserProbe::new(&proxy).unwrap();
         for _ in 0..2 {
-            assert_eq!(probe.test("http://browser-test.invalid/").unwrap().0, 200);
+            assert_eq!(
+                probe
+                    .test_detailed("http://browser-test.invalid/")
+                    .unwrap()
+                    .0,
+                200
+            );
         }
         let requests: Vec<_> = server
             .join()
@@ -163,8 +169,20 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         ]);
         let probe = BrowserProbe::new(&proxy).unwrap();
-        assert_eq!(probe.test("http://browser-test.invalid/").unwrap().0, 403);
-        assert_eq!(probe.test("http://browser-test.invalid/").unwrap().0, 200);
+        assert_eq!(
+            probe
+                .test_detailed("http://browser-test.invalid/")
+                .unwrap()
+                .0,
+            403
+        );
+        assert_eq!(
+            probe
+                .test_detailed("http://browser-test.invalid/")
+                .unwrap()
+                .0,
+            200
+        );
         let requests = server.join().unwrap();
         assert!(requests[2].to_lowercase().contains("chrome/149."));
     }
@@ -178,7 +196,7 @@ mod tests {
         assert_eq!(
             BrowserProbe::new(&proxy)
                 .unwrap()
-                .test("http://browser-test.invalid/start")
+                .test_detailed("http://browser-test.invalid/start")
                 .unwrap()
                 .0,
             200
@@ -195,7 +213,7 @@ mod tests {
         ]);
         let error = BrowserProbe::new(&proxy)
             .unwrap()
-            .test("http://browser-test.invalid/")
+            .test_detailed("http://browser-test.invalid/")
             .unwrap_err();
         let value = serde_json::to_value(error).unwrap();
         assert_eq!(value["code"], "response_transfer");
@@ -214,7 +232,7 @@ mod tests {
         assert_eq!(
             BrowserProbe::new(&proxy)
                 .unwrap()
-                .test("http://browser-test.invalid/")
+                .test_detailed("http://browser-test.invalid/")
                 .unwrap()
                 .0,
             200
@@ -242,7 +260,13 @@ mod tests {
         });
         let probe = BrowserProbe::new(&proxy).unwrap();
         for _ in 0..2 {
-            assert_eq!(probe.test("http://browser-test.invalid/").unwrap().0, 200);
+            assert_eq!(
+                probe
+                    .test_detailed("http://browser-test.invalid/")
+                    .unwrap()
+                    .0,
+                200
+            );
         }
         server.join().unwrap();
     }
@@ -261,7 +285,7 @@ mod tests {
         ]);
         let error = BrowserProbe::new(&proxy)
             .unwrap()
-            .test("https://browser-test.invalid/")
+            .test_detailed("https://browser-test.invalid/")
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ProxyConnect);
         let requests = server.join().unwrap();
@@ -285,7 +309,7 @@ mod tests {
         });
         let error = BrowserProbe::new(&proxy)
             .unwrap()
-            .test("https://tls-test.invalid/path?token=secret-test-value")
+            .test_detailed("https://tls-test.invalid/path?token=secret-test-value")
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Tls);
         let serialized = serde_json::to_string(&error).unwrap();
@@ -304,7 +328,7 @@ mod tests {
             assert_eq!(
                 BrowserProbe::new(&proxy)
                     .unwrap()
-                    .test("http://browser-test.invalid/")
+                    .test_detailed("http://browser-test.invalid/")
                     .unwrap()
                     .0,
                 200
@@ -333,7 +357,7 @@ mod tests {
         });
         assert!(BrowserProbe::new(&proxy)
             .unwrap()
-            .test("https://browser-test.invalid/")
+            .test_detailed("https://browser-test.invalid/")
             .is_err());
         let hello = server.join().unwrap();
         assert_eq!(hello[0], 1); // ClientHello
@@ -427,6 +451,7 @@ pub struct BrowserProbe {
 }
 
 impl BrowserProbe {
+    #[cfg(test)]
     pub fn new(proxy: &str) -> AppResult<Self> {
         Self::new_with_timeout(proxy, 12000)
     }
@@ -502,10 +527,6 @@ impl BrowserProbe {
     }
 
     /// 最多两个浏览器配置共享配置的整体超时；耗时包含候补请求。
-    pub fn test(&self, url: &str) -> AppResult<(u16, f64)> {
-        self.test_detailed(url)
-    }
-
     pub fn test_detailed(&self, url: &str) -> AppResult<(u16, f64)> {
         self.test_with_cancellation(url, &crate::operation::Cancellation::global())
     }

@@ -4,6 +4,41 @@ use std::fmt;
 
 pub type AppResult<T> = Result<T, AppError>;
 
+/// Localized detail is for the local text UI; only `error` enters machine output.
+#[derive(Debug)]
+pub struct CommandFailure {
+    pub error: AppError,
+    detail: String,
+}
+impl CommandFailure {
+    pub fn context(code: ErrorCode, stage: Stage, detail: impl Into<String>) -> Self {
+        Self {
+            error: AppError::new(code, stage),
+            detail: detail.into(),
+        }
+    }
+    pub fn exit_code(&self) -> i32 {
+        if self.error.code == ErrorCode::Cancelled {
+            130
+        } else {
+            1
+        }
+    }
+}
+impl From<AppError> for CommandFailure {
+    fn from(error: AppError) -> Self {
+        Self {
+            detail: error.to_string(),
+            error,
+        }
+    }
+}
+impl fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {

@@ -35,7 +35,7 @@ struct ProxiesMap {
     proxies: HashMap<String, ProxyInfo>,
 }
 
-fn api_json(be: &Backend, api: &crate::core_api::CoreApi, path: &str) -> Result<Value, String> {
+fn api_json_detailed(be: &Backend, api: &crate::core_api::CoreApi, path: &str) -> AppResult<Value> {
     let response = api.request(
         be,
         reqwest::Method::GET,
@@ -43,18 +43,20 @@ fn api_json(be: &Backend, api: &crate::core_api::CoreApi, path: &str) -> Result<
         None,
         std::time::Duration::from_secs(10),
     )?;
-    serde_json::from_slice(&response.body).map_err(|_| "API JSON 解析失败".into())
+    serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))
 }
-
+fn text_result<T>(result: AppResult<T>) -> Result<T, String> {
+    result
+        .inspect_err(crate::report::error)
+        .map_err(|error| error.to_string())
+}
 pub fn get_proxies(
     be: &Backend,
     api: &crate::core_api::CoreApi,
 ) -> Result<HashMap<String, ProxyInfo>, String> {
-    get_proxies_detailed(be, api)
-        .map(|(proxies, _)| proxies)
-        .map_err(Into::into)
+    text_result(get_proxies_detailed(be, api).map(|(proxies, _)| proxies))
 }
-
 pub fn get_proxies_detailed(
     be: &Backend,
     api: &crate::core_api::CoreApi,
@@ -70,25 +72,29 @@ pub fn get_proxies_detailed(
         .map_err(|_| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))?;
     Ok((parsed.proxies, response.server_pid))
 }
-
-pub fn get_version(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
-    api_json(be, api, "/version")?
+pub fn get_version_detailed(be: &Backend, api: &crate::core_api::CoreApi) -> AppResult<String> {
+    api_json_detailed(be, api, "/version")?
         .get("version")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| "响应不是有效的 mihomo 版本信息".into())
+        .ok_or_else(|| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))
 }
-
+pub fn get_version(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
+    text_result(get_version_detailed(be, api))
+}
 pub fn get_mode(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
-    api_json(be, api, "/configs")?
-        .get("mode")
-        .and_then(Value::as_str)
-        .map(|mode| mode.to_ascii_lowercase())
-        .ok_or("内核未提供代理模式".into())
+    text_result(api_json_detailed(be, api, "/configs").and_then(|v| {
+        v.get("mode")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| AppError::new(ErrorCode::InvalidResponse, Stage::Controller))
+    }))
 }
-
-pub fn get_runtime_proxy(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
-    let value = api_json(be, api, "/configs")?;
+pub fn get_runtime_proxy_detailed(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+) -> AppResult<String> {
+    let value = api_json_detailed(be, api, "/configs")?;
     for (name, scheme) in [
         ("mixed-port", "http"),
         ("port", "http"),
@@ -102,7 +108,12 @@ pub fn get_runtime_proxy(be: &Backend, api: &crate::core_api::CoreApi) -> Result
             return Ok(format!("{}://127.0.0.1:{}", scheme, port));
         }
     }
-    Err("目标内核没有可用的 mixed/HTTP/SOCKS 代理端口，请用 --proxy 指定".into())
+    let mut error = AppError::new(ErrorCode::InvalidResponse, Stage::Controller);
+    error.message = "目标内核没有可用的 mixed/HTTP/SOCKS 代理端口，请用 --proxy 指定".into();
+    Err(error)
+}
+pub fn get_runtime_proxy(be: &Backend, api: &crate::core_api::CoreApi) -> Result<String, String> {
+    text_result(get_runtime_proxy_detailed(be, api))
 }
 
 pub fn probe_delay(

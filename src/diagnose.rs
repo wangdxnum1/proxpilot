@@ -82,13 +82,16 @@ fn history_summary() -> AppResult<Value> {
 fn unavailable() -> AppError {
     AppError::new(ErrorCode::StateUnavailable, Stage::State)
 }
-pub fn collect(args: &Args) -> Value {
+pub fn collect(args: &Args) -> AppResult<Value> {
+    let cancel = crate::operation::Cancellation::global();
+    cancel.check()?;
     let mut aliases = Aliases::default();
     let mut warnings = Vec::<AppError>::new();
     let dependencies: Value =
         serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/provenance.json")))
             .expect("embedded provenance");
     let source_integrity = source_integrity(&dependencies, Path::new("."));
+    cancel.check()?;
     let api = crate::core_api::CoreApi::new().ok();
     let paths = crate::clients::DiscoveryPaths::current().ok();
     let records = if let (Some(api), Some(paths)) = (&api, &paths) {
@@ -104,10 +107,12 @@ pub fn collect(args: &Args) -> Value {
     } else {
         vec![]
     };
+    cancel.check()?;
     let active = crate::sysproxy::registry_proxy_server();
     let enabled = crate::sysproxy::proxy_enabled();
     let mut clients = Vec::new();
     for record in records {
+        cancel.check()?;
         if let (Some(be), Some(api)) = (record.backend, api.as_ref()) {
             let identity = be.kind.map(|k| k.name()).unwrap_or("mihomo");
             let endpoint = aliases.get("endpoint", &be.api.to_string());
@@ -130,6 +135,7 @@ pub fn collect(args: &Args) -> Value {
             clients.push(json!({"available":false,"reason":"controller_unavailable"}));
         }
     }
+    cancel.check()?;
     let recovery = match crate::switching::inspect_recovery() {
         Ok(Some(r)) => {
             json!({"pending":true,"committed":r.committed,"group":aliases.get("group",&r.group),"original":r.original.map(|n|aliases.get("node",&n)),"expected":aliases.get("node",&r.expected),"profile":r.profile.map(|p|aliases.get("profile",&p.to_string()))})
@@ -147,7 +153,10 @@ pub fn collect(args: &Args) -> Value {
     let partial = clients.is_empty()
         || clients.iter().any(|c| c["available"] != true)
         || !warnings.is_empty();
-    json!({"schema_version":1,"partial":partial,"program":{"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH},"dependencies":dependencies,"source_integrity":source_integrity,"clients":clients,"system_proxy":{"enabled":enabled},"recovery":recovery,"history":history,"warnings":warnings})
+    cancel.check()?;
+    Ok(
+        json!({"schema_version":1,"partial":partial,"program":{"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH},"dependencies":dependencies,"source_integrity":source_integrity,"clients":clients,"system_proxy":{"enabled":enabled},"recovery":recovery,"history":history,"warnings":warnings}),
+    )
 }
 pub fn source_integrity(dependencies: &Value, root: &Path) -> Value {
     let package = root.join("vendor/btls-sys/prebuilt/x86_64-pc-windows-msvc");
@@ -176,6 +185,7 @@ pub fn source_integrity(dependencies: &Value, root: &Path) -> Value {
     json!({"available":true,"scope":"source_files","verified":verified})
 }
 pub fn write_report(path: &Path, overwrite: bool, value: &Value) -> AppResult<()> {
+    crate::operation::Cancellation::global().check()?;
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| unavailable())?;
     bytes.push(b'\n');
     let mut options = std::fs::OpenOptions::new();

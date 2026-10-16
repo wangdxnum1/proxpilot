@@ -7,6 +7,25 @@ from cli_transactions import Fixture, EXECUTABLE, remaining, console_break
 
 
 class JsonOutput(unittest.TestCase):
+    def test_cancel_overrides_prior_partial_controller_error(self):
+        import threading
+        started,release=threading.Event(),threading.Event()
+        with Fixture([200]) as f:
+            f.probe_status=503
+            def pending():
+                if len(f.delay_queries)==2: started.set();release.wait(10)
+            f.delay_gate=pending
+            p=f.background("scan","--json","--concurrency","1","--retries","0")
+            try:
+                self.assertTrue(started.wait(8))
+                console_break(p.pid);release.set()
+                out,err=p.communicate(timeout=10)
+                d=self.document(subprocess.CompletedProcess([],p.returncode,out,err),"scan",130)
+                self.assertEqual(d["error"]["code"],"cancelled")
+            finally:
+                release.set()
+                if p.poll() is None: p.kill()
+                p.communicate(timeout=5)
     def document(self, result, command, code=0):
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         document = json.loads(result.stdout)
@@ -49,6 +68,42 @@ class JsonOutput(unittest.TestCase):
     def test_option_value_named_watch_is_not_the_command(self):
         with Fixture([200]) as f:
             self.document(f.run("--secret","watch","nodes","--json"),"nodes")
+
+    def test_output_permission_failure_is_not_success(self):
+        from pathlib import Path
+        with Fixture([200]) as f:
+            path=Path(f.temporary.name)/"readonly-output.txt"
+            path.write_bytes(b"preserve")
+            with path.open("rb") as output:
+                r=subprocess.run(f.command("nodes","--json"),env=f.environment(),stdout=output,stderr=subprocess.PIPE,timeout=10)
+            self.assertEqual(r.returncode,1,r.stderr)
+            self.assertEqual(path.read_bytes(),b"preserve")
+
+    def test_domain_errors_preserve_their_typed_category(self):
+        from pathlib import Path
+        with Fixture([200]) as f:
+            for arguments in [("scan",),("use","target")]:
+                r=subprocess.run(f.command(*arguments,"--json")+["--group","missing"],env=f.environment(),capture_output=True,text=True,encoding="utf-8",timeout=10)
+                e=self.document(r,arguments[0],1)["error"]
+                self.assertEqual((e["code"],e["stage"],e["retryable"]),("invalid_input","configuration",False))
+        with Fixture([200]) as f:
+            f.invalid_proxies=True
+            e=self.document(f.run("nodes","--json"),"nodes",1)["error"]
+            self.assertEqual((e["code"],e["stage"],e["retryable"]),("invalid_response","controller",False))
+        with Fixture([200]) as f:
+            path=Path(f.temporary.name)/"ProxPilot/history.sqlite3";path.parent.mkdir();path.write_bytes(b"damaged")
+            e=self.document(f.run("history","--json"),"history",1)["error"]
+            self.assertEqual((e["code"],e["stage"],e["retryable"]),("state_unavailable","state",False))
+        with Fixture([200]) as f:
+            e=self.document(f.run("nodes","--client","cutecloud","--json"),"nodes",1)["error"]
+            self.assertEqual((e["code"],e["stage"],e["retryable"]),("identity_mismatch","discovery",False))
+
+    def test_invalid_node_and_empty_billing_scope_are_input_errors(self):
+        with Fixture([200]) as f:
+            for arguments in [("info","missing"),("nodes","--max-rate","1"),("scan","--max-rate","1")]:
+                with self.subTest(arguments=arguments):
+                    e=self.document(f.run(*arguments,"--json"),arguments[0],1)["error"]
+                    self.assertEqual((e["code"],e["stage"],e["retryable"]),("invalid_input","configuration",False))
 
     def test_validation_failure_retains_rollback(self):
         with Fixture([403]) as f:

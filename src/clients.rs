@@ -1,3 +1,4 @@
+use crate::diagnostics::{CommandFailure, ErrorCode, Stage};
 use crate::{
     client_config::{self, ClientKind, ClientSelection},
     core_api::{ApiEndpoint, CoreApi},
@@ -203,20 +204,27 @@ pub fn validate_explicit_identity(
 fn verify(be: Backend, api: &CoreApi) -> Result<Backend, String> {
     verify_with_proxy(be, api, None)
 }
-fn verify_with_proxy(
+fn verify_with_proxy(be: Backend, api: &CoreApi, proxy: Option<&str>) -> Result<Backend, String> {
+    verify_with_proxy_detailed(be, api, proxy).map_err(|failure| failure.to_string())
+}
+fn verify_with_proxy_detailed(
     mut be: Backend,
     api: &CoreApi,
     proxy: Option<&str>,
-) -> Result<Backend, String> {
+) -> Result<Backend, CommandFailure> {
     if let ApiEndpoint::Http(url) = &be.api {
-        validate_endpoint_identity(be.kind, url)?;
+        validate_endpoint_identity(be.kind, url).map_err(|detail| {
+            CommandFailure::context(ErrorCode::IdentityMismatch, Stage::Discovery, detail)
+        })?;
     }
-    be.version = Some(crate::mihomo::get_version(&be, api)?);
-    be.proxy = proxy
-        .map(|p| Ok(p.to_string()))
-        .unwrap_or_else(|| crate::mihomo::get_runtime_proxy(&be, api))?;
+    be.version = Some(crate::mihomo::get_version_detailed(&be, api)?);
+    be.proxy = match proxy {
+        Some(value) => value.to_string(),
+        None => crate::mihomo::get_runtime_proxy_detailed(&be, api)?,
+    };
     Ok(be)
 }
+
 pub fn discover(api: &CoreApi, paths: &DiscoveryPaths) -> Vec<DiscoveryRecord> {
     discover_with_secret(api, paths, None)
 }
@@ -508,19 +516,23 @@ pub fn resolve_backend(
     args: &Args,
     api: &CoreApi,
     paths: &DiscoveryPaths,
-) -> Result<Backend, String> {
+) -> Result<Backend, CommandFailure> {
     if let Some(url) = &args.api {
-        let (url, local, _) = http_endpoint(url)?;
+        let (url, local, _) = http_endpoint(url).map_err(|detail| {
+            CommandFailure::context(ErrorCode::InvalidInput, Stage::Configuration, detail)
+        })?;
         let kind = if local { identify_endpoint(&url) } else { None };
         let expected = match args.client {
-            Some(ClientSelection::Explicit(k)) => Some(k),
+            Some(ClientSelection::Explicit(kind)) => Some(kind),
             _ => None,
         };
-        validate_explicit_identity(expected, local, kind)?;
+        validate_explicit_identity(expected, local, kind).map_err(|detail| {
+            CommandFailure::context(ErrorCode::IdentityMismatch, Stage::Discovery, detail)
+        })?;
         let mut be = Backend {
             kind,
             client: kind
-                .map(|k| k.display_name().to_string())
+                .map(|k| k.display_name().into())
                 .unwrap_or_else(|| "指定的 mihomo 内核".into()),
             api: url.into(),
             secret: args.secret.clone().or_else(|| {
@@ -532,33 +544,39 @@ pub fn resolve_backend(
             version: None,
             alternatives: vec![],
         };
-        be.version = Some(crate::mihomo::get_version(&be, api)?);
-        be.proxy = args
-            .proxy
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(|| crate::mihomo::get_runtime_proxy(&be, api))?;
+        be.version = Some(crate::mihomo::get_version_detailed(&be, api)?);
+        be.proxy = match &args.proxy {
+            Some(proxy) => proxy.clone(),
+            None => crate::mihomo::get_runtime_proxy_detailed(&be, api)?,
+        };
         return Ok(be);
     }
-    let selection = choose_selection(args.client, args.detect, &client_config::config_path()?)?;
+    let path = client_config::config_path().map_err(|detail| {
+        CommandFailure::context(ErrorCode::StateUnavailable, Stage::State, detail)
+    })?;
+    let selection = choose_selection(args.client, args.detect, &path).map_err(|detail| {
+        CommandFailure::context(ErrorCode::StateUnavailable, Stage::State, detail)
+    })?;
     let mut be = match selection {
         ClientSelection::Explicit(kind) => {
-            let mut be = configured(kind, paths)?;
+            let mut be = configured(kind, paths).map_err(|detail| {
+                CommandFailure::context(ErrorCode::ClientUnavailable, Stage::Discovery, detail)
+            })?;
             if args.secret.is_some() {
                 be.secret = args.secret.clone();
             }
-            verify_with_proxy(be, api, args.proxy.as_deref())?
+            verify_with_proxy_detailed(be, api, args.proxy.as_deref())?
         }
         ClientSelection::Auto => {
             let records = discover_with_secret(api, paths, args.secret.as_deref());
             let active = if crate::sysproxy::proxy_enabled() {
-                Some(crate::sysproxy::registry_proxy_server().ok_or(
-                    "系统代理已开启，但无法读取代理服务器地址；请检查系统代理设置，或用 --client / --api 显式指定目标",
-                )?)
+                Some(crate::sysproxy::registry_proxy_server().ok_or_else(||CommandFailure::context(ErrorCode::StateUnavailable,Stage::Discovery,"系统代理已开启，但无法读取代理服务器地址；请检查系统代理设置，或用 --client / --api 显式指定目标"))?)
             } else {
                 None
             };
-            select_auto(&records, active.as_deref())?
+            select_auto(&records, active.as_deref()).map_err(|detail| {
+                CommandFailure::context(ErrorCode::ClientUnavailable, Stage::Discovery, detail)
+            })?
         }
     };
     if let Some(proxy) = &args.proxy {
@@ -566,6 +584,7 @@ pub fn resolve_backend(
     }
     Ok(be)
 }
+
 pub fn refresh(be: &Backend, args: &Args, api: &CoreApi) -> Result<Backend, String> {
     if args.api.is_some() || be.kind.is_none() {
         return verify_with_proxy(be.clone(), api, args.proxy.as_deref());

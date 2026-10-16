@@ -17,6 +17,16 @@ pub struct Backend {
     pub alternatives: Vec<(String, String)>,
 }
 
-pub fn detect(api: &CoreApi, args: &Args) -> Result<Backend, String> {
-    crate::clients::resolve_backend(args, api, &crate::clients::DiscoveryPaths::current()?)
+pub fn detect(api: &CoreApi, args: &Args) -> Result<Backend, crate::diagnostics::CommandFailure> {
+    crate::clients::resolve_backend(
+        args,
+        api,
+        &crate::clients::DiscoveryPaths::current().map_err(|detail| {
+            crate::diagnostics::CommandFailure::context(
+                crate::diagnostics::ErrorCode::StateUnavailable,
+                crate::diagnostics::Stage::Discovery,
+                detail,
+            )
+        })?,
+    )
 }

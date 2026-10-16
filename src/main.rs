@@ -89,6 +89,7 @@ fn exit(code: i32) -> ! {
 use colored::Colorize;
 
 use detect::Backend;
+use diagnostics::{AppError, AppResult, CommandFailure, ErrorCode, Stage};
 
 #[derive(Clone)]
 pub struct Args {
@@ -344,7 +345,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
     Ok(args)
 }
 
-fn cmd_clients(args: &Args, supported: bool) -> Result<(), String> {
+fn cmd_clients(args: &Args, supported: bool) -> Result<(), CommandFailure> {
     if supported {
         report::data(serde_json::json!({"supported":["cutecloud","clash-verge","vvcloud","auto"]}));
         println!("cutecloud    CuteCloud    HTTP API；支持选择记忆同步");
@@ -353,7 +354,9 @@ fn cmd_clients(args: &Args, supported: bool) -> Result<(), String> {
         println!("auto         自动选择    系统代理开启时要求唯一匹配；关闭时要求唯一可用内核");
         return Ok(());
     }
-    let api = core_api::CoreApi::new()?;
+    let api = core_api::CoreApi::new().map_err(|detail| {
+        CommandFailure::context(ErrorCode::StateUnavailable, Stage::Configuration, detail)
+    })?;
     let records = if args.api.is_some() {
         vec![clients::DiscoveryRecord {
             name: "explicit".into(),
@@ -361,7 +364,12 @@ fn cmd_clients(args: &Args, supported: bool) -> Result<(), String> {
             error: None,
         }]
     } else {
-        clients::discover(&api, &clients::DiscoveryPaths::current()?)
+        clients::discover(
+            &api,
+            &clients::DiscoveryPaths::current().map_err(|detail| {
+                CommandFailure::context(ErrorCode::StateUnavailable, Stage::Discovery, detail)
+            })?,
+        )
     };
     report::data(
         serde_json::json!({"clients":records.iter().map(|r|serde_json::json!({"client":r.backend.as_ref().map(commands::backend),"available":r.backend.is_some(),"error":if r.backend.is_none(){Some(diagnostics::AppError::new(diagnostics::ErrorCode::ClientUnavailable,diagnostics::Stage::Discovery))}else{None}})).collect::<Vec<_>>()}),
@@ -402,7 +410,11 @@ fn cmd_clients(args: &Args, supported: bool) -> Result<(), String> {
     if available {
         Ok(())
     } else {
-        Err("未发现可用客户端".into())
+        Err(CommandFailure::context(
+            ErrorCode::ClientUnavailable,
+            Stage::Discovery,
+            "未发现可用客户端",
+        ))
     }
 }
 fn cmd_config(command: &ConfigCommand, dry_run: bool) -> Result<(), String> {
@@ -419,7 +431,7 @@ fn cmd_config(command: &ConfigCommand, dry_run: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_history(clear: bool, dry_run: bool) -> Result<(), String> {
+fn cmd_history(clear: bool, dry_run: bool) -> AppResult<()> {
     if clear && dry_run {
         report::data(serde_json::json!({"cleared":false,"dry_run":true}));
         ui::dim("dry-run：将清理本工具的测量历史；未执行");
@@ -645,7 +657,8 @@ fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
     let be = match detect::detect(&agent, args) {
         Ok(b) => b,
         Err(e) => {
-            ui::fail(&e);
+            report::error(&e.error);
+            ui::fail(&e.to_string());
             return Err(1);
         }
     };
@@ -676,14 +689,20 @@ fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
     Ok((be, agent))
 }
 
-fn runtime_group_args(be: &Backend, api: &core_api::CoreApi, args: &Args) -> Result<Args, String> {
-    let proxies = mihomo::get_proxies(be, api)?;
+fn runtime_group_args(
+    be: &Backend,
+    api: &core_api::CoreApi,
+    args: &Args,
+) -> Result<Args, CommandFailure> {
+    let proxies = mihomo::get_proxies_detailed(be, api)?.0;
     let saved = if args.group.is_empty() {
         appstate::current_group(be)
     } else {
         None
     };
-    group_args_from_proxies(&proxies, args, saved.as_deref())
+    group_args_from_proxies(&proxies, args, saved.as_deref()).map_err(|detail| {
+        CommandFailure::context(ErrorCode::InvalidInput, Stage::Configuration, detail)
+    })
 }
 fn group_args_from_proxies(
     proxies: &std::collections::HashMap<String, mihomo::ProxyInfo>,
@@ -876,6 +895,10 @@ fn cmd_nodes(be: &Backend, api: &core_api::CoreApi, args: &Args) -> i32 {
         "协议来自内核；倍率来自名称或已识别的订阅提示；线路、家宽和用途标签来自名称，未实测验证。",
     );
     if selected.names.is_empty() {
+        report::error(&AppError::new(
+            ErrorCode::InvalidInput,
+            Stage::Configuration,
+        ));
         1
     } else {
         0
@@ -890,6 +913,10 @@ fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i
         }
     };
     let Some(live) = proxies.get(name).filter(|p| checker::is_real_node(p, name)) else {
+        report::error(&AppError::new(
+            ErrorCode::InvalidInput,
+            Stage::Configuration,
+        ));
         ui::fail("未找到此真实节点；用 nodes 查看名称（含空格请加引号）");
         return 1;
     };
@@ -899,6 +926,10 @@ fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i
             .and_then(|p| p.all.as_ref())
             .is_some_and(|members| members.iter().any(|n| n == name))
     {
+        report::error(&AppError::new(
+            ErrorCode::InvalidInput,
+            Stage::Configuration,
+        ));
         ui::fail("节点不属于指定策略组");
         return 1;
     }
@@ -1126,6 +1157,10 @@ fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 
     let members = selected.names;
     if members.is_empty() {
         scope.print_current(&members, &[]);
+        report::error(&AppError::new(
+            ErrorCode::InvalidInput,
+            Stage::Configuration,
+        ));
         ui::fail("没有符合条件的真实节点，请检查倍率限制或策略组");
         return 1;
     }
@@ -1584,7 +1619,15 @@ fn cmd_use(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args, node: &s
     }
 }
 
-fn cmd_recovery_record(action: RecoveryAction) -> Result<(), String> {
+fn cmd_recovery_preview(action: RecoveryAction) -> AppResult<()> {
+    let record = switching::inspect_recovery()?;
+    report::data(serde_json::json!({"dry_run":true,"action":match action {
+        RecoveryAction::Inspect=>"inspect",RecoveryAction::Retry=>"retry",RecoveryAction::Discard=>"discard"
+    },"record":record}));
+    ui::info("dry-run：仅预览恢复记录，未访问控制接口、恢复节点/系统代理或删除记录");
+    Ok(())
+}
+fn cmd_recovery_record(action: RecoveryAction) -> AppResult<()> {
     match action {
         RecoveryAction::Inspect => match switching::inspect_recovery()? {
             Some(record) => {
@@ -1665,7 +1708,8 @@ fn cmd_watch(initial: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -
         return match runtime_group_args(initial, agent, args) {
             Ok(resolved) => cmd_scan(initial, agent, &resolved),
             Err(error) => {
-                ui::fail(&error);
+                report::error(&error.error);
+                ui::fail(&error.to_string());
                 if operation::Cancellation::global().is_cancelled() {
                     130
                 } else {
@@ -1711,31 +1755,42 @@ fn run_main() {
         ui::fail(&e);
         exit(1)
     });
-    let static_result = match &args.cmd {
-        Cmd::Diagnose => Some((|| -> Result<(), String> {
-            let value = diagnose::collect(&args);
+    if let Err(error) = operation::Cancellation::global().check() {
+        report::error(&error);
+        exit(130);
+    }
+    let static_result: Option<Result<(), CommandFailure>> = match &args.cmd {
+        Cmd::Diagnose => Some((|| -> Result<(), CommandFailure> {
+            let value = diagnose::collect(&args)?;
             if let Some(path) = &args.output {
-                diagnose::write_report(path, args.overwrite, &value).map_err(|e| {
-                    report::error(&e);
-                    e.to_string()
-                })?;
+                diagnose::write_report(path, args.overwrite, &value)?;
             }
             report::data(&value);
             println!("{}", serde_json::to_string_pretty(&value).unwrap());
             Ok(())
         })()),
         Cmd::Clients(s) => Some(cmd_clients(&args, *s)),
-        Cmd::Config(c) => Some(cmd_config(c, args.dry_run)),
-        Cmd::History(clear) => Some(cmd_history(*clear, args.dry_run)),
+        Cmd::Config(c) => Some(cmd_config(c, args.dry_run).map_err(|detail| {
+            CommandFailure::context(ErrorCode::StateUnavailable, Stage::State, detail)
+        })),
+        Cmd::History(clear) => Some(cmd_history(*clear, args.dry_run).map_err(Into::into)),
+        Cmd::Recover(action) if args.dry_run => {
+            Some(cmd_recovery_preview(*action).map_err(Into::into))
+        }
         Cmd::Recover(action @ (RecoveryAction::Inspect | RecoveryAction::Discard)) => {
-            Some(cmd_recovery_record(*action))
+            Some(cmd_recovery_record(*action).map_err(Into::into))
         }
         _ => None,
     };
     if let Some(result) = static_result {
-        if let Err(e) = result {
-            ui::fail(&e);
-            exit(1);
+        if let Err(error) = operation::Cancellation::global().check() {
+            report::error(&error);
+            exit(130);
+        }
+        if let Err(failure) = result {
+            report::error(&failure.error);
+            ui::fail(&failure.to_string());
+            exit(failure.exit_code());
         }
         return;
     }
@@ -1759,7 +1814,8 @@ fn run_main() {
         args
     } else {
         runtime_group_args(&be, &agent, &args).unwrap_or_else(|e| {
-            ui::fail(&e);
+            report::error(&e.error);
+            ui::fail(&e.to_string());
             exit(if operation::Cancellation::global().is_cancelled() {
                 130
             } else {

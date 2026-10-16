@@ -3,9 +3,31 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from cli_transactions import Fixture, EXECUTABLE, remaining
+from cli_transactions import Fixture, EXECUTABLE, remaining, console_break
+import threading
 
 class Diagnose(unittest.TestCase):
+    def test_cancelled_collection_exits_130_and_creates_no_file(self):
+        started,release=threading.Event(),threading.Event()
+        def pending(): started.set();release.wait(10)
+        with Fixture([200]) as f:
+            f.proxies_gate=pending
+            output=Path(f.temporary.name)/"cancelled-report.json"
+            process=f.background("diagnose","--json","--output",str(output))
+            try:
+                self.assertTrue(started.wait(8))
+                console_break(process.pid)
+                release.set()
+                stdout,stderr=process.communicate(timeout=10)
+                self.assertEqual(process.returncode,130,stdout+stderr)
+                d=json.loads(stdout)
+                self.assertTrue(d["cancelled"])
+                self.assertEqual(d["error"]["code"],"cancelled")
+                self.assertFalse(output.exists())
+            finally:
+                release.set()
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
     def test_anonymous_readonly_report_and_file_protection(self):
         with Fixture([200]) as f:
             secrets=["SECRET-alpha-123", "password-6789", "e99bca34-18de-4800-9696-5399bbd9bc19", "Cookie-x=y", "C:\\Users\\PrivatePerson", "https://subscription.invalid/token"]

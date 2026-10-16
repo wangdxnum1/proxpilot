@@ -10,6 +10,7 @@ use std::sync::{
 
 static JSON: AtomicBool = AtomicBool::new(false);
 static CLOSED: AtomicBool = AtomicBool::new(false);
+static OUTPUT_FAILED: AtomicBool = AtomicBool::new(false);
 static EVENTS: AtomicBool = AtomicBool::new(false);
 static DATA: Mutex<Value> = Mutex::new(Value::Null);
 static ERROR: Mutex<Option<AppError>> = Mutex::new(None);
@@ -43,7 +44,12 @@ fn write(bytes: &[u8]) -> bool {
         .lock()
         .write_all(bytes)
         .and_then(|_| io::stdout().flush());
-    if result.is_err() {
+    if let Err(error) = result {
+        if error.kind() != io::ErrorKind::BrokenPipe
+            && !matches!(error.raw_os_error(), Some(109 | 232 | 233))
+        {
+            OUTPUT_FAILED.store(true, Ordering::Release);
+        }
         CLOSED.store(true, Ordering::Release);
         return false;
     }
@@ -65,11 +71,13 @@ pub fn warning(value: &AppError) {
 }
 pub fn finish(command: &str, code: i32) -> i32 {
     if command == "watch" && EVENTS.load(Ordering::Acquire) {
-        return if closed() { 0 } else { code };
+        return output_exit(code);
     }
     if machine() {
         let error = if code == 0 {
             None
+        } else if code == 130 {
+            Some(AppError::new(ErrorCode::Cancelled, Stage::State))
         } else {
             ERROR.lock().unwrap().clone().or_else(|| {
                 Some(AppError::new(
@@ -107,7 +115,12 @@ pub fn finish(command: &str, code: i32) -> i32 {
             write(&bytes);
         }
     }
-    if closed() {
+    output_exit(code)
+}
+fn output_exit(code: i32) -> i32 {
+    if OUTPUT_FAILED.load(Ordering::Acquire) {
+        1
+    } else if closed() {
         0
     } else {
         code

@@ -57,6 +57,9 @@ class Fixture:
         self.probe_status = 200
         self.health_failure_after_probe = False
         self.nodes = ["original", "target"]
+        self.invalid_proxies = False
+        self.proxies_gate = None
+        self.delay_gate = None
         self.after_health_state_reads = 0
         self.change_before_operation = False
         self.changed_before_operation = threading.Event()
@@ -86,6 +89,10 @@ class Fixture:
                 if path == "/version": self.reply({"version": "fixture"}, 503 if fixture.health_failure_after_probe and fixture.delay_queries else 200)
                 elif path == "/configs": self.reply({"mode": "rule", "mixed-port": fixture.proxy.server_port})
                 elif path == "/proxies":
+                    if fixture.proxies_gate: fixture.proxies_gate()
+                    if fixture.invalid_proxies:
+                        self.reply("not an object")
+                        return
                     if fixture.proxy_requests == 1:
                         fixture.after_health_state_reads += 1
                         if fixture.fail_prepare_once and fixture.after_health_state_reads == 2:
@@ -106,6 +113,7 @@ class Fixture:
                         fixture.delay_active += 1
                         fixture.delay_peak = max(fixture.delay_peak, fixture.delay_active)
                     time.sleep(0.03)
+                    if fixture.delay_gate: fixture.delay_gate()
                     with fixture.mutex: fixture.delay_active -= 1
                     if truncate:
                         self.send_response(200)
@@ -488,17 +496,25 @@ class Transactions(unittest.TestCase):
             self.assertTrue(all(urllib.parse.parse_qs(urllib.parse.urlsplit(q).query)["timeout"] == ["777"] for q in fixture.delay_queries))
 
     def test_website_timeout_is_applied_without_retrying_failed_sample(self):
+        release = threading.Event()
         def pending():
-            time.sleep(1)
+            release.wait(15)
             return 200
         with Fixture([pending]) as fixture:
-            started = time.monotonic()
-            result = fixture.run("use", "target", "--verify-timeout-ms", "100", "--retries", "3")
-            elapsed = time.monotonic() - started
-            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-            self.assertLess(elapsed, 0.9)
-            self.assertEqual(fixture.selected, "original")
-            self.assertEqual(fixture.proxy_requests, 1)
+            process = fixture.background("use", "target", "--json", "--verify-timeout-ms", "100", "--retries", "3")
+            try:
+                self.assertTrue(fixture.proxy_started.wait(8))
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 2, stdout + stderr)
+                self.assertFalse(release.is_set(), "client must time out before server responds")
+                self.assertEqual(json.loads(stdout)["error"]["code"], "timeout")
+                self.assertEqual(fixture.selected, "original")
+                self.assertEqual(fixture.proxy_requests, 1)
+            finally:
+                release.set()
+                if process.poll() is None: process.kill(); process.wait()
+                if process.stdout: process.stdout.close()
+                if process.stderr: process.stderr.close()
 
     def test_second_mutation_is_busy_but_readonly_scan_can_run(self):
         release = threading.Event()
@@ -553,6 +569,31 @@ class Transactions(unittest.TestCase):
                 release.set()
                 if process.poll() is None: process.kill()
                 process.communicate(timeout=5)
+
+    def test_recovery_dry_run_never_switches_or_discards_record(self):
+        for action in ["--retry", "--discard"]:
+            release = threading.Event()
+            def pending():
+                release.wait(10)
+                return 200
+            with self.subTest(action=action), Fixture([pending]) as fixture:
+                process = fixture.background("use", "target")
+                try:
+                    self.assertTrue(fixture.proxy_started.wait(5))
+                    process.kill(); process.communicate(timeout=5); release.set()
+                    journal = Path(fixture.temporary.name)/"ProxPilot/recovery.bin"
+                    before = journal.read_bytes()
+                    requests = list(fixture.requests)
+                    result = fixture.run("recover", action, "--dry-run", "--json")
+                    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                    self.assertEqual(fixture.selected,"target")
+                    self.assertEqual(journal.read_bytes(),before)
+                    self.assertEqual(fixture.requests,requests)
+                    self.assertTrue(json.loads(result.stdout)["data"]["dry_run"])
+                finally:
+                    release.set()
+                    if process.poll() is None: process.kill()
+                    process.communicate(timeout=5)
 
     def test_corrupted_journal_is_preserved_until_explicit_discard(self):
         with Fixture([200]) as fixture:

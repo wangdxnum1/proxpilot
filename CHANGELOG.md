@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.5.0（2026-10-16）
+
+- scan 探测改为滚动工作线程：空闲槽位立即领取下一个节点，不再等待最慢的同伴返回，消除批次尾部停顿；实际并发仍受 `--concurrency` 限制。
+- scan 恢复实时节点计数：终端进度和 `--json` 的已完成/可达/未通过/重试计数随结果实时更新，不再滞后于探测进度。
+
+- 移除废弃和未使用的接口（`show_config`、`get_version`、`get_runtime_proxy`、`mihomo::switch_group`、`BrowserProbe::test`、`CoreResponse.status`、`DelayRecord`），内核切换统一经 `switching::SwitchControl`，并清理编译告警。
+
+- 修复旧版 Windows PowerShell（5.1）对 `PSModulePath` 的过滤：除 pwsh 安装路径外一并排除 Store 版 PowerShell 7 的模块根目录，避免 `Get-FileHash` 等 cmdlet 被 7.x 模块遮蔽，构建与打包不再在哈希校验阶段失败。
+
 ## v0.4.0（2026-10-16）
 
 - P0/P1/P2：条件回滚、取消/互斥与恢复日志；可验证的构建发布；有界扫描、隔离历史评分及守护保护；稳定 JSON/NDJSON、匿名只读诊断和默认取消的终端确认切换。
@@ -99,9 +108,3 @@
 
 ### 其他
 - exe 静态链接 CRT 并内置 SQLite，单文件免安装，Windows 10/11 直接运行。
-## 未发布：可靠性改进（开发中）
-
-- `scan` 延迟列统一使用 `延迟(ms)` 表头和右对齐数值。
-- `use/fix` 最终验证、提交与客户端记忆同步纳入事务；失败恢复原直接选择，保留外部修改与恢复失败证据。
-- 增加可取消探测/等待、Ctrl+C/Ctrl+Break 收尾、每用户修改锁、DPAPI 恢复记录和 `recover` 命令。
-- 增加 `--no-system-proxy`；独立代理修复失败不再被静默忽略。

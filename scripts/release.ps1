@@ -34,8 +34,13 @@ try {
     $dirty = ($status -join '').Trim().Length -gt 0
     if ($PublishDraft) {
         if ($dirty) { throw 'Commit reviewed changes first; publishing requires a clean tree.' }
+        # Redirecting a native command's stderr captures it as an error record, which
+        # 'Stop' turns into a terminating error while probing for a missing tag.
+        $ErrorActionPreference = 'Continue'
         & git rev-parse --verify "refs/tags/$tag" *> $null
-        if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists." }
+        $tagExists = $LASTEXITCODE -eq 0
+        $ErrorActionPreference = 'Stop'
+        if ($tagExists) { throw "Tag $tag already exists." }
         $remoteUrl = (Invoke-Checked git @('remote', 'get-url', $Remote)) -join ''
         if ($remoteUrl -notmatch '^(https://github\.com/|git@github\.com:)[^/]+/[^/]+?(?:\.git)?$') {
             throw 'Draft publishing requires an explicit github.com remote.'

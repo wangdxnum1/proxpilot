@@ -62,6 +62,16 @@ fn transient(error: &AppError) -> bool {
                 | ErrorCode::TransportUnknown
         )
 }
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeProgress {
+    pub total: usize,
+    pub completed: usize,
+    pub reachable: usize,
+    pub failed: usize,
+    pub retries: usize,
+}
+
+#[cfg(test)]
 pub fn run(
     nodes: &[String],
     options: &ProbeOptions,
@@ -69,6 +79,25 @@ pub fn run(
     cancel: &Cancellation,
     probe: impl Fn(&str, u32) -> AppResult<i64> + Sync,
 ) -> ProbeRun {
+    run_with_progress(nodes, options, cpu, cancel, probe, |_| {})
+}
+
+pub fn run_with_progress(
+    nodes: &[String],
+    options: &ProbeOptions,
+    cpu: usize,
+    cancel: &Cancellation,
+    probe: impl Fn(&str, u32) -> AppResult<i64> + Sync,
+    on_progress: impl Fn(ProbeProgress) + Sync,
+) -> ProbeRun {
+    let progress = Mutex::new(ProbeProgress {
+        total: nodes.len(),
+        completed: 0,
+        reachable: 0,
+        failed: 0,
+        retries: 0,
+    });
+    on_progress(*progress.lock().unwrap());
     let limit = options.limit(cpu, nodes.len());
     let mut concurrency = if options.concurrency.is_some() {
         limit
@@ -97,7 +126,17 @@ pub fn run(
                 if cancel.is_cancelled() || fatal.load(Ordering::Acquire) {
                     break;
                 }
-                let (probe, batch, retries, active, peak, fatal, controller_error) = (
+                let (
+                    probe,
+                    batch,
+                    retries,
+                    active,
+                    peak,
+                    fatal,
+                    controller_error,
+                    progress,
+                    on_progress,
+                ) = (
                     &probe,
                     &batch,
                     &retries,
@@ -105,6 +144,8 @@ pub fn run(
                     &peak,
                     &fatal,
                     &controller_error,
+                    &progress,
+                    &on_progress,
                 );
                 scope.spawn(move || {
                     let mut attempts = 0;
@@ -118,6 +159,9 @@ pub fn run(
                         }
                         if attempts > 0 {
                             retries.fetch_add(1, Ordering::Relaxed);
+                            let mut progress = progress.lock().unwrap();
+                            progress.retries += 1;
+                            on_progress(*progress);
                         }
                         attempts += 1;
                         let in_flight = active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -155,6 +199,10 @@ pub fn run(
                         Ok(delay) => (Some(delay), None),
                         Err(error) => (None, Some(error)),
                     };
+                    let completed = !error
+                        .as_ref()
+                        .is_some_and(|e| e.code == ErrorCode::Cancelled);
+                    let reachable = delay_ms.is_some();
                     batch.lock().unwrap().push((
                         ProbeMeasurement {
                             node: name.clone(),
@@ -164,6 +212,17 @@ pub fn run(
                         },
                         had_transient,
                     ));
+                    if completed {
+                        // Serialize notifications so concurrent workers cannot display older counts.
+                        let mut progress = progress.lock().unwrap();
+                        progress.completed += 1;
+                        if reachable {
+                            progress.reachable += 1;
+                        } else {
+                            progress.failed += 1;
+                        }
+                        on_progress(*progress);
+                    }
                 });
             }
         });
@@ -211,6 +270,79 @@ mod tests {
 
     fn names(n: usize) -> Vec<String> {
         (0..n).map(|n| n.to_string()).collect()
+    }
+    #[test]
+    fn progress_counts_final_nodes_once_and_reports_retries_separately() {
+        let updates = Mutex::new(Vec::new());
+        let attempts = AtomicUsize::new(0);
+        let report = run_with_progress(
+            &names(2),
+            &ProbeOptions {
+                concurrency: Some(1),
+                retries: 1,
+                ..Default::default()
+            },
+            2,
+            &Cancellation::new(),
+            |name, _| {
+                if name == "1" {
+                    Err(AppError::new(ErrorCode::ProbeFailed, Stage::Probe))
+                } else if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(AppError::new(ErrorCode::Timeout, Stage::Probe))
+                } else {
+                    Ok(20)
+                }
+            },
+            |progress| updates.lock().unwrap().push(progress),
+        );
+        let updates = updates.into_inner().unwrap();
+        assert_eq!(updates[0].completed, 0);
+        assert!(updates.iter().any(|p| p.completed == 0 && p.retries == 1));
+        assert!(updates
+            .windows(2)
+            .all(|pair| pair[0].completed <= pair[1].completed));
+        for progress in &updates {
+            assert_eq!(progress.total, 2);
+            assert_eq!(progress.completed, progress.reachable + progress.failed);
+            assert!(progress.completed <= progress.total);
+        }
+        let last = updates.last().unwrap();
+        assert_eq!(
+            (last.completed, last.reachable, last.failed, last.retries),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(report.measurements.len(), 2);
+    }
+
+    #[test]
+    fn progress_arrives_before_the_slowest_node_in_a_window_finishes() {
+        let (finished, first_result) = std::sync::mpsc::channel();
+        let first_result = Mutex::new(first_result);
+        run_with_progress(
+            &names(2),
+            &ProbeOptions {
+                concurrency: Some(2),
+                retries: 0,
+                ..Default::default()
+            },
+            2,
+            &Cancellation::new(),
+            |name, _| {
+                if name == "1" {
+                    first_result
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap();
+                }
+                Ok(20)
+            },
+            |progress| {
+                if progress.completed == 1 {
+                    finished.send(()).unwrap();
+                }
+            },
+        );
     }
     #[test]
     fn limits_respect_cpu_global_cap_explicit_override_and_empty_input() {

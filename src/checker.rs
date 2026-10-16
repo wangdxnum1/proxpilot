@@ -290,14 +290,28 @@ fn scan_network_report(
         .map(|n| n.get())
         .unwrap_or(1);
     let spinner = ui::Spinner::start(&format!(
-        "探测 {} 个节点（并发上限 {}）...",
+        "已测 0/{} · 可达 0 · 未通过 0 · 重试 0（并发上限 {}）",
         members.len(),
         options.limit(cpu, members.len())
     ));
-    let mut report =
-        crate::probe_scheduler::run(members, options, cpu, &cancel, |name, timeout| {
-            mihomo::probe_delay(be, agent, name, url, timeout)
-        });
+    let mut report = crate::probe_scheduler::run_with_progress(
+        members,
+        options,
+        cpu,
+        &cancel,
+        |name, timeout| mihomo::probe_delay(be, agent, name, url, timeout),
+        |progress| {
+            spinner.set_text(format!(
+                "已测 {}/{} · 可达 {} · 未通过 {} · 重试 {}（并发上限 {}）",
+                progress.completed,
+                progress.total,
+                progress.reachable,
+                progress.failed,
+                progress.retries,
+                options.limit(cpu, members.len()),
+            ));
+        },
+    );
     drop(spinner);
     if !report.cancelled
         && report.controller_error.is_none()

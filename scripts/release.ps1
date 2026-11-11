@@ -13,6 +13,24 @@ $taskConsoleEncoding = [Console]::OutputEncoding
 $taskPipeEncoding = $OutputEncoding
 $utf8 = New-Object Text.UTF8Encoding($false)
 function Write-Utf8([string]$Path, [string]$Content) { [IO.File]::WriteAllText($Path, $Content, $utf8) }
+# Release notes must describe THIS version only; passing the whole CHANGELOG.md
+# to `gh release create` published every historical entry as v0.6.0's notes.
+function Get-VersionNotes([string]$Path, [string]$Version) {
+    $raw = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+    $lines = $raw -split "\r?\n"
+    $heading = [regex]::new('^##\s+v' + [regex]::Escape($Version) + '(?=$|[^0-9A-Za-z.+-])')
+    $start = -1
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        if ($heading.IsMatch($lines[$i])) { $start = $i; break }
+    }
+    if ($start -lt 0) { throw "CHANGELOG.md has no section for v$Version." }
+    $body = New-Object System.Collections.Generic.List[string]
+    for ($i = $start; $i -lt $lines.Length; $i++) {
+        if ($i -gt $start -and $lines[$i] -match '^##\s') { break }
+        $body.Add($lines[$i])
+    }
+    return (($body -join "`n").TrimEnd() + "`n")
+}
 function Invoke-Checked([string]$Command, [string[]]$Arguments) {
     $result = @(& $Command @Arguments)
     if ($LASTEXITCODE -ne 0) { throw "$Command $($Arguments -join ' ') failed (exit $LASTEXITCODE)." }
@@ -66,6 +84,10 @@ try {
     Copy-Item -LiteralPath (Join-Path $root 'vendor/btls-sys/prebuilt/x86_64-pc-windows-msvc/manifest.json') -Destination (Join-Path $package 'native-manifest.json')
     $provenance = [ordered]@{schema_version=1; version=$version; revision=$revision; dirty=$dirty; rust=$rust; target=$Target; tests='cargo test --locked --quiet'; native_integrity_verified=$true; exe_sha256=(Get-FileHash (Join-Path $package 'proxpilot.exe') -Algorithm SHA256).Hash.ToLowerInvariant()}
     Write-Utf8 (Join-Path $package 'build-metadata.json') ($provenance | ConvertTo-Json -Depth 5)
+    # Only this version's section becomes the release body.
+    $notes = Get-VersionNotes (Join-Path $root 'CHANGELOG.md') $version
+    $notesFile = Join-Path $package 'RELEASE_NOTES.md'
+    Write-Utf8 $notesFile $notes
     $lines = @(Get-ChildItem -LiteralPath $package -File -Recurse | Sort-Object FullName | ForEach-Object {
         $relative = $_.FullName.Substring($package.Length + 1).Replace('\', '/')
         (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $relative
@@ -82,7 +104,7 @@ try {
         $repository = $remoteUrl -replace '^https://github\.com/|^git@github\.com:', '' -replace '\.git$', ''
         Invoke-Checked git @('tag', $tag, $revision) | Out-Host
         Invoke-Checked git @('push', $Remote, "refs/tags/$tag") | Out-Host
-        Invoke-Checked gh @('release', 'create', $tag, $archive, "$archive.sha256", '--repo', $repository, '--draft', '--verify-tag', '--title', "ProxPilot $tag", '--notes-file', (Join-Path $root 'CHANGELOG.md')) | Out-Host
+        Invoke-Checked gh @('release', 'create', $tag, $archive, "$archive.sha256", '--repo', $repository, '--draft', '--verify-tag', '--title', "ProxPilot $tag", '--notes-file', $notesFile) | Out-Host
         Write-Host 'Draft release created. Review it before publishing.'
     } else { Write-Host 'Local package only. Use -PublishDraft explicitly to create a draft release.' }
 } catch {

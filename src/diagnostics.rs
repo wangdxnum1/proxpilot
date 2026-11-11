@@ -264,6 +264,9 @@ pub struct VerificationReport {
 pub enum StreamHealth {
     Healthy,
     Degraded,
+    /// Failures cluster at the same elapsed time: the node enforces a fixed
+    /// transfer duration (e.g. cut every ~3s) rather than dropping randomly.
+    Limited,
     Cut,
     #[default]
     Unknown,
@@ -292,6 +295,9 @@ pub struct StreamReport {
     pub samples: Vec<StreamSample>,
     /// `proxy_link` — this measures the link, not a real git.exe client.
     pub represents: String,
+    /// Cut length when failures cluster at a constant duration, in ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_after_ms: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

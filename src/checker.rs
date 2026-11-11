@@ -27,6 +27,8 @@ pub fn classify_stream(
     let mut unknown = 0usize;
     let mut min_ratio = f64::INFINITY;
     let mut rates = Vec::new();
+    // Elapsed times of samples that transferred some bytes and still failed.
+    let mut cut_elapsed: Vec<f64> = Vec::new();
     for sample in samples {
         let ratio = if sample.expected_bytes == 0 {
             0.0
@@ -68,6 +70,11 @@ pub fn classify_stream(
             unknown += 1;
         } else {
             cuts += 1;
+            // Only cuts that were actively moving bytes count as duration-limit
+            // evidence; a zero-byte failure is a transport problem.
+            if sample.received_bytes > 0 {
+                cut_elapsed.push(sample.elapsed_ms);
+            }
         }
     }
     rates.sort_by(f64::total_cmp);
@@ -78,7 +85,49 @@ pub fn classify_stream(
     } else {
         rates[rates.len() / 2]
     };
-    let health = if cuts > 0 {
+    // A fixed transfer-duration policy cuts every connection at the same
+    // moment. Cluster detection needs at least two observed cuts and a spread
+    // small enough that random network failures cannot explain it.
+    let cut_after_ms = clustered_cut_time(&cut_elapsed, options.timeout_ms);
+    // A single cut plus successes that all finish right at that same moment is
+    // still evidence of a duration cap: the successful samples only survived
+    // because they squeezed in just under the limit.
+    let budget = f64::from(options.timeout_ms);
+    // A duration cap only makes sense when that connection was actually moving
+    // bytes; a zero-byte failure is a transport/setup problem, not a time limit.
+    let single_cut_ms = if cuts == 1 && cut_after_ms.is_none() {
+        samples
+            .iter()
+            .filter(|s| !s.completed && s.received_bytes > 0)
+            .map(|s| s.elapsed_ms)
+            .find(|ms| ms.is_finite() && *ms > 0.0 && *ms < budget * 0.95)
+    } else {
+        None
+    };
+    let barely_completed = cut_after_ms.or(single_cut_ms).map_or(false, |limit| {
+        // Count successes that finished in the last 40% of the budget.
+        let near = samples
+            .iter()
+            .filter(|s| s.completed)
+            .filter(|s| s.elapsed_ms >= limit * 0.6 && s.elapsed_ms <= limit)
+            .count();
+        // One success crowding the limit is already suspicious when a cut
+        // happened at that same moment; require at least that much.
+        near >= 1
+    });
+    // A single early cut that is clearly NOT the overall budget is already a
+    // duration cap: the node dropped a connection mid-body at a moment it
+    // chose, and every run we observed reproduced exactly that.
+    let single_early_cut = cuts == 1 && single_cut_ms.is_some();
+    let limited = (cuts >= 2 && cut_after_ms.is_some()) || barely_completed || single_early_cut;
+    let effective_cut_ms = if limited {
+        cut_after_ms.or(single_cut_ms)
+    } else {
+        None
+    };
+    let health = if limited {
+        StreamHealth::Limited
+    } else if cuts > 0 {
         StreamHealth::Cut
     } else if unknown == requested || requested == 0 {
         StreamHealth::Unknown
@@ -101,7 +150,49 @@ pub fn classify_stream(
         health,
         samples: samples.to_vec(),
         represents: "proxy_link".into(),
+        cut_after_ms: effective_cut_ms,
     }
+}
+
+/// Spread threshold for "these cuts happened at the same moment".
+/// Network-level variance under a fixed policy is well under this in practice.
+const CUT_CLUSTER_TOLERANCE_MS: f64 = 400.0;
+
+/// Returns the representative cut duration when at least two cuts cluster.
+///
+/// Samples that hit the overall budget are excluded first: one 15s timeout
+/// alongside three 3s cuts must not erase the fact that most cuts clustered.
+fn clustered_cut_time(cut_elapsed: &[f64], overall_timeout_ms: u32) -> Option<f64> {
+    let budget = f64::from(overall_timeout_ms);
+    let mut times: Vec<f64> = cut_elapsed
+        .iter()
+        .copied()
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        // A cut at the overall budget is "we gave up", not "the peer cut us".
+        .filter(|ms| *ms < budget * 0.95)
+        .collect();
+    if times.len() < 2 {
+        return None;
+    }
+    times.sort_by(f64::total_cmp);
+    let median = if times.len() % 2 == 0 {
+        (times[times.len() / 2 - 1] + times[times.len() / 2]) / 2.0
+    } else {
+        times[times.len() / 2]
+    };
+    let spread = times.last().unwrap() - times.first().unwrap();
+    // Every cut must sit within the tolerance window of the median, and the
+    // overall spread must itself be tight -- a wide spread means random drops.
+    if spread > CUT_CLUSTER_TOLERANCE_MS {
+        return None;
+    }
+    if times
+        .iter()
+        .any(|ms| (ms - median).abs() > CUT_CLUSTER_TOLERANCE_MS)
+    {
+        return None;
+    }
+    Some(median)
 }
 
 /// One node's concurrent stream samples. Returns `None` when the stream
@@ -745,16 +836,166 @@ mod stream_tests {
             error: None,
         }
     }
+    fn completed_at(elapsed_ms: f64) -> StreamSample {
+        StreamSample {
+            completed: true,
+            received_bytes: 1024,
+            expected_bytes: 1024,
+            first_byte_ms: Some(120.0),
+            elapsed_ms,
+            throughput_kbps: 3000.0,
+            error: None,
+        }
+    }
     fn cut(received: u64, code: ErrorCode) -> StreamSample {
+        cut_at(received, code, 3160.0)
+    }
+    fn cut_at(received: u64, code: ErrorCode, elapsed_ms: f64) -> StreamSample {
         StreamSample {
             completed: false,
             received_bytes: received,
             expected_bytes: 1024,
             first_byte_ms: if received > 0 { Some(300.0) } else { None },
-            elapsed_ms: 3160.0,
+            elapsed_ms,
             throughput_kbps: 0.0,
             error: Some(AppError::new(code, Stage::Stream)),
         }
+    }
+
+    #[test]
+    fn matched_cut_times_report_a_fixed_duration_limit() {
+        // Reproduces the observed node: every connection dies at ~3.00s.
+        let samples = vec![
+            cut_at(613577, ErrorCode::ResponseTransfer, 3006.0),
+            cut_at(950263, ErrorCode::ResponseTransfer, 3007.0),
+            cut_at(367826, ErrorCode::ResponseTransfer, 3008.0),
+            cut_at(462528, ErrorCode::ResponseTransfer, 3006.0),
+            completed(205.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Limited);
+        let ms = report.cut_after_ms.expect("clustered cut time");
+        assert!((ms - 3006.5).abs() < 5.0, "unexpected cut time {ms}");
+        assert_eq!(report.early_cuts, 4);
+    }
+
+    #[test]
+    fn scattered_cut_times_stay_a_random_drop_problem() {
+        // Same success ratio, but failures are not synchronised in time.
+        let samples = vec![
+            cut_at(613577, ErrorCode::ResponseTransfer, 1200.0),
+            cut_at(950263, ErrorCode::ResponseTransfer, 4800.0),
+            cut_at(367826, ErrorCode::ResponseTransfer, 8100.0),
+            cut_at(462528, ErrorCode::ResponseTransfer, 15000.0),
+            completed(205.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Cut);
+        assert!(report.cut_after_ms.is_none());
+    }
+
+    #[test]
+    fn budget_timeout_alone_is_not_a_duration_cap() {
+        // Hitting the overall budget means "we gave up", not "the peer cut us".
+        let samples = vec![
+            cut_at(400000, ErrorCode::Timeout, 15000.0),
+            completed(3000.0),
+            completed(3000.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Cut);
+        assert!(report.cut_after_ms.is_none());
+    }
+
+    #[test]
+    fn a_single_early_cut_is_a_duration_cap() {
+        // Every real run reproduced exactly one cut at ~3.0s while later
+        // connections finished normally: that is the node dropping us.
+        let samples = vec![
+            cut_at(250000, ErrorCode::ResponseTransfer, 3005.0),
+            completed_at(6104.0),
+            completed_at(10431.0),
+            completed_at(13439.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Limited);
+        let ms = report.cut_after_ms.expect("cut time");
+        assert!((ms - 3005.0).abs() < 10.0);
+    }
+
+    #[test]
+    fn near_miss_cluster_still_counts_as_limited() {
+        // 3.0s and 3.3s are the same policy; tolerance must not be too tight.
+        let samples = vec![
+            cut_at(400000, ErrorCode::ResponseTransfer, 3000.0),
+            cut_at(500000, ErrorCode::ResponseTransfer, 3300.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Limited);
+    }
+
+    #[test]
+    fn one_overall_timeout_does_not_erase_clustered_cuts() {
+        // Real run: three cuts at 3005ms plus one 15s overall timeout.
+        // The timeout is "we gave up", not a peer cut, and must be excluded.
+        let samples = vec![
+            cut_at(400000, ErrorCode::ResponseTransfer, 3004.0),
+            cut_at(500000, ErrorCode::ResponseTransfer, 3005.0),
+            cut_at(600000, ErrorCode::ResponseTransfer, 3005.0),
+            cut_at(700000, ErrorCode::Timeout, 15005.0),
+            completed_at(6464.0),
+            completed_at(7095.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Limited);
+        let ms = report.cut_after_ms.expect("clustered cut time");
+        assert!((ms - 3005.0).abs() < 10.0, "unexpected cut time {ms}");
+    }
+
+    #[test]
+    fn single_cut_with_successes_hugging_the_limit_is_still_limited() {
+        // Observed in practice: 4 succeed but all finish around 3s, one is
+        // cut at 3.0s. That is a cap, not luck.
+        let samples = vec![
+            cut_at(400000, ErrorCode::ResponseTransfer, 3003.0),
+            completed_at(2732.0),
+            completed_at(2997.0),
+            completed_at(3446.0),
+            completed_at(3962.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Limited);
+        assert!(report.cut_after_ms.is_some());
+    }
+
+    #[test]
+    fn single_early_cut_is_a_cap_regardless_of_other_samples() {
+        // Field evidence: one mid-body cut at a moment the node chose is the
+        // signal, even when other samples completed quickly.
+        let samples = vec![
+            cut_at(400000, ErrorCode::ResponseTransfer, 3003.0),
+            completed_at(200.0),
+            completed_at(250.0),
+            completed_at(300.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Limited);
+        assert!(report.cut_after_ms.is_some());
+    }
+
+    #[test]
+    fn one_success_crowding_the_cut_moment_is_enough() {
+        // Real run: [2938, 3004(cut), 3243, 4605, 5018]. 2938 sits just under
+        // the 3s cap, which reveals the cap even with a single cut sample.
+        let samples = vec![
+            completed_at(2938.0),
+            cut_at(400000, ErrorCode::ResponseTransfer, 3004.0),
+            completed_at(3243.0),
+            completed_at(4605.0),
+            completed_at(5018.0),
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Limited);
     }
 
     #[test]

@@ -151,8 +151,11 @@ impl StreamConfig {
     }
     pub fn default_options() -> diagnostics::StreamOptions {
         diagnostics::StreamOptions {
+            // Large enough to exceed transfer-duration caps (a small object
+            // finishes inside the cap and hides the problem), with enough
+            // samples that one stray timeout cannot mask a clustering pattern.
             bytes: 2 * 1024 * 1024,
-            samples: 5,
+            samples: 6,
             timeout_ms: 15_000,
             min_throughput_kbps: 200,
             first_byte_timeout_ms: 5_000,
@@ -737,7 +740,7 @@ mod cli_tests {
         let args = parse(&["check", "--git-check"]).unwrap();
         let config = args.git_stream.as_ref().expect("stream config");
         assert_eq!(config.options.bytes, 2 * 1024 * 1024);
-        assert_eq!(config.options.samples, 5);
+        assert_eq!(config.options.samples, 6);
         assert_eq!(config.options.timeout_ms, 15_000);
         assert_eq!(config.options.first_byte_timeout_ms, 5_000);
         assert_eq!(config.options.min_throughput_kbps, 200);
@@ -1264,6 +1267,7 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
     let label = match stream.health {
         diagnostics::StreamHealth::Healthy => "✔ 稳定",
         diagnostics::StreamHealth::Degraded => "▲ 偏慢",
+        diagnostics::StreamHealth::Limited => "✘ 有时长限制",
         diagnostics::StreamHealth::Cut => "✘ 不稳定",
         diagnostics::StreamHealth::Unknown => "? 无法判定",
     };
@@ -1293,6 +1297,26 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
                 ui::dim("问题不是断线，是带宽不足；大仓库 clone/fetch 会很慢");
             }
         }
+        diagnostics::StreamHealth::Limited => {
+            let seconds = stream.cut_after_ms.unwrap_or(0.0) / 1000.0;
+            ui::dim(&format!(
+                "多条连接都在约 {:.1} 秒时被切断（断开时刻高度一致，不是随机丢包）",
+                seconds
+            ));
+            if verbose {
+                ui::dim(&format!(
+                    "被切断的连接当时只收到约 {:.0}% 的数据；能完成的连接可以跑更久，说明节点在约 {:.1} 秒处按已传量判断，未达标即断开",
+                    stream.min_received_ratio * 100.0,
+                    seconds
+                ));
+                ui::dim(
+                    "实际影响：git clone/fetch 一条连接要连续传几十 MB，中途被断开就要整个重来，较大的仓库失败率很高",
+                );
+            }
+            ui::warn(
+                "该节点会中断长时间传输，不适合 git；建议运行 proxpilot fix --git-check 换节点",
+            );
+        }
         diagnostics::StreamHealth::Cut => {
             ui::dim(&format!(
                 "约 {:.0}% 的连接在传输中途被对端断开",
@@ -1307,7 +1331,7 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
                     "{} 条连接能收完（中位 {:.0} KB/s），速度本身没问题",
                     completed, stream.median_throughput_kbps
                 ));
-                ui::dim("问题不是慢，是连接会被对端提前断开");
+                ui::dim("问题不是慢，是连接会被对端提前断开，且断开时刻不固定（更像随机抖动）");
                 ui::dim(
                     "实际影响：git clone/fetch 用一条连接连续传几十 MB，断开一次就要整个重来，",
                 );

@@ -179,7 +179,8 @@ fn stream_rank(stream: Option<&crate::diagnostics::StreamReport>) -> (u8, u32) {
         Some(StreamHealth::Healthy) => (0, 0),
         Some(StreamHealth::Degraded) => (1, 0),
         Some(StreamHealth::Unknown) | None => (2, 0), // not measured = neutral
-        Some(StreamHealth::Cut) => (3, stream.map_or(0, |s| s.early_cuts as u32)),
+        Some(StreamHealth::Limited) => (3, stream.map_or(0, |s| s.early_cuts as u32)),
+        Some(StreamHealth::Cut) => (4, stream.map_or(0, |s| s.early_cuts as u32)),
     }
 }
 
@@ -387,6 +388,7 @@ mod tests {
             health,
             samples: vec![],
             represents: "proxy_link".into(),
+            cut_after_ms: None,
         });
         Candidate::verified(node.into(), &[], v, None).unwrap()
     }

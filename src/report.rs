@@ -24,6 +24,8 @@ macro_rules! print {
     ($($arg:tt)*) => { crate::report::text(format_args!($($arg)*)) };
 }
 
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
 pub fn initialize(json: bool) {
     JSON.store(json, Ordering::Release);
     if json {
@@ -32,6 +34,14 @@ pub fn initialize(json: bool) {
 }
 pub fn machine() -> bool {
     JSON.load(Ordering::Acquire)
+}
+/// Detailed explanations are opt-in (`--verbose`); default terminal output keeps
+/// the one-line verdict and drops the long rationale.
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Acquire)
+}
+pub fn set_verbose(value: bool) {
+    VERBOSE.store(value, Ordering::Release);
 }
 pub fn closed() -> bool {
     CLOSED.load(Ordering::Acquire)

@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-use crate::diagnostics::{AppError, AppResult, ErrorCode, Stage};
+use crate::diagnostics::{AppError, AppResult, ErrorCode, Stage, StreamOptions, StreamSample};
 use http_body_util::BodyExt;
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::redirect;
@@ -560,5 +560,308 @@ impl BrowserProbe {
             };
             Ok((code, start.elapsed().as_secs_f64()))
         })
+    }
+}
+
+// --- Git long-connection / large-transfer dimension -----------------------
+//
+// Kept separate from `BrowserProbe`: webpage verification uses a short
+// 12s budget and one short request per sample, while a stream sample needs a
+// bounded but much larger body read. Nothing here changes existing behavior.
+//
+// Concurrency model: all samples for ONE node run concurrently (the kernel's
+// selected node is global state, so different nodes must stay serial). N
+// independent connections are N Bernoulli trials of "is this connection cut
+// at the start of the body", which is exactly the failure mode described in
+// gitpilot/doc/long-connection-probe-20261111.md. Wall time is ~one sample,
+// not N samples.
+
+fn failed_sample(options: StreamOptions, code: ErrorCode) -> StreamSample {
+    StreamSample {
+        completed: false,
+        received_bytes: 0,
+        expected_bytes: options.bytes.max(1),
+        first_byte_ms: None,
+        elapsed_ms: 0.0,
+        throughput_kbps: 0.0,
+        error: Some(AppError::new(code, Stage::Stream)),
+    }
+}
+
+async fn stream_once(proxy: wreq::Proxy, url: String, options: StreamOptions) -> StreamSample {
+    let start = Instant::now();
+    let overall = Duration::from_millis(u64::from(options.timeout_ms.max(1)));
+    let first_byte_budget = Duration::from_millis(u64::from(options.first_byte_timeout_ms.max(1)));
+    let mut sample = StreamSample {
+        completed: false,
+        received_bytes: 0,
+        expected_bytes: options.bytes.max(1),
+        first_byte_ms: None,
+        elapsed_ms: 0.0,
+        throughput_kbps: 0.0,
+        error: None,
+    };
+    let work = async {
+        let client = wreq::Client::builder()
+            .emulation(
+                Emulation::builder()
+                    .profile(Profile::Chrome149)
+                    .platform(Platform::Windows)
+                    .build(),
+            )
+            .no_proxy()
+            .proxy(proxy)
+            .redirect(wreq::redirect::Policy::limited(10))
+            .timeout(overall)
+            .connect_timeout(overall.min(Duration::from_secs(8)))
+            .build()
+            .map_err(|e| AppError::from_wreq(&e, Stage::Stream))?;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AppError::from_wreq(&e, Stage::Stream))?;
+        // Never read more than --git-bytes. A declared Content-Length is
+        // trusted only down to that cap; a smaller object is read in full.
+        let declared = response
+            .headers()
+            .get(wreq::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        let target = declared.unwrap_or(options.bytes).min(options.bytes).max(1);
+        sample.expected_bytes = target;
+        let mut body = wreq::Body::from(response);
+        let mut got_first = false;
+        loop {
+            let frame = if got_first {
+                body.frame().await
+            } else {
+                // Headers were already received; this budget isolates the
+                // "200 OK then no pack stream" failure mode.
+                match tokio::time::timeout(first_byte_budget, body.frame()).await {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        sample.error = Some(AppError::new(ErrorCode::Timeout, Stage::Stream));
+                        break;
+                    }
+                }
+            };
+            let Some(frame) = frame else { break };
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(_) => {
+                    sample.error = Some(AppError::new(ErrorCode::ResponseTransfer, Stage::Stream));
+                    break;
+                }
+            };
+            if let Some(data) = frame.data_ref() {
+                if !got_first {
+                    got_first = true;
+                    sample.first_byte_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                sample.received_bytes = sample.received_bytes.saturating_add(data.len() as u64);
+                if sample.received_bytes >= target {
+                    break;
+                }
+            }
+        }
+        sample.completed = sample.error.is_none() && sample.received_bytes >= target;
+        if !sample.completed && sample.error.is_none() {
+            // Response headers arrived, body ended early: early EOF, not HTTP 0.
+            sample.error = Some(AppError::new(ErrorCode::ResponseTransfer, Stage::Stream));
+        }
+        Ok::<(), AppError>(())
+    };
+    match tokio::time::timeout(overall, work).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => sample.error = Some(error),
+        Err(_) => {
+            sample.completed = false;
+            sample.error = Some(AppError::new(ErrorCode::Timeout, Stage::Stream));
+        }
+    }
+    sample.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    sample.throughput_kbps = if sample.elapsed_ms > 0.0 {
+        sample.received_bytes as f64 / (sample.elapsed_ms / 1000.0) / 1024.0
+    } else {
+        0.0
+    };
+    sample
+}
+
+pub struct StreamProbe {
+    proxy: wreq::Proxy,
+    runtime: Runtime,
+}
+
+impl StreamProbe {
+    pub fn new(proxy: &str) -> AppResult<Self> {
+        Ok(Self {
+            proxy: wreq::Proxy::all(proxy)
+                .map_err(|e| AppError::from_wreq(&e, Stage::Configuration))?,
+            // Single-threaded runtime is enough: stream samples are IO-bound
+            // and `JoinSet` overlaps them on the reactor. No rt-multi-thread
+            // feature (and no extra OS threads) required.
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| AppError::new(ErrorCode::StateUnavailable, Stage::Stream))?,
+        })
+    }
+
+    /// Same as `test_stream`, reporting `(completed, total)` after each sample
+    /// finishes so the UI can show live progress.
+    pub fn test_stream_with_progress(
+        &self,
+        url: &str,
+        options: StreamOptions,
+        cancellation: &crate::operation::Cancellation,
+        on_progress: impl Fn(usize, usize) + Send + Sync,
+    ) -> AppResult<Vec<StreamSample>> {
+        cancellation.check()?;
+        self.runtime.block_on(async {
+            let total = options.samples.max(1);
+            let mut set = tokio::task::JoinSet::new();
+            for _ in 0..total {
+                set.spawn(stream_once(self.proxy.clone(), url.to_string(), options));
+            }
+            let mut samples = Vec::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        set.abort_all();
+                        return Err(AppError::new(ErrorCode::Cancelled, Stage::Stream));
+                    }
+                    joined = set.join_next() => {
+                        let Some(result) = joined else { break };
+                        samples.push(match result {
+                            Ok(sample) => sample,
+                            Err(_) => failed_sample(options, ErrorCode::TransportUnknown),
+                        });
+                        on_progress(samples.len(), total);
+                    }
+                }
+            }
+            Ok(samples)
+        })
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::http::test_support::{accept, listener, read_request};
+    use std::io::Write;
+
+    fn options(samples: usize, bytes: u64) -> StreamOptions {
+        StreamOptions {
+            bytes,
+            samples,
+            timeout_ms: 4000,
+            min_throughput_kbps: 1,
+            first_byte_timeout_ms: 2000,
+        }
+    }
+
+    /// Minimal HTTP proxy: reply with a body of `body_len` bytes, or cut the
+    /// connection right after the headers when `cut` is set (the exact failure
+    /// mode in gitpilot/doc/long-connection-probe-20261111.md).
+    fn proxy_server(
+        connections: usize,
+        body_len: usize,
+        cut: bool,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = listener();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for _ in 0..connections {
+                let mut stream = accept(&listener);
+                let _ = read_request(&mut stream);
+                if cut {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        body_len
+                    )
+                    .unwrap();
+                    stream.flush().unwrap();
+                    drop(stream); // early EOF, no close_notify equivalent
+                } else {
+                    let body = vec![b'x'; body_len];
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                    stream.flush().unwrap();
+                }
+                served += 1;
+            }
+            served
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn concurrent_samples_all_complete() {
+        let (proxy, server) = proxy_server(5, 4096, false);
+        let probe = StreamProbe::new(&proxy).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let samples = probe
+            .test_stream_with_progress(
+                "http://stream.invalid/data",
+                options(5, 4096),
+                &crate::operation::Cancellation::new(),
+                |done, total| seen.lock().unwrap().push((done, total)),
+            )
+            .unwrap();
+        assert_eq!(samples.len(), 5);
+        assert!(samples.iter().all(|s| s.completed));
+        assert!(samples.iter().all(|s| s.received_bytes == 4096));
+        assert_eq!(server.join().unwrap(), 5, "all 5 connections were served");
+        // Progress must advance to completion so the UI is never silent.
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 5);
+        assert_eq!(seen.last(), Some(&(5, 5)));
+    }
+
+    #[test]
+    fn early_eof_is_detected_as_incomplete_not_healthy() {
+        let (proxy, server) = proxy_server(5, 4096, true);
+        let probe = StreamProbe::new(&proxy).unwrap();
+        let samples = probe
+            .test_stream_with_progress(
+                "http://stream.invalid/data",
+                options(5, 4096),
+                &crate::operation::Cancellation::new(),
+                |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(samples.len(), 5);
+        assert!(samples
+            .iter()
+            .all(|s| !s.completed && s.received_bytes == 0));
+        assert_eq!(server.join().unwrap(), 5);
+    }
+
+    #[test]
+    fn cancellation_aborts_pending_samples() {
+        let (proxy, server) = proxy_server(1, 4096, false);
+        let probe = StreamProbe::new(&proxy).unwrap();
+        let cancellation = crate::operation::Cancellation::new();
+        cancellation.cancel();
+        let result = probe.test_stream_with_progress(
+            "http://stream.invalid/data",
+            options(1, 4096),
+            &cancellation,
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        // Server thread may never accept; drop without joining to avoid a hang.
+        drop(server);
     }
 }

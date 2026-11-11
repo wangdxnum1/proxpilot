@@ -47,6 +47,7 @@ pub enum Stage {
     Controller,
     Probe,
     Verification,
+    Stream,
     Switching,
     Rollback,
     State,
@@ -248,6 +249,58 @@ pub struct VerificationReport {
     pub samples_requested: usize,
     pub samples_passed: usize,
     pub error: Option<AppError>,
+    /// Optional because the stream dimension is disabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamReport>,
+}
+
+/// Health of one node's large-transfer / long-connection capability.
+///
+/// This is an *orthogonal* dimension to `Availability`: it never changes the
+/// webpage grade, the 50/25/15/10 score, or the exit codes. It only breaks ties
+/// inside the same availability grade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamHealth {
+    Healthy,
+    Degraded,
+    Cut,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamSample {
+    pub completed: bool,
+    pub received_bytes: u64,
+    pub expected_bytes: u64,
+    pub first_byte_ms: Option<f64>,
+    pub elapsed_ms: f64,
+    pub throughput_kbps: f64,
+    pub error: Option<AppError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamReport {
+    pub samples_requested: usize,
+    pub samples_completed: usize,
+    pub early_cuts: usize,
+    pub slow_samples: usize,
+    pub min_received_ratio: f64,
+    pub median_throughput_kbps: f64,
+    pub health: StreamHealth,
+    pub samples: Vec<StreamSample>,
+    /// `proxy_link` — this measures the link, not a real git.exe client.
+    pub represents: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct StreamOptions {
+    pub bytes: u64,
+    pub samples: usize,
+    pub timeout_ms: u32,
+    pub min_throughput_kbps: u64,
+    pub first_byte_timeout_ms: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -657,6 +657,7 @@ mod tests {
             samples_requested: 2,
             samples_passed: 2,
             error: None,
+            stream: None,
         }
     }
 
@@ -829,6 +830,7 @@ mod tests {
                 samples_requested: 2,
                 samples_passed: 1,
                 error: Some(crate::diagnostics::AppError::website_status(403)),
+                stream: None,
             };
             assert_eq!(txn.commit(&failed).unwrap_err().http_status, Some(403));
             assert!(core.persisted.borrow().is_empty());

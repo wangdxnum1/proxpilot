@@ -7,9 +7,143 @@ use std::thread;
 use std::time::Duration;
 
 use crate::detect::Backend;
-use crate::diagnostics::{AppError, Availability, ErrorCode, Stage, VerificationReport};
+use crate::diagnostics::{
+    AppError, Availability, ErrorCode, Stage, StreamHealth, StreamOptions, StreamReport,
+    VerificationReport,
+};
 use crate::mihomo::{self, ProxyInfo};
 use crate::ui;
+
+/// Pure attribution of one node's stream samples. Kept free of I/O so the
+/// gitpilot §5 decision table can be unit-tested exhaustively.
+pub fn classify_stream(
+    samples: &[crate::diagnostics::StreamSample],
+    options: StreamOptions,
+) -> StreamReport {
+    let requested = samples.len();
+    let mut completed = 0usize;
+    let mut cuts = 0usize;
+    let mut slow = 0usize;
+    let mut unknown = 0usize;
+    let mut min_ratio = f64::INFINITY;
+    let mut rates = Vec::new();
+    for sample in samples {
+        let ratio = if sample.expected_bytes == 0 {
+            0.0
+        } else {
+            (sample.received_bytes as f64 / sample.expected_bytes as f64).min(1.0)
+        };
+        min_ratio = min_ratio.min(ratio);
+        // Environment/transport setup errors are NOT node-quality failures.
+        // They must never be counted as an early cut.
+        let setup_failure = sample.error.as_ref().is_some_and(|e| {
+            matches!(
+                e.code,
+                ErrorCode::Tls
+                    | ErrorCode::Dns
+                    | ErrorCode::Connect
+                    | ErrorCode::ProxyConnect
+                    | ErrorCode::InvalidInput
+                    | ErrorCode::Cancelled
+            )
+        });
+        if setup_failure {
+            unknown += 1;
+            continue;
+        }
+        if sample.completed {
+            completed += 1;
+            rates.push(sample.throughput_kbps);
+            if sample.throughput_kbps < options.min_throughput_kbps as f64 {
+                slow += 1;
+            }
+        } else if sample
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::Timeout)
+            && sample.received_bytes == 0
+        {
+            // No body bytes and we hit the overall budget: cannot distinguish
+            // a stalled node from a stalled target. Do not blame the node.
+            unknown += 1;
+        } else {
+            cuts += 1;
+        }
+    }
+    rates.sort_by(f64::total_cmp);
+    let median = if rates.is_empty() {
+        0.0
+    } else if rates.len() % 2 == 0 {
+        (rates[rates.len() / 2 - 1] + rates[rates.len() / 2]) / 2.0
+    } else {
+        rates[rates.len() / 2]
+    };
+    let health = if cuts > 0 {
+        StreamHealth::Cut
+    } else if unknown == requested || requested == 0 {
+        StreamHealth::Unknown
+    } else if completed == requested && slow == 0 {
+        StreamHealth::Healthy
+    } else {
+        StreamHealth::Degraded
+    };
+    StreamReport {
+        samples_requested: requested,
+        samples_completed: completed,
+        early_cuts: cuts,
+        slow_samples: slow,
+        min_received_ratio: if min_ratio.is_finite() {
+            min_ratio
+        } else {
+            0.0
+        },
+        median_throughput_kbps: median,
+        health,
+        samples: samples.to_vec(),
+        represents: "proxy_link".into(),
+    }
+}
+
+/// One node's concurrent stream samples. Returns `None` when the stream
+/// dimension is disabled or the probe could not be constructed.
+pub fn run_stream(proxy: &str, url: &str, options: Option<StreamOptions>) -> Option<StreamReport> {
+    let options = options?;
+    let probe = match crate::http::StreamProbe::new(proxy) {
+        Ok(probe) => probe,
+        Err(error) => {
+            ui::warn(&format!("长连接检测不可用，跳过该维度：{error}"));
+            return None;
+        }
+    };
+    let bytes = options.bytes;
+    let spinner = ui::Spinner::start(&format!(
+        "长连接检测：并发 {} 次采样（每次 {} KiB）...",
+        options.samples,
+        bytes / 1024
+    ));
+    let result = probe.test_stream_with_progress(
+        url,
+        options,
+        &crate::operation::Cancellation::global(),
+        |done, total| {
+            spinner.set_text(format!(
+                "长连接检测：并发 {} 次采样，已完成 {}/{}（每次 {} KiB）",
+                total,
+                done,
+                total,
+                bytes / 1024
+            ));
+        },
+    );
+    drop(spinner);
+    match result {
+        Ok(samples) => Some(classify_stream(&samples, options)),
+        Err(error) => {
+            ui::warn(&format!("长连接检测未完成，跳过该维度：{error}"));
+            None
+        }
+    }
+}
 
 /// 机场放在节点列表里的假节点（套餐信息占位）
 const FAKE_NODES: [&str; 13] = [
@@ -94,6 +228,7 @@ pub fn verify_access_report_with_timeout(
         samples_requested: n,
         samples_passed: 0,
         error: None,
+        stream: None,
     };
     let probe = match crate::http::BrowserProbe::new_with_timeout(proxy, timeout_ms) {
         Ok(probe) => probe,
@@ -162,6 +297,22 @@ pub fn verify_access_report_with_timeout(
     report
 }
 
+/// Same evidence as `verify_access_report_with_timeout`, plus the optional
+/// git long-connection dimension. Existing callers keep their old signature.
+pub fn verify_access_with_stream(
+    proxy: &str,
+    url: &str,
+    samples: usize,
+    timeout_ms: u32,
+    stream: Option<(String, StreamOptions)>,
+) -> VerificationReport {
+    let mut report = verify_access_report_with_timeout(proxy, url, samples, timeout_ms);
+    if let Some((stream_url, options)) = stream {
+        report.stream = run_stream(proxy, &stream_url, Some(options));
+    }
+    report
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CurrentVerification {
     pub verification: VerificationReport,
@@ -179,6 +330,23 @@ pub fn verify_current_report(
     samples: usize,
     timeout_ms: u32,
 ) -> CurrentVerification {
+    verify_current_with_stream(be, api, group, url, samples, timeout_ms, None)
+}
+
+/// Adds the optional stream dimension to the current-exit check.
+///
+/// The stream samples lengthen the window between the before/after state
+/// snapshots, so the result is only attributed to the node when the state is
+/// still stable afterwards (see `stable` handling below).
+pub fn verify_current_with_stream(
+    be: &Backend,
+    api: &crate::core_api::CoreApi,
+    group: &str,
+    url: &str,
+    samples: usize,
+    timeout_ms: u32,
+    stream: Option<(String, StreamOptions)>,
+) -> CurrentVerification {
     use crate::switching::SwitchControl;
     let control = crate::runtime_switch::KernelSwitchControl { backend: be, api };
     let mut controller_error = None;
@@ -193,7 +361,7 @@ pub fn verify_current_report(
             }
         }
     };
-    let report = verify_access_report_with_timeout(&be.proxy, url, samples, timeout_ms);
+    let report = verify_access_with_stream(&be.proxy, url, samples, timeout_ms, stream);
     let mut result = CurrentVerification {
         verification: report,
         state: before.clone(),
@@ -231,6 +399,14 @@ pub fn verify_current_report(
             result.state = Some(after);
         }
         Err(error) => result.controller_error = Some(error),
+    }
+    // The stream window is longer than a webpage sample. If the selection,
+    // subscription or members changed during it, the evidence cannot be
+    // attributed to the node we measured -- report Unknown, never a verdict.
+    if !result.stable {
+        if let Some(stream) = result.verification.stream.as_mut() {
+            stream.health = StreamHealth::Unknown;
+        }
     }
     result
 }
@@ -541,5 +717,104 @@ mod rate_policy_tests {
                 .contains("未进行节点切换")
         );
         assert!(server.join().unwrap().starts_with("GET /proxies "));
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::diagnostics::{StreamHealth, StreamSample};
+
+    fn options() -> StreamOptions {
+        StreamOptions {
+            bytes: 1024,
+            samples: 5,
+            timeout_ms: 15000,
+            min_throughput_kbps: 200,
+            first_byte_timeout_ms: 5000,
+        }
+    }
+    fn completed(rate: f64) -> StreamSample {
+        StreamSample {
+            completed: true,
+            received_bytes: 1024,
+            expected_bytes: 1024,
+            first_byte_ms: Some(120.0),
+            elapsed_ms: 800.0,
+            throughput_kbps: rate,
+            error: None,
+        }
+    }
+    fn cut(received: u64, code: ErrorCode) -> StreamSample {
+        StreamSample {
+            completed: false,
+            received_bytes: received,
+            expected_bytes: 1024,
+            first_byte_ms: if received > 0 { Some(300.0) } else { None },
+            elapsed_ms: 3160.0,
+            throughput_kbps: 0.0,
+            error: Some(AppError::new(code, Stage::Stream)),
+        }
+    }
+
+    #[test]
+    fn all_fast_complete_is_healthy() {
+        let samples: Vec<_> = (0..5).map(|_| completed(3000.0)).collect();
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Healthy);
+        assert_eq!(report.samples_completed, 5);
+        assert_eq!(report.early_cuts, 0);
+        assert_eq!(report.min_received_ratio, 1.0);
+    }
+
+    #[test]
+    fn one_early_cut_is_enough_to_reject_the_node() {
+        // gitpilot 2026-11-11 measured 5/9: a single sample hides it.
+        let mut samples = vec![completed(3000.0); 4];
+        samples.push(cut(0, ErrorCode::ResponseTransfer));
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Cut);
+        assert_eq!(report.early_cuts, 1);
+        assert_eq!(report.min_received_ratio, 0.0);
+    }
+
+    #[test]
+    fn slow_but_complete_is_degraded_not_cut() {
+        let samples: Vec<_> = (0..5).map(|_| completed(100.0)).collect();
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Degraded);
+        assert_eq!(report.slow_samples, 5);
+        assert_eq!(report.early_cuts, 0);
+    }
+
+    #[test]
+    fn tls_and_timeout_setup_failures_are_unknown_not_node_faults() {
+        let samples = vec![
+            cut(0, ErrorCode::Tls),
+            cut(0, ErrorCode::Connect),
+            cut(0, ErrorCode::ProxyConnect),
+            cut(0, ErrorCode::Timeout), // 0 bytes + timeout => not attributable
+        ];
+        let report = classify_stream(&samples, options());
+        assert_eq!(report.health, StreamHealth::Unknown);
+        assert_eq!(report.early_cuts, 0);
+    }
+
+    #[test]
+    fn empty_and_cancelled_samples_are_unknown() {
+        assert_eq!(
+            classify_stream(&[], options()).health,
+            StreamHealth::Unknown
+        );
+        let report = classify_stream(&[cut(0, ErrorCode::Cancelled)], options());
+        assert_eq!(report.health, StreamHealth::Unknown);
+    }
+
+    #[test]
+    fn report_never_exposes_the_target_url() {
+        let report = classify_stream(&[completed(3000.0)], options());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("http"));
+        assert_eq!(report.represents, "proxy_link");
     }
 }

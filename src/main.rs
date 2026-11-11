@@ -28,51 +28,69 @@ mod watch;
 mod watch_policy;
 mod workflow;
 
+fn flag_takes_value(value: &str) -> bool {
+    matches!(
+        value,
+        "--client"
+            | "--api"
+            | "--secret"
+            | "--proxy"
+            | "--group"
+            | "--url"
+            | "--max-rate"
+            | "--top"
+            | "--samples"
+            | "--concurrency"
+            | "--probe-timeout-ms"
+            | "--verify-timeout-ms"
+            | "--retries"
+            | "--interval"
+            | "--reopt"
+            | "--min-switch-interval"
+            | "--failure-cooldown"
+            | "--manual-hold"
+            | "--output"
+            | "--git-url"
+            | "--git-bytes"
+            | "--git-samples"
+            | "--git-timeout-ms"
+            | "--git-first-byte-ms"
+            | "--min-throughput-kbps"
+    )
+}
+
+fn is_command(value: &str) -> bool {
+    matches!(
+        value,
+        "check"
+            | "scan"
+            | "fix"
+            | "use"
+            | "watch"
+            | "nodes"
+            | "info"
+            | "clients"
+            | "config"
+            | "history"
+            | "recover"
+            | "diagnose"
+            | "browse"
+            | "help"
+    )
+}
+
 fn command_name() -> String {
-    let mut values = std::env::args().skip(1);
+    command_name_from(std::env::args().skip(1))
+}
+
+fn command_name_from(values: impl IntoIterator<Item = String>) -> String {
+    let mut values = values.into_iter();
     while let Some(value) = values.next() {
-        if matches!(
-            value.as_str(),
-            "--client"
-                | "--api"
-                | "--secret"
-                | "--proxy"
-                | "--group"
-                | "--url"
-                | "--max-rate"
-                | "--top"
-                | "--samples"
-                | "--concurrency"
-                | "--probe-timeout-ms"
-                | "--verify-timeout-ms"
-                | "--retries"
-                | "--interval"
-                | "--reopt"
-                | "--min-switch-interval"
-                | "--failure-cooldown"
-                | "--manual-hold"
-                | "--output"
-        ) {
+        if flag_takes_value(&value) {
             values.next();
             continue;
         }
-        if matches!(
-            value.as_str(),
-            "check"
-                | "scan"
-                | "fix"
-                | "use"
-                | "watch"
-                | "nodes"
-                | "info"
-                | "clients"
-                | "config"
-                | "history"
-                | "recover"
-                | "diagnose"
-                | "browse"
-                | "help"
-        ) {
+        if is_command(&value) {
             return value;
         }
     }
@@ -115,6 +133,31 @@ pub struct Args {
     pub json: bool,
     pub output: Option<std::path::PathBuf>,
     pub overwrite: bool,
+    pub verbose: bool,
+    pub git_stream: Option<StreamConfig>,
+}
+
+/// Git long-connection detection settings. `None` means the whole dimension is
+/// disabled and all existing behavior is byte-for-byte unchanged.
+#[derive(Clone, Debug)]
+pub struct StreamConfig {
+    pub url: String,
+    pub options: diagnostics::StreamOptions,
+}
+
+impl StreamConfig {
+    fn default_url(bytes: u64) -> String {
+        format!("https://speed.cloudflare.com/__down?bytes={bytes}")
+    }
+    pub fn default_options() -> diagnostics::StreamOptions {
+        diagnostics::StreamOptions {
+            bytes: 2 * 1024 * 1024,
+            samples: 5,
+            timeout_ms: 15_000,
+            min_throughput_kbps: 200,
+            first_byte_timeout_ms: 5_000,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -175,7 +218,17 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         json: false,
         output: None,
         overwrite: false,
+        verbose: false,
+        git_stream: None,
     };
+    // Stream settings are staged here so flags can appear in any order.
+    let mut git_bytes: Option<u64> = None;
+    let mut git_url: Option<String> = None;
+    let mut git_samples: Option<usize> = None;
+    let mut git_timeout_ms: Option<u32> = None;
+    let mut git_first_byte_ms: Option<u32> = None;
+    let mut min_throughput_kbps: Option<u64> = None;
+    let mut git_check = false;
     let mut command = false;
     let mut supported = false;
     let mut recovery_action = None;
@@ -257,12 +310,55 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                     _ => args.watch.manual_hold_secs = seconds,
                 }
             }
+            "--git-check" => git_check = true,
+            "--git-url" => git_url = Some(value(&mut it, &arg)?),
+            "--git-bytes" => {
+                let n: u64 = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--git-bytes 必须为正整数".to_string())?;
+                if !(1024..=64 * 1024 * 1024).contains(&n) {
+                    return Err("--git-bytes 需在 1024 – 67108864 之间".into());
+                }
+                git_bytes = Some(n);
+            }
+            "--git-samples" => {
+                let n: usize = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--git-samples 必须为正整数".to_string())?;
+                if !(1..=10).contains(&n) {
+                    return Err("--git-samples 需在 1 – 10 之间".into());
+                }
+                git_samples = Some(n);
+            }
+            "--git-timeout-ms" | "--git-first-byte-ms" => {
+                let n: u32 = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| format!("{arg} 必须为非负整数"))?;
+                if !(100..=120000).contains(&n) {
+                    return Err(format!("{arg} 需在 100 – 120000 之间"));
+                }
+                if arg == "--git-timeout-ms" {
+                    git_timeout_ms = Some(n);
+                } else {
+                    git_first_byte_ms = Some(n);
+                }
+            }
+            "--min-throughput-kbps" => {
+                let n: u64 = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--min-throughput-kbps 必须为非负整数".to_string())?;
+                if n > 1_000_000 {
+                    return Err("--min-throughput-kbps 超出合理范围".into());
+                }
+                min_throughput_kbps = Some(n);
+            }
             "--dry-run" => args.dry_run = true,
             "--no-system-proxy" => args.manage_system_proxy = false,
             "--detect" => args.detect = true,
             "--json" => args.json = true,
             "--output" => args.output = Some(value(&mut it, &arg)?.into()),
             "--overwrite" => args.overwrite = true,
+            "--verbose" | "-v" => args.verbose = true,
             "--supported" => supported = true,
             "--retry" | "--discard" => {
                 if recovery_action.is_some() {
@@ -341,6 +437,53 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
     {
         return Err("测试网址必须是带主机名的 http(s) URL".into());
+    }
+    let stream_requested = git_check
+        || git_url.is_some()
+        || git_bytes.is_some()
+        || git_samples.is_some()
+        || git_timeout_ms.is_some()
+        || git_first_byte_ms.is_some()
+        || min_throughput_kbps.is_some();
+    if stream_requested {
+        let mut options = StreamConfig::default_options();
+        if let Some(n) = git_bytes {
+            options.bytes = n;
+        }
+        if let Some(n) = git_samples {
+            options.samples = n;
+        }
+        if let Some(n) = git_timeout_ms {
+            options.timeout_ms = n;
+        }
+        if let Some(n) = git_first_byte_ms {
+            options.first_byte_timeout_ms = n;
+        }
+        if let Some(n) = min_throughput_kbps {
+            options.min_throughput_kbps = n;
+        }
+        // A tighter overall budget silently bounds the first-byte budget;
+        // only an explicitly larger first-byte value is a user error.
+        if git_first_byte_ms.is_some() && options.first_byte_timeout_ms > options.timeout_ms {
+            return Err("--git-first-byte-ms 不能大于 --git-timeout-ms".into());
+        }
+        options.first_byte_timeout_ms = options.first_byte_timeout_ms.min(options.timeout_ms);
+        // Guard against an accidental huge transfer: bytes x concurrent samples.
+        // Only the explicit combination is rejected; defaults alone stay valid.
+        let total = options.bytes.saturating_mul(options.samples as u64);
+        if git_bytes.is_some() && git_samples.is_some() && total > 256 * 1024 * 1024 {
+            return Err(format!(
+                "--git-bytes × --git-samples 合计约 {} MiB，超过 256 MiB 上限；请调小其中一个",
+                total / (1024 * 1024)
+            ));
+        }
+        let url = git_url.unwrap_or_else(|| StreamConfig::default_url(options.bytes));
+        if !reqwest::Url::parse(&url)
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+        {
+            return Err("--git-url 必须是带主机名的 http(s) URL".into());
+        }
+        args.git_stream = Some(StreamConfig { url, options });
     }
     Ok(args)
 }
@@ -501,6 +644,7 @@ fn cmd_history(clear: bool, dry_run: bool) -> AppResult<()> {
                 samples_requested: 0,
                 samples_passed: 0,
                 error: None,
+                stream: None,
             };
             let basis = scoring::score_at(&evidence, &unverified, None, now);
             ui::dim(&format!("历史依据（人为权重 50/25/15/10）：{} 次验证 · 成功率分 {:.1}/50 · 延迟分 {:.1}/25 · 稳定性分 {:.1}/15；倍率未知，成本分0；不代表当前可用",basis.samples,basis.success,basis.latency,basis.stability));
@@ -587,6 +731,85 @@ mod cli_tests {
             Some(client_config::ClientSelection::Auto)
         );
     }
+
+    #[test]
+    fn git_stream_defaults_and_bounds() {
+        let args = parse(&["check", "--git-check"]).unwrap();
+        let config = args.git_stream.as_ref().expect("stream config");
+        assert_eq!(config.options.bytes, 2 * 1024 * 1024);
+        assert_eq!(config.options.samples, 5);
+        assert_eq!(config.options.timeout_ms, 15_000);
+        assert_eq!(config.options.first_byte_timeout_ms, 5_000);
+        assert_eq!(config.options.min_throughput_kbps, 200);
+        assert!(config.url.contains("bytes=2097152"));
+        assert!(parse(&["check"]).unwrap().git_stream.is_none());
+
+        for (flag, good, bad) in [
+            (
+                "--git-bytes",
+                vec!["1024", "67108864"],
+                vec!["0", "67108865"],
+            ),
+            ("--git-samples", vec!["1", "10"], vec!["0", "11"]),
+            (
+                "--git-timeout-ms",
+                vec!["100", "120000"],
+                vec!["99", "120001"],
+            ),
+            (
+                "--git-first-byte-ms",
+                vec!["100", "120000"],
+                vec!["99", "120001"],
+            ),
+        ] {
+            for v in good {
+                // Keep the first-byte budget within the overall budget.
+                assert!(
+                    parse(&["check", "--git-timeout-ms", "120000", flag, v]).is_ok(),
+                    "{flag} {v}"
+                );
+            }
+            for v in bad {
+                assert!(parse(&["check", flag, v]).is_err(), "{flag} {v}");
+            }
+        }
+        assert!(parse(&["check", "--git-url", "not-a-url"]).is_err());
+        assert!(parse(&["check", "--git-first-byte-ms", "20000"]).is_err());
+        // Flow guard: bytes x samples must stay bounded.
+        assert!(parse(&["check", "--git-bytes", "67108864", "--git-samples", "10"]).is_err());
+        assert!(parse(&["check", "--git-bytes", "67108864", "--git-samples", "4"]).is_ok());
+    }
+
+    #[test]
+    fn git_stream_url_override_and_command_name_skip_table() {
+        let args = parse(&[
+            "check",
+            "--git-url",
+            "https://codeload.github.com/git/git/tar.gz/refs/heads/master",
+        ])
+        .unwrap();
+        assert!(args
+            .git_stream
+            .unwrap()
+            .url
+            .starts_with("https://codeload.github.com/"));
+        // P2 regression: flag values must never be mistaken for a command.
+        assert_eq!(
+            command_name_from(
+                ["watch", "--git-url", "https://example.invalid/x", "--json"].map(str::to_string)
+            ),
+            "watch"
+        );
+        assert_eq!(
+            command_name_from(["fix", "--git-bytes", "2097152"].map(str::to_string)),
+            "fix"
+        );
+        // Original P2 regression still guarded.
+        assert_eq!(
+            command_name_from(["--secret", "watch", "nodes", "--json"].map(str::to_string)),
+            "nodes"
+        );
+    }
 }
 
 fn print_help() {
@@ -629,6 +852,13 @@ fn print_help() {
     println!("  --probe-timeout-ms <N>  初筛超时 100–120000ms（默认 4000）");
     println!("  --verify-timeout-ms <N> 网页单次采样整体超时 100–120000ms（默认 12000）");
     println!("  --retries <N>    初筛传输失败额外重试 0–3 次（默认 1），不重试网页失败采样");
+    println!("  --git-check       启用 git 长连接检测；同节点内并发采样，只在同一验证等级内排序");
+    println!("  --git-url <地址> 长连接探测目标（默认 speed.cloudflare.com/__down?bytes=N）");
+    println!("  --git-bytes <N>  单次期望/上限字节数（默认 2097152，范围 1024–67108864）");
+    println!("  --git-samples <N> 并发采样次数（默认 5，范围 1–10）");
+    println!("  --git-timeout-ms <N>      单次整体超时（默认 15000）");
+    println!("  --git-first-byte-ms <N>   首字节超时（默认 5000，须 ≤ 整体超时）");
+    println!("  --min-throughput-kbps <N> 限速告警阈值（默认 200）");
     println!("  --interval <秒>  watch 检查间隔（默认 300）");
     println!("  --optimize      watch 启动时及定时主动优选（默认关闭）");
     println!("  --reopt <秒>     --optimize 的定时优选间隔（默认 7200）");
@@ -636,6 +866,7 @@ fn print_help() {
     println!("  --failure-cooldown <秒>    失败候选冷却时间（默认 600，0 关闭）");
     println!("  --manual-hold <秒>         操作外选择变化后的主动优化保护（默认 900，0 关闭）");
     println!("  --dry-run        只探测报告，不切换");
+    println!("  --verbose, -v     显示详细解释（长连接判定依据、历史库状态等；默认只给结论）");
     println!("  --no-system-proxy 保持系统代理现状（适用于 TUN 或手动代理）");
     println!("  --detect         自动探测（兼容 --client auto）");
     println!("默认：未配置时使用 auto；系统代理开启时要求唯一匹配，关闭时要求唯一可用内核。");
@@ -1029,6 +1260,75 @@ fn cmd_info(be: &Backend, api: &core_api::CoreApi, args: &Args, name: &str) -> i
     0
 }
 
+fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
+    let label = match stream.health {
+        diagnostics::StreamHealth::Healthy => "✔ 稳定",
+        diagnostics::StreamHealth::Degraded => "▲ 偏慢",
+        diagnostics::StreamHealth::Cut => "✘ 不稳定",
+        diagnostics::StreamHealth::Unknown => "? 无法判定",
+    };
+    let requested = stream.samples_requested;
+    let completed = stream.samples_completed;
+    let failed = requested.saturating_sub(completed);
+    ui::info(&format!(
+        "Git 长连接：{}（同时开 {} 条连接各下载一个文件，{} 条成功、{} 条被掐断）",
+        label, requested, completed, failed
+    ));
+    let verbose = report::verbose();
+    match stream.health {
+        diagnostics::StreamHealth::Healthy => {
+            if verbose {
+                ui::dim(&format!(
+                    "全部连接完整收完，中位速度 {:.0} KB/s；git clone/fetch 可以正常使用",
+                    stream.median_throughput_kbps
+                ));
+            }
+        }
+        diagnostics::StreamHealth::Degraded => {
+            ui::dim(&format!(
+                "速度偏慢（中位 {:.0} KB/s，低于 {} KB/s），git 会明显卡顿",
+                stream.median_throughput_kbps, min_throughput_kbps
+            ));
+            if verbose {
+                ui::dim("问题不是断线，是带宽不足；大仓库 clone/fetch 会很慢");
+            }
+        }
+        diagnostics::StreamHealth::Cut => {
+            ui::dim(&format!(
+                "约 {:.0}% 的连接在传输中途被对端断开",
+                if requested == 0 {
+                    0.0
+                } else {
+                    failed as f64 * 100.0 / requested as f64
+                }
+            ));
+            if verbose {
+                ui::dim(&format!(
+                    "{} 条连接能收完（中位 {:.0} KB/s），速度本身没问题",
+                    completed, stream.median_throughput_kbps
+                ));
+                ui::dim("问题不是慢，是连接会被对端提前断开");
+                ui::dim(
+                    "实际影响：git clone/fetch 用一条连接连续传几十 MB，断开一次就要整个重来，",
+                );
+                ui::dim("所以你会遇到「有时能 clone、有时报 early EOF / curl 56」这种时好时坏");
+            }
+            ui::warn("该节点对 git 长连接不友好，建议运行 proxpilot fix --git-check 换节点");
+        }
+        diagnostics::StreamHealth::Unknown => {
+            if verbose {
+                ui::dim("连接建立或 TLS 阶段就没成功，无法判断是节点还是目标站点的问题");
+                ui::dim("这类失败不计入节点质量问题；可稍后重试或换 --git-url 再测");
+            }
+        }
+    }
+    if verbose {
+        ui::dim(
+            "说明：衡量的是代理链路的大流量传输能力，不代表真实 git.exe 行为；早期中断常见于机场节点对长连接的限制",
+        );
+    }
+}
+
 fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
     if !checker::core_alive(&be.proxy) {
         ui::fail("内核代理端口不通，请确认客户端已启动；若使用的不是 CuteCloud，加 --detect 自动探测或用 --api 指定");
@@ -1077,15 +1377,24 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
                 let now = g.now.clone().unwrap_or_else(|| "未知".into());
                 ui::info(&format!("当前组「{}」→ {}", name, now));
             }
-            let current = checker::verify_current_report(
+            let current = checker::verify_current_with_stream(
                 be,
                 agent,
                 display_group.as_deref().unwrap_or(""),
                 &args.url,
                 args.samples,
                 args.verify_timeout_ms,
+                args.git_stream.as_ref().map(|s| (s.url.clone(), s.options)),
             );
             report::data(&current);
+            if let Some(stream) = &current.verification.stream {
+                report_stream(
+                    stream,
+                    args.git_stream
+                        .as_ref()
+                        .map_or(200, |s| s.options.min_throughput_kbps),
+                );
+            }
             if let Some(e) = &current.history_warning {
                 report::warning(e);
             }
@@ -1145,6 +1454,14 @@ fn cmd_check(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32
 }
 
 fn cmd_scan(be: &Backend, agent: &crate::core_api::CoreApi, args: &Args) -> i32 {
+    if args.git_stream.is_some() && matches!(args.cmd, Cmd::Scan) {
+        // scan is a fast reachability ranking; long-transfer sampling belongs to
+        // check/fix/use. Say so instead of silently ignoring the flag.
+        // (fix --dry-run forwards here too, but there the user already knows.)
+        ui::warn(
+            "scan 不做长连接检测（只做快速可达性排序）；请用 check --git-check 或 fix --git-check",
+        );
+    }
     match switching::inspect_recovery() {
         Ok(Some(_)) => ui::warn("存在尚未清理的操作记录；本次只读扫描保持现状，可用 recover 查看或显式处理"),
         Err(_) => ui::warn("操作恢复记录无法安全读取；本次只读扫描保持现状，可用 recover 查看，确认放弃后用 recover --discard 清理"),
@@ -1598,6 +1915,9 @@ fn print_commit(result: &switching::CommitReport) {
         }
         diagnostics::Availability::Failed => ui::fail("网站验证失败"),
     }
+    if let Some(stream) = &result.verification.stream {
+        report_stream(stream, 200);
+    }
     match result.memory {
         Some(switching::MemorySync::Synced) => ui::dim("已同步当前订阅的选择记忆"),
         Some(switching::MemorySync::ClientManaged) => ui::dim("重启后的选择持久化由客户端管理"),
@@ -1750,6 +2070,7 @@ fn set_console_utf8() {
 
 fn main() {
     report::initialize(std::env::args().any(|v| v == "--json"));
+    report::set_verbose(std::env::args().any(|v| v == "--verbose" || v == "-v"));
     run_main();
     exit(0);
 }

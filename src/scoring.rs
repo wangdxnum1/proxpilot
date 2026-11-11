@@ -169,9 +169,27 @@ pub fn grade(availability: Availability) -> u8 {
         Availability::Failed => 2,
     }
 }
+/// Orthogonal tie-breaker inside one availability grade. When the stream
+/// dimension is disabled every candidate is `None`, so this key is equal for
+/// all of them and `compare_candidates` is byte-for-byte identical to the
+/// pre-existing ordering.
+fn stream_rank(stream: Option<&crate::diagnostics::StreamReport>) -> (u8, u32) {
+    use crate::diagnostics::StreamHealth;
+    match stream.map(|s| s.health) {
+        Some(StreamHealth::Healthy) => (0, 0),
+        Some(StreamHealth::Degraded) => (1, 0),
+        Some(StreamHealth::Unknown) | None => (2, 0), // not measured = neutral
+        Some(StreamHealth::Cut) => (3, stream.map_or(0, |s| s.early_cuts as u32)),
+    }
+}
+
 pub fn compare_candidates(a: &Candidate, b: &Candidate) -> Ordering {
     grade(a.verification.availability)
         .cmp(&grade(b.verification.availability))
+        .then_with(|| {
+            stream_rank(a.verification.stream.as_ref())
+                .cmp(&stream_rank(b.verification.stream.as_ref()))
+        })
         .then_with(|| b.score.total.total_cmp(&a.score.total))
         .then_with(|| {
             a.verification
@@ -196,6 +214,7 @@ mod tests {
             samples_requested: 2,
             samples_passed: if grade == Availability::Webpage { 2 } else { 0 },
             error: None,
+            stream: None,
         }
     }
     fn row(grade: Availability, ms: Option<f64>) -> HistoryEntry {
@@ -350,5 +369,78 @@ mod tests {
         )
         .unwrap();
         assert!(compare_candidates(&a, &b).is_lt());
+    }
+
+    fn with_stream(
+        grade: Availability,
+        health: crate::diagnostics::StreamHealth,
+        node: &str,
+    ) -> Candidate {
+        let mut v = current(grade, Some(500.0));
+        v.stream = Some(crate::diagnostics::StreamReport {
+            samples_requested: 5,
+            samples_completed: usize::from(health == crate::diagnostics::StreamHealth::Healthy),
+            early_cuts: usize::from(health == crate::diagnostics::StreamHealth::Cut),
+            slow_samples: 0,
+            min_received_ratio: 1.0,
+            median_throughput_kbps: 3000.0,
+            health,
+            samples: vec![],
+            represents: "proxy_link".into(),
+        });
+        Candidate::verified(node.into(), &[], v, None).unwrap()
+    }
+
+    #[test]
+    fn disabled_stream_dimension_leaves_ordering_exactly_unchanged() {
+        // All `None` => equal tie-breaker => grade, score, mean_ms, name only.
+        let a = Candidate::verified(
+            "a".into(),
+            &[],
+            current(Availability::Webpage, Some(500.0)),
+            None,
+        )
+        .unwrap();
+        let b = Candidate::verified(
+            "b".into(),
+            &[],
+            current(Availability::Webpage, Some(500.0)),
+            None,
+        )
+        .unwrap();
+        assert!(a.verification.stream.is_none());
+        assert!(b.verification.stream.is_none());
+        assert!(
+            compare_candidates(&a, &b).is_lt(),
+            "name must decide when scores tie"
+        );
+        assert_eq!(a.score.total, b.score.total);
+    }
+
+    #[test]
+    fn grade_still_outranks_stream() {
+        let web_cut = with_stream(
+            Availability::Webpage,
+            crate::diagnostics::StreamHealth::Cut,
+            "z",
+        );
+        let ip_healthy = with_stream(
+            Availability::IpOnly,
+            crate::diagnostics::StreamHealth::Healthy,
+            "a",
+        );
+        assert!(compare_candidates(&web_cut, &ip_healthy).is_lt());
+    }
+
+    #[test]
+    fn stream_breaks_ties_only_inside_the_same_grade() {
+        use crate::diagnostics::StreamHealth as H;
+        let healthy = with_stream(Availability::Webpage, H::Healthy, "z");
+        let degraded = with_stream(Availability::Webpage, H::Degraded, "a");
+        let unknown = with_stream(Availability::Webpage, H::Unknown, "a");
+        let cut = with_stream(Availability::Webpage, H::Cut, "a");
+        assert!(compare_candidates(&healthy, &degraded).is_lt());
+        assert!(compare_candidates(&degraded, &unknown).is_lt());
+        assert!(compare_candidates(&unknown, &cut).is_lt());
     }
 }

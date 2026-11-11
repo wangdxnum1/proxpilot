@@ -141,16 +141,17 @@ impl HistorySession {
             store,
             warning,
         };
-        if let Some(error) = &result.warning {
-            crate::ui::warn(&format!("测量历史不可用，本轮网络测试继续：{error}"));
-        }
+        // History is an optional scoring aid: when it is unavailable the run
+        // continues with cold-start priors. Stay silent on the terminal and
+        // surface the reason only through the machine report.
         result
     }
     fn record_many(&mut self, be: &Backend, measurements: &[(String, Measurement)]) {
         if self.warning.is_some() || measurements.is_empty() {
             return;
         }
-        let result = if self.scope.profile != crate::appstate::current_profile_id(be) {
+        let profile_changed = self.scope.profile != crate::appstate::current_profile_id(be);
+        let result = if profile_changed {
             Err(AppError::new(ErrorCode::ProfileChanged, Stage::State))
         } else {
             self.store
@@ -159,7 +160,19 @@ impl HistorySession {
                 .and_then(|store| store.record_many(&self.scope, measurements, now()))
         };
         if let Err(error) = result {
-            crate::ui::warn(&format!("测量历史未写入，本轮网络测试继续：{error}"));
+            // Silent by default: the network test already succeeded and the
+            // reason stays in the machine report. `--verbose` surfaces it.
+            if crate::report::verbose() {
+                let reason = if profile_changed {
+                    "订阅在本次测量期间发生了变化，结果不记入历史以免归到错误订阅"
+                } else {
+                    "历史库无法写入（可能是目录权限、磁盘只读或数据库被占用）"
+                };
+                crate::ui::warn(&format!("测量历史未写入，本轮网络测试继续：{reason}"));
+                if !profile_changed {
+                    crate::ui::dim(&format!("  底层错误：{error}"));
+                }
+            }
             self.warning = Some(error);
         }
     }
@@ -226,7 +239,11 @@ impl HistorySession {
         match self.recent(node) {
             Ok(rows) => rows,
             Err(error) => {
-                crate::ui::warn(&format!("测量历史读取失败，评分采用冷启动先验：{error}"));
+                // Same rule as writes: scoring silently falls back to the
+                // cold-start prior; `--verbose` surfaces the reason.
+                if crate::report::verbose() {
+                    crate::ui::warn(&format!("测量历史读取失败，评分采用冷启动先验：{error}"));
+                }
                 self.warning = Some(error);
                 vec![]
             }

@@ -11,7 +11,7 @@ ProxPilot 是一个 Windows 命令行工具，用于解决 Clash 系代理客户
 
 ProxPilot 直接与本机运行的内核 API 通信：并发探测节点 → 逐个真实访问验证 → 按本轮验证等级和透明参考分优选，全程彩色输出、无需打开浏览器。
 
-运行过程有**实时进度指示**（旋转符 + 当前步骤 + 已耗时 + 完成计数，如 `⠹ 并发探测节点... 已测 17/53 (8s)`）；输出被重定向到文件/管道时自动降级为静态日志，设 `PROXPILOT_SPINNER=1` 可强制开启。
+运行过程有**实时进度指示**（旋转符 + 当前步骤 + 已耗时 + 完成计数，如 `⠹ 并发探测节点... 已测 17/53 (8s)`）；输出被重定向到文件/管道时自动降级为静态日志，设 `PROXPILOT_SPINNER=1` 可强制开启。git 长连接检测（`--git-check`）同样有进度：`⠹ 长连接检测：并发 5 次采样，已完成 3/5（每次 2048 KiB） (6s)`。
 
 ---
 
@@ -207,6 +207,13 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 | `--probe-timeout-ms <N>` | `4000` | 初筛超时，范围 100–120000ms |
 | `--verify-timeout-ms <N>` | `12000` | 网页每次采样的整体预算，浏览器候补共享，范围 100–120000ms |
 | `--retries <N>` | `1` | 初筛传输故障额外重试 0–3 次，退避 200/400/800ms；不重试网页失败采样 |
+| `--git-check` | 关 | 启用 git 长连接检测：同节点内并发采样大流量传输，只在同一验证等级内参与排序 |
+| `--git-url <地址>` | `speed.cloudflare.com/__down?bytes=N` | 长连接探测目标。真实 GitHub 场景建议 `https://codeload.github.com/git/git/tar.gz/refs/heads/master` |
+| `--git-bytes <N>` | `2097152` | 单次期望字节数与读取上限，范围 1024–67108864 |
+| `--git-samples <N>` | `5` | 并发采样次数，范围 1–10；5 次对约 44% 失败率的检出概率约 94% |
+| `--git-timeout-ms <N>` | `15000` | 单次采样整体超时，范围 100–120000 |
+| `--git-first-byte-ms <N>` | `5000` | 首字节超时，须不大于整体超时；用于区分「掐连接」与「卡死」 |
+| `--min-throughput-kbps <N>` | `200` | 限速告警阈值，低于此值记为限速样本 |
 | `--interval <秒>` | `300` | `watch` 的检查周期 |
 | `--optimize` | 关 | `watch` 启动时及定时主动优选；默认仅在当前节点故障确认后优选 |
 | `--reopt <秒>` | `7200` | `watch --optimize` 的定时重新优选间隔；单独设置不启用主动优选 |
@@ -214,6 +221,7 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 | `--failure-cooldown <秒>` | `600` | 失败候选冷却，不把全局控制或配置错误记为节点失败；0关闭 |
 | `--manual-hold <秒>` | `900` | 操作外选择变化后的主动优化保护；0关闭，仍重置周期 |
 | `--dry-run` | 关 | 只探测报告、不切换不修复（`fix` 下等价于 `scan`；`check` 下不自动开系统代理） |
+| `--verbose` / `-v` | 关 | 显示详细解释：长连接判定依据与失败占比、历史库读写异常等；默认终端只给一行结论与建议 |
 | `--no-system-proxy` | 关 | 保持系统代理设置，适合 TUN 或手动管理代理；网页验证仍使用指定出口 |
 | `--detect` | 关 | 自动选择本机客户端，与 `--client auto` 等价；覆盖保存的默认值，但不覆盖显式 `--client` |
 
@@ -244,6 +252,13 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 ```
 
 - **初筛与实测是两回事**：延迟探测只要收到任何 HTTP 响应就算成功（403 也算）；真实验证使用 `wreq + BoringSSL` 经指定代理发起 HTTPS 请求，读取完整响应体并计时，两次 200 才算"能访问"。内核 API 保留 `reqwest + rustls`。
+- **git 长连接是第三个维度**（`--git-check`，默认关闭）：网页短请求全通过，不代表节点能撑住 `git clone/fetch` 那种单连接连续传输几十 MB。此类节点的典型表现是「网页说得开、git 时好时坏」，报错像 SSL 但实际是对端提前断开 TCP。
+  - 单节点内 **N 次采样并发**执行（同一节点多条独立连接）；候选之间仍串行，因为内核的选择是全局状态。N 条独立连接即 N 次伯努利试验，墙钟约等于单次采样而非 N 倍。
+  - 每次采样逐帧读取并计数，记录首字节时间、实收/期望字节、吞吐与中断位置；收到响应头后 body 提前结束记为早期中断（不是 `HTTP 0`）。
+  - 归因（对齐 gitpilot 判别法则）：早期中断 → `cut`；完整但吞吐低于阈值 → `degraded`；TLS/DNS/连接建立失败或零字节超时 → `unknown`，**不当作节点质量问题**，避免环境异常冤枉节点。
+  - 结果**正交于验证等级**：不改变 `Webpage > IpOnly > Failed`，不改变 50/25/15/10 公式，不改变退出码；只在同一等级内打破平手。未启用时排序与输出与之前完全一致。
+  - `check` 的 stream 结果需要前后状态快照一致（`stable`）才归属到该节点，否则记为 `unknown`，不把可能已变化的节点当成结论。
+  - 标注 `represents: proxy_link`：衡量的是**代理链路**的大流量传输能力，不代表真实 `git.exe` 行为（也因此不受探测进程 TLS 凭据问题影响）。
 - **浏览器指纹模拟**：`wreq-util` 默认使用 Windows Chrome 149 配置，统一生成 UA、Client Hints、TLS ClientHello 和 HTTP/2 设置。仅当收到 HTTP 403 且 `cf-mitigated: challenge` 时，尝试 macOS Safari 26 配置；候补返回 200 后，同一次节点验证的后续采样优先使用该配置。两个配置的 Cookie 独立，每个采样最多尝试两个配置，整体超时 12 秒，计时包含候补请求。支持 gzip/Brotli/deflate/zstd 解压和最多 10 次重定向。每次请求建立新连接，避免切换节点后复用旧隧道。内核 API 请求明确直连，不受系统或环境代理影响。
 - **双信号判定**：`chatgpt.com` 返回 403 时追加检查 `api.openai.com/v1/models`。401 被作为 IP 检查通过的备选信号，并复测隧道稳定性；403 或连接/传输失败判失败。仅 IP 通过的节点排在实测 200 节点之后。API 检查通过不能保证浏览器可访问，也不能证明网页 403 一定由指纹造成。
 - **模拟范围**：可模拟 Chrome 的网络协议特征，但不会执行 JavaScript 或人机验证，不能保证消除 Cloudflare 403。网站实测验证 HTTPS 证书，使用内置 WebPKI 根证书；内核 API 的 rustls 使用系统证书验证。网站实测不会自动信任企业自行添加的根证书。
@@ -255,7 +270,16 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 **Q：节点测速是绿的，为什么 ChatGPT 还是打不开？**
 测速链接只证明隧道连通。ChatGPT 靠 IP 信誉拦截，机场共享 IP 常被 OpenAI/Cloudflare 风控（返回 403 或人机验证），此时测速照样绿。用 `fix` 换到实测 200 的节点即可。
 
-**Q：check 显示 403，但浏览器明明能打开？**
+**Q：ChatGPT 能打开、测速也绿，但 git clone/fetch 总是失败？**
+这说明节点撑不住长连接，不是证书或 SSL backend 问题。`fix` 的网页验证只发短请求，看不出这个维度。用 `proxpilot check --git-check` 确认：若显示「长连接被提前掐断」，用 `proxpilot fix --git-check` 让优选把长连接健康度纳入同等级内的排序。真实 GitHub 场景可加 `--git-url https://codeload.github.com/git/git/tar.gz/refs/heads/master`。报错形如 `curl 56`、`early EOF`、`missing close_notify` 且**在几秒内快速失败**，基本可以确定是节点掐连接，换 SSL backend 无效。
+
+**Q：为什么 `--git-check` 默认关闭？**
+它会真实下载数据（默认 2 MiB × 5 次并发），有流量与时间成本。默认关闭可保证既有命令的行为、耗时和输出完全不变。需要排查 git 问题时再显式开启。
+
+**Q：`--git-check` 会让我从「网页能用的节点」换到更差的节点吗？**
+不会。长连接只是**同一网页验证等级内**的平手裁决，`Webpage` 永远优先于 `IpOnly`；参考分公式和退出码都不变。若所有候选网页等级相同，才会优先选长连接健康的。
+
+
 HTTP 客户端和浏览器的 TLS 指纹、Cookie、JavaScript 执行能力不同，403 可能来自 Cloudflare 验证。ProxPilot 会用 `api.openai.com` 交叉检查，401 作为 IP 检查通过的备选信号，但浏览器访问仍需实际确认。
 
 **Q：fix 提示"全部候选无法打开网页"？**

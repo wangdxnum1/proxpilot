@@ -423,12 +423,14 @@ pub fn use_flow_expected(
         let mut history =
             crate::history::HistorySession::new(be, scope.profile, &args.group, &args.url);
         let prior = history.prior(target);
+        crate::ui::dim(&format!("切换到 {} 并实测...", target));
         transaction.select(target)?;
-        let evidence = checker::verify_access_report_with_timeout(
+        let evidence = checker::verify_access_with_stream(
             &be.proxy,
             &args.url,
             args.samples,
             args.verify_timeout_ms,
+            args.git_stream.as_ref().map(|s| (s.url.clone(), s.options)),
         );
         transaction.validate_current()?;
         scored_candidate = crate::scoring::Candidate::verified(
@@ -471,13 +473,23 @@ fn measure_node<C: SwitchControl + ?Sized>(
     node: &str,
     failures: &mut Vec<crate::diagnostics::NodeFailure>,
 ) -> AppResult<VerificationReport> {
-    let report = checker::verify_access_report_with_timeout(
+    let report = checker::verify_access_with_stream(
         &be.proxy,
         &args.url,
         args.samples,
         args.verify_timeout_ms,
+        args.git_stream.as_ref().map(|s| (s.url.clone(), s.options)),
     );
+    // Stream samples lengthen the window; re-validate selection before the
+    // evidence can be attributed to this node.
     transaction.validate_current()?;
+    if report
+        .stream
+        .as_ref()
+        .is_some_and(|s| s.health == crate::diagnostics::StreamHealth::Cut)
+    {
+        crate::ui::warn(&format!("{} · 长连接检测发现提前掐断", node));
+    }
     if let Some(error) = report.error.as_ref().filter(|error| {
         matches!(
             error.code,
@@ -562,8 +574,15 @@ fn verify_candidates<C: SwitchControl + ?Sized>(
     ));
     let mut verified = Vec::new();
     let mut last_error = AppError::new(ErrorCode::ProbeFailed, Stage::Verification);
-    for (_, name) in reachable.iter().take(args.top) {
+    let total_candidates = reachable.len().min(args.top);
+    for (index, (_, name)) in reachable.iter().take(args.top).enumerate() {
         let prior = history.prior(name);
+        crate::ui::dim(&format!(
+            "第 {}/{} 个候选：切换并实测 {}...",
+            index + 1,
+            total_candidates,
+            name
+        ));
         transaction.select(name)?;
         let report = measure_node(transaction, be, args, history, name, failures)?;
         if report.availability == crate::diagnostics::Availability::Failed {
@@ -608,7 +627,23 @@ fn final_candidate<C: SwitchControl + ?Sized>(
     failures: &mut Vec<crate::diagnostics::NodeFailure>,
 ) -> AppResult<crate::scoring::Candidate> {
     transaction.select(&best.result.node)?;
-    let report = measure_node(transaction, be, args, history, &best.result.node, failures)?;
+    crate::ui::info(&format!("最终确认：切换到 {} 并复验...", best.result.node));
+    let mut report = measure_node(transaction, be, args, history, &best.result.node, failures)?;
+    // Final confirmation re-runs ONE stream sample (not the full N), so the
+    // cost is one RTT rather than another five. It only annotates the report;
+    // it never blocks a webpage-verified commit.
+    if let Some(config) = &args.git_stream {
+        let mut confirm = config.options;
+        confirm.samples = 1;
+        if let Some(stream) = checker::run_stream(&be.proxy, &config.url, Some(confirm)) {
+            let health = stream.health;
+            transaction.validate_current()?;
+            report.stream = Some(stream);
+            if health == crate::diagnostics::StreamHealth::Cut {
+                crate::ui::warn("最终确认时长连接检测仍发现提前掐断（不阻断网页验证结果）");
+            }
+        }
+    }
     if report.availability == crate::diagnostics::Availability::Failed
         || (best.result.verification.availability == crate::diagnostics::Availability::Webpage
             && report.availability != crate::diagnostics::Availability::Webpage)

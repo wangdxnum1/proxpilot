@@ -211,6 +211,7 @@ mod tests {
                 samples_requested: 2,
                 samples_passed: 2,
                 error: None,
+                stream: None,
             })
             .unwrap();
         assert_eq!(result.memory, Some(MemorySync::NotAvailable));

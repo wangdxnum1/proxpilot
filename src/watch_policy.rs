@@ -302,6 +302,7 @@ mod tests {
             samples_requested: 1,
             samples_passed: usize::from(grade == Availability::Webpage),
             error: None,
+            stream: None,
         }
     }
     fn score(total: f64) -> ScoreBreakdown {

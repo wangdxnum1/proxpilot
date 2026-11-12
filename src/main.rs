@@ -13,6 +13,7 @@ mod diagnose;
 mod diagnostics;
 mod history;
 mod http;
+mod lifetime;
 mod mihomo;
 mod nodeinfo;
 mod operation;
@@ -57,6 +58,8 @@ fn flag_takes_value(value: &str) -> bool {
             | "--git-timeout-ms"
             | "--git-first-byte-ms"
             | "--min-throughput-kbps"
+            | "--lifetime-window-ms"
+            | "--lifetime-samples"
     )
 }
 
@@ -76,6 +79,7 @@ fn is_command(value: &str) -> bool {
             | "recover"
             | "diagnose"
             | "deps"
+            | "lifetime"
             | "browse"
             | "help"
     )
@@ -137,6 +141,30 @@ pub struct Args {
     pub overwrite: bool,
     pub verbose: bool,
     pub git_stream: Option<StreamConfig>,
+    /// Connection-lifetime quick probe settings; `None` when the flags were not
+    /// used, so `lifetime` falls back to its defaults.
+    pub lifetime: Option<LifetimeConfig>,
+}
+
+/// Idle-tunnel lifetime probe settings for the `lifetime` command.
+#[derive(Clone, Debug)]
+pub struct LifetimeConfig {
+    pub host: String,
+    pub samples: usize,
+    pub window_ms: u64,
+}
+
+impl LifetimeConfig {
+    fn default_host() -> String {
+        "www.google.com".into()
+    }
+    pub fn default_options() -> Self {
+        Self {
+            host: Self::default_host(),
+            samples: lifetime::DEFAULT_SAMPLES,
+            window_ms: lifetime::DEFAULT_WINDOW_MS,
+        }
+    }
 }
 
 /// Git long-connection detection settings. `None` means the whole dimension is
@@ -181,6 +209,7 @@ pub enum Cmd {
     History(bool),
     Diagnose,
     Deps,
+    Lifetime,
     Browse,
 }
 
@@ -226,6 +255,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
         overwrite: false,
         verbose: false,
         git_stream: None,
+        lifetime: None,
     };
     // Stream settings are staged here so flags can appear in any order.
     let mut git_bytes: Option<u64> = None;
@@ -235,6 +265,9 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
     let mut git_first_byte_ms: Option<u32> = None;
     let mut min_throughput_kbps: Option<u64> = None;
     let mut git_check = false;
+    let mut lifetime_host: Option<String> = None;
+    let mut lifetime_samples: Option<usize> = None;
+    let mut lifetime_window_ms: Option<u64> = None;
     let mut command = false;
     let mut supported = false;
     let mut recovery_action = None;
@@ -317,6 +350,31 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 }
             }
             "--git-check" => git_check = true,
+            "--lifetime-host" => lifetime_host = Some(value(&mut it, &arg)?),
+            "--lifetime-samples" => {
+                let n: usize = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--lifetime-samples 必须为正整数".to_string())?;
+                if !(1..=lifetime::MAX_SAMPLES).contains(&n) {
+                    return Err(format!(
+                        "--lifetime-samples 需在 1 – {} 之间",
+                        lifetime::MAX_SAMPLES
+                    ));
+                }
+                lifetime_samples = Some(n);
+            }
+            "--lifetime-window-ms" => {
+                let n: u64 = value(&mut it, &arg)?
+                    .parse()
+                    .map_err(|_| "--lifetime-window-ms 必须为正整数".to_string())?;
+                if !(500..=lifetime::MAX_WINDOW_MS).contains(&n) {
+                    return Err(format!(
+                        "--lifetime-window-ms 需在 500 – {} 之间",
+                        lifetime::MAX_WINDOW_MS
+                    ));
+                }
+                lifetime_window_ms = Some(n);
+            }
             "--git-url" => git_url = Some(value(&mut it, &arg)?),
             "--git-bytes" => {
                 let n: u64 = value(&mut it, &arg)?
@@ -381,7 +439,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 return Ok(args);
             }
             "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" | "nodes"
-            | "info" | "recover" | "history" | "diagnose" | "deps" | "browse"
+            | "info" | "recover" | "history" | "diagnose" | "deps" | "lifetime" | "browse"
                 if !command =>
             {
                 command = true;
@@ -389,6 +447,7 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                     "browse" => Cmd::Browse,
                     "diagnose" => Cmd::Diagnose,
                     "deps" => Cmd::Deps,
+                    "lifetime" => Cmd::Lifetime,
                     "nodes" => Cmd::Nodes,
                     "recover" => Cmd::Recover(RecoveryAction::Inspect),
                     "history" => Cmd::History(false),
@@ -491,6 +550,23 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
             return Err("--git-url 必须是带主机名的 http(s) URL".into());
         }
         args.git_stream = Some(StreamConfig { url, options });
+    }
+    if lifetime_host.is_some() || lifetime_samples.is_some() || lifetime_window_ms.is_some() {
+        let mut config = LifetimeConfig::default_options();
+        if let Some(host) = lifetime_host {
+            let trimmed = host.trim().to_string();
+            if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains(' ') {
+                return Err("--lifetime-host 只接受主机名（不含协议、端口或路径）".into());
+            }
+            config.host = trimmed;
+        }
+        if let Some(n) = lifetime_samples {
+            config.samples = n;
+        }
+        if let Some(n) = lifetime_window_ms {
+            config.window_ms = n;
+        }
+        args.lifetime = Some(config);
     }
     Ok(args)
 }
@@ -835,6 +911,9 @@ fn print_help() {
     println!(
         "  deps           逐个检查开发工具（npm/pip/cargo/docker/maven/nuget/git）走代理还是直连"
     );
+    println!(
+        "  lifetime       快速探测连接寿命：只建空闲隧道不发数据，看多久被断开（约 3–12 秒出结果）"
+    );
     println!("  history [clear] 查看最近测量记录或清理本工具历史（无需内核在线）");
     println!("  recover [--retry | --discard]  查看、重试恢复或仅清理恢复记录");
     println!("  clients [--supported]  查看发现的客户端 / 支持的类型");
@@ -865,7 +944,7 @@ fn print_help() {
     println!("  --git-check       启用 git 长连接检测；同节点内并发采样，只在同一验证等级内排序");
     println!("  --git-url <地址> 长连接探测目标（默认 speed.cloudflare.com/__down?bytes=N）");
     println!("  --git-bytes <N>  单次期望/上限字节数（默认 2097152，范围 1024–67108864）");
-    println!("  --git-samples <N> 并发采样次数（默认 5，范围 1–10）");
+    println!("  --git-samples <N> 并发采样次数（默认 6，范围 1–10）");
     println!("  --git-timeout-ms <N>      单次整体超时（默认 15000）");
     println!("  --git-first-byte-ms <N>   首字节超时（默认 5000，须 ≤ 整体超时）");
     println!("  --min-throughput-kbps <N> 限速告警阈值（默认 200）");
@@ -888,6 +967,134 @@ fn print_help() {
     println!("  proxpilot watch --interval 180");
     println!("  proxpilot watch --optimize --reopt 7200");
     println!("  proxpilot use \"香港 IEPL 01\"");
+}
+
+fn cmd_lifetime(args: &Args) -> Result<(), CommandFailure> {
+    let config = args
+        .lifetime
+        .clone()
+        .unwrap_or_else(LifetimeConfig::default_options);
+    // Same endpoint precedence as `deps`: explicit --proxy, then the system
+    // proxy the kernel installed, then the conventional default.
+    let proxy = args
+        .proxy
+        .clone()
+        .or_else(|| sysproxy::registry_proxy_server())
+        .unwrap_or_else(|| "127.0.0.1:7890".into());
+    let shown = if proxy.contains("://") {
+        ui::display_url(&proxy)
+    } else {
+        proxy.clone()
+    };
+    ui::info(&format!(
+        "代理出口：{shown}　目标：{}:443　观察窗口：{:.0} 秒",
+        config.host,
+        config.window_ms as f64 / 1000.0
+    ));
+    let spinner = ui::Spinner::start(&format!(
+        "建立 {} 条空闲隧道，观察多久被断开（每条都不发送任何数据）",
+        config.samples
+    ));
+    let value = lifetime::probe(&proxy, &config.host, config.samples, config.window_ms);
+    // Spinner stops and clears its line when dropped.
+    drop(spinner);
+    report::data(lifetime::to_json(&value));
+    match value.verdict {
+        lifetime::LifetimeVerdict::CapObserved => {
+            let seconds = value.lifespan_ms.unwrap_or(0.0) / 1000.0;
+            ui::info(&format!(
+                "✘ 连接寿命受限（{} 条隧道中有 {} 条被断开，集中落在约 {:.1} 秒）",
+                value.samples_requested, value.samples_closed, seconds
+            ));
+            ui::dim(&format!(
+                "这些隧道全程没有发送任何数据，所以断开与传输量、传输速度无关，是连接本身活不过这个时长{}",
+                value
+                    .spread_ms
+                    .map(|s| format!("（各条断开时刻最多相差 {:.0} 毫秒）", s))
+                    .unwrap_or_default()
+            ));
+            if report::verbose() {
+                ui::dim(
+                    "可能原因：出口节点、中间链路或目标站点对连接施加了寿命限制；本工具只观测到现象，不判断具体责任方",
+                );
+                ui::dim(
+                    "实际影响：git clone/fetch 一条连接要连续传几十 MB，活不过这个时长就要整个重来，较大的仓库失败率较高",
+                );
+                ui::dim("空闲就会断，这一点与「下载慢」不同：带宽再好也救不了");
+            }
+            ui::warn("该链路的连接存活时间偏短，长时间传输容易被中断；可换节点后重测");
+        }
+        lifetime::LifetimeVerdict::CapVariable => {
+            let ages: Vec<f64> = value
+                .samples
+                .iter()
+                .filter(|s| s.closed)
+                .map(|s| s.survived_ms)
+                .collect();
+            let earliest = ages.iter().copied().fold(f64::MAX, f64::min) / 1000.0;
+            let latest = ages.iter().copied().fold(f64::MIN, f64::max) / 1000.0;
+            ui::info(&format!(
+                "✘ 连接寿命受限，且每次断开的时长不固定（{} 条隧道中有 {} 条被断开，最早约 {:.1} 秒、最晚约 {:.1} 秒）",
+                value.samples_requested, value.samples_closed, earliest, latest
+            ));
+            ui::dim(
+                "空闲隧道本不该被断开，却被断开了，说明这条链路对连接有存活限制；只是不同连接的寿命不一致",
+            );
+            if report::verbose() {
+                ui::dim(
+                    "可能原因：出口节点、中间链路或目标站点对连接施加了寿命限制；本工具只观测到现象，不判断具体责任方",
+                );
+                ui::dim(
+                    "实际影响：git clone/fetch 一条连接要连续传几十 MB，活不过这个时长就要整个重来，较大的仓库失败率较高",
+                );
+            }
+            ui::warn("该链路的连接存活时间偏短，长时间传输容易被中断；可换节点后重测");
+        }
+        lifetime::LifetimeVerdict::NoCapObserved => {
+            ui::info(&format!(
+                "✔ 观察期内没有断开（{} 条隧道全部活过 {:.0} 秒）",
+                value.samples_requested,
+                value.window_ms as f64 / 1000.0
+            ));
+            ui::dim("空闲连接能存活，说明该链路没有明显的连接寿命上限");
+            if report::verbose() {
+                ui::dim("若 git 仍然失败，问题更可能在带宽、丢包或目标站点，可再跑 check --git-check 看传输侧表现");
+            }
+        }
+        lifetime::LifetimeVerdict::Inconclusive => {
+            // Two different reasons land here: too few closes to compare, or
+            // closes that disagree. Say which one happened.
+            if value.samples_closed < 2 {
+                ui::info(&format!(
+                    "? 无法判定（{} 条隧道中 {} 条被断开，样本太少）",
+                    value.samples_requested, value.samples_closed
+                ));
+                if report::verbose() {
+                    ui::dim(
+                        "至少需要 2 条隧道被断开才能比较断开时刻；可加大 --lifetime-samples 后重测",
+                    );
+                }
+            } else {
+                ui::info(&format!(
+                    "? 无法判定（{} 条隧道中 {} 条被断开，断开时刻不一致）",
+                    value.samples_requested, value.samples_closed
+                ));
+                ui::dim("可能是随机丢包或链路抖动，而不是固定寿命上限");
+                if report::verbose() {
+                    ui::dim("可加大 --lifetime-samples 或 --lifetime-window-ms 后重测");
+                }
+            }
+        }
+        lifetime::LifetimeVerdict::Unreachable => {
+            ui::fail("无法建立隧道：代理不可用或目标主机不通；本次结论不代表节点质量");
+        }
+    }
+    if report::verbose() {
+        ui::dim(
+            "说明：本探测只建立 CONNECT 隧道、不发送任何字节，测的是连接存活时间；它不验证 TLS、不下载数据，也不代表真实 git.exe 行为",
+        );
+    }
+    Ok(())
 }
 
 fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
@@ -1339,7 +1546,7 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
     let label = match stream.health {
         diagnostics::StreamHealth::Healthy => "✔ 稳定",
         diagnostics::StreamHealth::Degraded => "▲ 偏慢",
-        diagnostics::StreamHealth::Limited => "✘ 有时长限制",
+        diagnostics::StreamHealth::Limited => "✘ 连接寿命受限",
         diagnostics::StreamHealth::Cut => "✘ 不稳定",
         diagnostics::StreamHealth::Unknown => "? 无法判定",
     };
@@ -1372,23 +1579,31 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
         diagnostics::StreamHealth::Limited => {
             let seconds = stream.cut_after_ms.unwrap_or(0.0) / 1000.0;
             ui::dim(&format!(
-                "多条连接都在约 {:.1} 秒时被切断（断开时刻高度一致，不像随机丢包）",
+                "多条连接都在约 {:.1} 秒时被断开，断开时刻高度一致，不像随机丢包",
                 seconds
             ));
             if verbose {
-                ui::dim(&format!(
-                    "被切断的连接当时只收到约 {:.0}% 的数据，而完成的连接可以跑更久",
-                    stream.min_received_ratio * 100.0
-                ));
+                if stream.early_cuts >= 2 {
+                    ui::dim(&format!(
+                        "被断开的连接当时已传数据量差别很大（最低只到目标的约 {:.0}%），说明断开看的是连接活多久，不是传了多少",
+                        stream.min_received_ratio * 100.0
+                    ));
+                } else {
+                    ui::dim(&format!(
+                        "被断开的连接当时已收到约 {:.0}% 的数据，不是在传完时结束",
+                        stream.min_received_ratio * 100.0
+                    ));
+                }
+                ui::dim("也就是说这条链路对连接本身有存活时间上限，连续传输撑不过这个时刻");
                 ui::dim(
-                    "可能原因：出口节点、中间链路或目标站点对该传输施加了限制；本工具只观测到现象，不判断具体责任方",
+                    "可能原因：出口节点、中间链路或目标站点对连接施加了寿命限制；本工具只观测到现象，不判断具体责任方",
                 );
                 ui::dim(
-                    "实际影响：git clone/fetch 一条连接要连续传几十 MB，中途被断开就要整个重来，较大的仓库失败率较高",
+                    "实际影响：git clone/fetch 一条连接要连续传几十 MB，活不过这个时长就要整个重来，较大的仓库失败率较高",
                 );
             }
             ui::warn(
-                "该链路在长时间传输时会被中断，对 git 不友好；可换节点后重测，或加 --verbose 查看细节",
+                "该链路的连接存活时间偏短，长时间传输容易被中断；可换节点后重测，或加 --verbose 查看细节",
             );
         }
         diagnostics::StreamHealth::Cut => {
@@ -1422,7 +1637,7 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
     }
     if verbose {
         ui::dim(
-            "说明：衡量的是代理链路的大流量传输能力，不代表真实 git.exe 行为；早期中断常见于机场节点对长连接的限制",
+            "说明：衡量的是代理链路的大流量传输能力，不代表真实 git.exe 行为；早期中断常见于链路对连接寿命或长连接的限制",
         );
     }
 }
@@ -2212,6 +2427,7 @@ fn run_main() {
         // Pure network probe of each toolchain's registry; needs no kernel and
         // changes nothing, so it runs before backend discovery.
         Cmd::Deps => Some(cmd_deps(&args)),
+        Cmd::Lifetime => Some(cmd_lifetime(&args)),
         Cmd::Recover(action) if args.dry_run => {
             Some(cmd_recovery_preview(*action).map_err(Into::into))
         }
@@ -2275,7 +2491,12 @@ fn run_main() {
         Cmd::Fix => cmd_fix(&be, &agent, &args),
         Cmd::Use(n) => cmd_use(&be, &agent, &args, n),
         Cmd::Watch => cmd_watch(&be, &agent, &args),
-        Cmd::Clients(_) | Cmd::Config(_) | Cmd::History(_) | Cmd::Diagnose | Cmd::Deps => {
+        Cmd::Clients(_)
+        | Cmd::Config(_)
+        | Cmd::History(_)
+        | Cmd::Diagnose
+        | Cmd::Deps
+        | Cmd::Lifetime => {
             unreachable!()
         }
         Cmd::Help => {

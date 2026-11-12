@@ -264,9 +264,11 @@ pub struct VerificationReport {
 pub enum StreamHealth {
     Healthy,
     Degraded,
-    /// Failures cluster at the same elapsed time, which points at a limit on
-    /// transfer duration somewhere in the path (egress node, relay or target).
-    /// The tool observes the pattern; it does not attribute the cause.
+    /// Failures cluster at the same elapsed time regardless of how many bytes
+    /// they had transferred, which points at a lifetime cap on the connection
+    /// itself somewhere in the path (egress node, relay or target) rather than
+    /// a throughput limit. The tool observes the pattern; it does not attribute
+    /// the cause.
     Limited,
     Cut,
     #[default]

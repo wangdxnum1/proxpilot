@@ -85,14 +85,14 @@ pub fn classify_stream(
     } else {
         rates[rates.len() / 2]
     };
-    // Cuts that land at the same moment suggest a limit on transfer duration
+    // Cuts that land at the same moment suggest a lifetime cap on the connection
     // somewhere in the path. Cluster detection needs at least two observed
     // cuts and a spread small enough that random network failures cannot
     // explain it.
     let cut_after_ms = clustered_cut_time(&cut_elapsed, options.timeout_ms);
     let budget = f64::from(options.timeout_ms);
-    // Such a limit only makes sense when that connection was moving bytes; a
-    // zero-byte failure is a transport/setup problem, not a time limit.
+    // Such a cap only makes sense when that connection was moving bytes; a
+    // zero-byte failure is a transport/setup problem, not a lifetime cap.
     let single_cut_ms = if cuts == 1 && cut_after_ms.is_none() {
         samples
             .iter()
@@ -114,8 +114,11 @@ pub fn classify_stream(
     });
     // A single mid-body cut that is clearly not the overall budget is enough on
     // its own: the peer dropped us at a moment it chose. Semantic note: this
-    // says "the path stalled", not "the node did it".
+    // says "the connection stopped living", not "the node did it".
     let single_early_cut = cuts == 1 && single_cut_ms.is_some();
+    // Cuts that land at the same moment regardless of bytes transferred mean the
+    // connection has a lifetime cap rather than a throughput cap. The measured
+    // moment is that lifetime; attribution stays with the observer, not the node.
     let limited = (cuts >= 2 && cut_after_ms.is_some()) || barely_completed || single_early_cut;
     let effective_cut_ms = if limited {
         cut_after_ms.or(single_cut_ms)

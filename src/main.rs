@@ -1112,7 +1112,14 @@ fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
         proxy.clone()
     };
     let timeout_ms = u64::from(args.probe.timeout_ms.max(1000));
-    let report_value = deps::report(&proxy, timeout_ms);
+    // The probes run concurrently, so this is the longest single probe rather
+    // than the sum. Without a progress line the command looks hung for that
+    // whole window.
+    let spinner = ui::Spinner::start("逐个探测各工具的代理与直连路径…");
+    let report_value = deps::report(&proxy, timeout_ms, |done, total| {
+        spinner.set_text(format!("逐个探测各工具的代理与直连路径… {done}/{total}"));
+    });
+    drop(spinner);
     report::data(deps::to_json(&report_value));
     ui::info(&format!("代理出口：{shown}"));
     if let Some(server) = &report_value.system_proxy {
@@ -1126,18 +1133,31 @@ fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
         ui::dim("环境变量代理：未设置（只认环境变量的工具将直连）");
     }
     println!();
+    // Header: the four columns are meaningless without labels, and "配置来源"
+    // is the column that reads "where does this tool get its network settings".
+    println!(
+        "  {} {} {} {} {} {}",
+        deps::cell("工具", 7),
+        deps::cell("依赖仓库端点", 22),
+        deps::cell("配置来源", 28),
+        deps::cell("经代理", 9),
+        deps::cell("直连", 9),
+        "结论"
+    );
     for probe in &report_value.probes {
-        let route = match probe.proxy_source {
-            deps::ProxySource::System => "系统代理",
-            deps::ProxySource::Environment => "环境变量",
-            deps::ProxySource::OwnConfig => "自有配置",
-            deps::ProxySource::Direct => "直连",
+        let source = match (&probe.config, probe.proxy_source) {
+            (Some(config), _) => config.clone(),
+            (None, deps::ProxySource::System) => "系统代理".to_string(),
+            (None, deps::ProxySource::Environment) => "环境变量".to_string(),
+            (None, deps::ProxySource::OwnConfig) => "自有配置".to_string(),
+            (None, deps::ProxySource::Direct) => "直连（无配置）".to_string(),
         };
         let status = match probe.reach {
-            deps::Reach::Both => "✔ 两条路都通".to_string(),
-            deps::Reach::ViaProxy => "✔ 需经代理".to_string(),
+            deps::Reach::Both => "✔ 两条都通".to_string(),
+            // Worth flagging: nothing else keeps this tool working.
+            deps::Reach::ViaProxy => "▲ 只能走代理".to_string(),
             deps::Reach::Direct => "✔ 可直连".to_string(),
-            deps::Reach::Unreachable => "✘ 两条路都不通".to_string(),
+            deps::Reach::Unreachable => "✘ 都不通".to_string(),
         };
         let via = probe
             .via_proxy_ms
@@ -1148,17 +1168,21 @@ fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "-".into());
         println!(
-            "  {:<8} {:<22} {:<8} 代理 {:<7} 直连 {:<7}  {}",
-            probe.tool, probe.endpoint, route, via, direct, status
+            "  {} {} {} {} {} {}",
+            deps::cell(&probe.tool, 7),
+            deps::cell(&probe.endpoint, 22),
+            deps::cell(&source, 28),
+            deps::cell(&via, 9),
+            deps::cell(&direct, 9),
+            status
         );
-        if let Some(config) = &probe.config {
-            ui::dim(&format!("           配置：{config}"));
-        }
     }
     println!();
-    ui::dim(
-        "说明：本命令只读探测各工具 registry 端点的可达性，不修改任何工具配置；仅代表端点连通，不代表完整业务可用。",
-    );
+    ui::dim("配置来源：这个工具从哪里读网络设置——「系统代理」跟随 Windows 设置，");
+    ui::dim("          写文件名的表示它有自己的配置（镜像源或代理），与系统代理无关。");
+    ui::dim("经代理/直连：分别探测该端点 443 端口的握手耗时，「-」表示这条路不通。");
+    ui::dim("「▲ 只能走代理」表示代理一停这个工具立刻不可用。");
+    ui::dim("说明：只读探测，不修改任何配置；仅代表端点连通，不代表完整业务可用。");
     Ok(())
 }
 

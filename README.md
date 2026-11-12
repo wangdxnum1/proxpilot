@@ -205,21 +205,23 @@ proxpilot deps
   系统代理：127.0.0.1:7890
   环境变量代理：未设置（只认环境变量的工具将直连）
 
-  npm      registry.npmjs.org     系统代理   代理 6ms    直连 180ms   ✔ 两条路都通
-  pip      pypi.org               系统代理   代理 0ms    直连 38ms    ✔ 两条路都通
-  cargo    rsproxy.cn             自有配置   代理 37ms   直连 34ms    ✔ 两条路都通
-             配置：~/.cargo/config.toml
-  docker   registry-1.docker.io   系统代理   代理 27ms   直连 -       ✔ 需经代理
-  maven    repo.maven.apache.org  直连       代理 141ms  直连 178ms   ✔ 可直连
-  nuget    api.nuget.org          直连       代理 136ms  直连 123ms   ✔ 可直连
-  github   github.com             自有配置   代理 31ms   直连 127ms   ✔ 两条路都通
-             配置：~/.gitconfig
+  工具    依赖仓库端点           配置来源                     经代理    直连      结论
+  npm     registry.npmjs.org     系统代理                     9ms       248ms     ✔ 两条都通
+  pip     pypi.org               系统代理                     8ms       1150ms    ✔ 两条都通
+  cargo   rsproxy.cn             ~/.cargo/config.toml         35ms      67ms      ✔ 两条都通
+  docker  registry-1.docker.io   系统代理                     8ms       -         ▲ 只能走代理
+  maven   repo.maven.apache.org  直连（无配置）               9ms       217ms     ✔ 可直连
+  nuget   api.nuget.org          直连（无配置）               73ms      186ms     ✔ 可直连
+  github  github.com             ~/.gitconfig                 34ms      120ms     ✔ 两条都通
 ```
 
-- `proxy_source` 表示该工具**实际会用**的代理来源：`system`（WinINET 系统代理，多数工具默认）、`environment`（`HTTP_PROXY`/`HTTPS_PROXY` 等）、`own_config`（工具自己的配置文件，如 git 的 `http.proxy`、cargo 的镜像）、`direct`（未发现任何代理配置）。
+14 次探测（7 个工具 × 代理/直连两条路）**并发执行**，墙钟取最慢的一次而不是求和；探测期间显示进度（`… 8/14`），不会再出现「输入命令后卡住几秒没有任何输出」。直连被墙的端点（如 `registry-1.docker.io`）通常就是最慢的那次，它决定了总耗时，可用 `--probe-timeout-ms` 封顶（例如 `--probe-timeout-ms 1500` 把本机 4.1s 压到 1.6s，代价是慢端点可能被误判为不通）。
+
+- **配置来源**：这个工具从哪里读网络设置。「系统代理」表示跟随 Windows 设置（WinINET）；显示文件名的表示它有**自己的配置文件**，与系统代理无关——`~/.gitconfig` 里可能写了 `http.proxy`，`~/.cargo/config.toml` 里可能是镜像源替换（本机就是后者，与代理无关）。
+- `proxy_source`（JSON 字段）表示该工具**实际会用**的代理来源：`system`（WinINET 系统代理，多数工具默认）、`environment`（`HTTP_PROXY`/`HTTPS_PROXY` 等）、`own_config`（工具自己的配置文件，如 git 的 `http.proxy`、cargo 的镜像）、`direct`（未发现任何代理配置）。
 - `own_config` 只在配置文件**真实存在**时才算数；文件不存在会如实降级为 `direct`，不会假报「自有配置」。
-- `reach` 是代理/直连两条路径的实测结果：`both` 两条路都通、`via_proxy` 只有代理通（**这类工具断代理就会失败**）、`direct` 可直连、`unreachable` 都不通。
-- 只做 TCP 可达性探测，不发送业务请求、不读写任何工具配置，也不代表完整业务可用（例如鉴权、CDN 回源仍可能失败）。
+- `reach` 是代理/直连两条路径的实测结果：`both` 两条路都通、`via_proxy` 只有代理通（**这类工具断代理就会失败**，表中标 `▲ 只能走代理`）、`direct` 可直连、`unreachable` 都不通。
+- 只做 TCP 可达性探测（443 端口握手），不发送业务请求、不读写任何工具配置，也不代表完整业务可用（例如鉴权、CDN 回源仍可能失败）。
 - 加 `--json` 输出稳定的机器可读结构（`tools` 按工具名索引）。
 
 ---

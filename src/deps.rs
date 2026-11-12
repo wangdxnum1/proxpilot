@@ -233,11 +233,48 @@ fn config_exists(relative: &str) -> bool {
     home.join(normalized).is_file()
 }
 
-pub fn report(proxy: &str, timeout_ms: u64) -> DepReport {
+pub fn report<F>(proxy: &str, timeout_ms: u64, on_progress: F) -> DepReport
+where
+    F: Fn(usize, usize) + Send + Sync,
+{
     let system_proxy = read_system_proxy();
     let env_proxy = environment_proxy();
+    let targets = targets();
+    // Every (tool, route) pair is independent, so they all run at once: the
+    // wall clock is the slowest single probe, not their sum. A tool whose
+    // direct path is firewalled would otherwise make the whole command wait
+    // out its timeout once per tool.
+    let total = targets.len() * 2;
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<(Option<u64>, Option<u64>)>> = targets
+        .iter()
+        .map(|_| std::sync::Mutex::new((None, None)))
+        .collect();
+    std::thread::scope(|scope| {
+        for (index, target) in targets.iter().enumerate() {
+            for via_proxy in [true, false] {
+                let done = &done;
+                let slots = &slots;
+                let on_progress = &on_progress;
+                scope.spawn(move || {
+                    let route = if via_proxy { Some(proxy) } else { None };
+                    let measured = probe_once(target.host, route, timeout_ms).ok();
+                    let mut slot = slots[index].lock().unwrap();
+                    if via_proxy {
+                        slot.0 = measured;
+                    } else {
+                        slot.1 = measured;
+                    }
+                    drop(slot);
+                    let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    on_progress(finished, total);
+                });
+            }
+        }
+    });
     let mut probes = Vec::new();
-    for target in targets() {
+    for (index, target) in targets.iter().enumerate() {
+        let (via, direct) = *slots[index].lock().unwrap();
         // "Own config" is only real when the file is on disk; otherwise the
         // tool falls back to its built-in default (usually direct).
         let owns_config = target.config.is_some_and(config_exists);
@@ -253,8 +290,6 @@ pub fn report(proxy: &str, timeout_ms: u64) -> DepReport {
             ProxySource::System => ProxySource::Direct,
             other => other,
         };
-        let via = probe_once(target.host, Some(proxy), timeout_ms).ok();
-        let direct = probe_once(target.host, None, timeout_ms).ok();
         let reach = match (via.is_some(), direct.is_some()) {
             (true, true) => Reach::Both,
             (true, false) => Reach::ViaProxy,
@@ -295,6 +330,22 @@ pub fn report(proxy: &str, timeout_ms: u64) -> DepReport {
         environment_proxy: env_proxy,
         probes,
     }
+}
+
+/// Pad `text` to `width` display columns.
+///
+/// `{:<8}` counts chars, so a CJK label like "系统代理" occupies 8 columns but
+/// only 4 chars and the columns after it drift. This pads by rendered width.
+pub fn cell(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let occupied = text.width();
+    if occupied >= width {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + width - occupied);
+    out.push_str(text);
+    out.extend(std::iter::repeat_n(' ', width - occupied));
+    out
 }
 
 /// Machine output keeps a flat, stable shape for scripting.
@@ -379,5 +430,18 @@ mod tests {
         assert_eq!(json["tools"]["npm"]["reach"], "both");
         assert_eq!(json["tools"]["npm"]["proxy_source"], "system");
         assert_eq!(json["tools"]["npm"]["via_proxy_ms"], 10);
+    }
+
+    #[test]
+    fn cell_pads_by_display_width_not_char_count() {
+        use unicode_width::UnicodeWidthStr;
+        // Two CJK chars occupy four columns; padding by char count would leave
+        // the following columns two columns to the left.
+        let padded = cell("工具", 7);
+        assert_eq!(padded.width(), 7);
+        assert_eq!(padded.chars().count(), 5);
+        // Already wide enough: left untouched, never truncated.
+        let long = cell("registry.npmjs.org", 7);
+        assert_eq!(long, "registry.npmjs.org");
     }
 }

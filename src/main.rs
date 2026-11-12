@@ -1097,6 +1097,19 @@ fn cmd_lifetime(args: &Args) -> Result<(), CommandFailure> {
     Ok(())
 }
 
+/// Colour one of the `deps` timing columns without breaking column alignment:
+/// pad by display width first, then wrap in ANSI codes (zero-width).
+fn deps_timing_cell(text: &str, width: usize, mark: deps::RouteMark) -> String {
+    let padded = deps::cell(text, width);
+    match mark {
+        deps::RouteMark::Faster => padded.as_str().green().to_string(),
+        // The slower of two live routes stays in the default colour so green
+        // always means "this is the one to prefer".
+        deps::RouteMark::Slower => padded,
+        deps::RouteMark::Down => padded.as_str().red().to_string(),
+    }
+}
+
 fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
     // deps needs a proxy endpoint; --proxy wins, otherwise use the saved target
     // kernel's port when one can be discovered, else the common default.
@@ -1153,11 +1166,11 @@ fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
             (None, deps::ProxySource::Direct) => "直连（无配置）".to_string(),
         };
         let status = match probe.reach {
-            deps::Reach::Both => "✔ 两条都通".to_string(),
+            deps::Reach::Both => "✔ 两条都通".green().to_string(),
             // Worth flagging: nothing else keeps this tool working.
-            deps::Reach::ViaProxy => "▲ 只能走代理".to_string(),
-            deps::Reach::Direct => "✔ 可直连".to_string(),
-            deps::Reach::Unreachable => "✘ 都不通".to_string(),
+            deps::Reach::ViaProxy => "▲ 只能走代理".yellow().to_string(),
+            deps::Reach::Direct => "✔ 可直连".green().to_string(),
+            deps::Reach::Unreachable => "✘ 都不通".red().to_string(),
         };
         let via = probe
             .via_proxy_ms
@@ -1167,13 +1180,14 @@ fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
             .direct_ms
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "-".into());
+        let (via_mark, direct_mark) = deps::route_marks(probe.via_proxy_ms, probe.direct_ms);
         println!(
             "  {} {} {} {} {} {}",
             deps::cell(&probe.tool, 7),
             deps::cell(&probe.endpoint, 22),
             deps::cell(&source, 28),
-            deps::cell(&via, 9),
-            deps::cell(&direct, 9),
+            deps_timing_cell(&via, 9, via_mark),
+            deps_timing_cell(&direct, 9, direct_mark),
             status
         );
     }
@@ -1181,6 +1195,7 @@ fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
     ui::dim("配置来源：这个工具从哪里读网络设置——「系统代理」跟随 Windows 设置，");
     ui::dim("          写文件名的表示它有自己的配置（镜像源或代理），与系统代理无关。");
     ui::dim("经代理/直连：分别探测该端点 443 端口的握手耗时，「-」表示这条路不通。");
+    ui::dim("          绿色只表示该路握手更快，不代表工具会走它（实际走哪条看配置来源）；红色表示不通。");
     ui::dim("「▲ 只能走代理」表示代理一停这个工具立刻不可用。");
     ui::dim("说明：只读探测，不修改任何配置；仅代表端点连通，不代表完整业务可用。");
     Ok(())

@@ -348,6 +348,38 @@ pub fn cell(text: &str, width: usize) -> String {
     out
 }
 
+/// How to colour one of the two timing columns in `deps` text output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteMark {
+    /// Answered and is the quicker of the two live routes.
+    Faster,
+    /// Answered but the other route was quicker (or equal).
+    Slower,
+    /// Did not answer at all.
+    Down,
+}
+
+/// Decide the colouring of the "via proxy" / "direct" columns.
+///
+/// The quicker of two live routes is green, a route that never answered is
+/// red. When both times are equal the proxy column is treated as the quicker
+/// one. This is a pure verdict; the caller owns the actual ANSI colouring so
+/// that padding can happen before colour codes are added.
+pub fn route_marks(via: Option<u64>, direct: Option<u64>) -> (RouteMark, RouteMark) {
+    match (via, direct) {
+        (Some(v), Some(d)) => {
+            if v <= d {
+                (RouteMark::Faster, RouteMark::Slower)
+            } else {
+                (RouteMark::Slower, RouteMark::Faster)
+            }
+        }
+        (Some(_), None) => (RouteMark::Faster, RouteMark::Down),
+        (None, Some(_)) => (RouteMark::Down, RouteMark::Faster),
+        (None, None) => (RouteMark::Down, RouteMark::Down),
+    }
+}
+
 /// Machine output keeps a flat, stable shape for scripting.
 pub fn to_json(report: &DepReport) -> serde_json::Value {
     let mut tools = BTreeMap::new();
@@ -443,5 +475,36 @@ mod tests {
         // Already wide enough: left untouched, never truncated.
         let long = cell("registry.npmjs.org", 7);
         assert_eq!(long, "registry.npmjs.org");
+    }
+
+    #[test]
+    fn route_marks_choose_the_faster_answered_route() {
+        assert_eq!(
+            route_marks(Some(20), Some(120)),
+            (RouteMark::Faster, RouteMark::Slower)
+        );
+        assert_eq!(
+            route_marks(Some(120), Some(20)),
+            (RouteMark::Slower, RouteMark::Faster)
+        );
+        // Equal times: the proxy column wins the tie so green is never absent
+        // when both routes are alive.
+        assert_eq!(
+            route_marks(Some(50), Some(50)),
+            (RouteMark::Faster, RouteMark::Slower)
+        );
+    }
+
+    #[test]
+    fn route_marks_flag_only_the_dead_route() {
+        assert_eq!(
+            route_marks(Some(30), None),
+            (RouteMark::Faster, RouteMark::Down)
+        );
+        assert_eq!(
+            route_marks(None, Some(30)),
+            (RouteMark::Down, RouteMark::Faster)
+        );
+        assert_eq!(route_marks(None, None), (RouteMark::Down, RouteMark::Down));
     }
 }

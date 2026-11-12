@@ -264,8 +264,9 @@ pub struct VerificationReport {
 pub enum StreamHealth {
     Healthy,
     Degraded,
-    /// Failures cluster at the same elapsed time: the node enforces a fixed
-    /// transfer duration (e.g. cut every ~3s) rather than dropping randomly.
+    /// Failures cluster at the same elapsed time, which points at a limit on
+    /// transfer duration somewhere in the path (egress node, relay or target).
+    /// The tool observes the pattern; it does not attribute the cause.
     Limited,
     Cut,
     #[default]

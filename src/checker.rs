@@ -85,16 +85,14 @@ pub fn classify_stream(
     } else {
         rates[rates.len() / 2]
     };
-    // A fixed transfer-duration policy cuts every connection at the same
-    // moment. Cluster detection needs at least two observed cuts and a spread
-    // small enough that random network failures cannot explain it.
+    // Cuts that land at the same moment suggest a limit on transfer duration
+    // somewhere in the path. Cluster detection needs at least two observed
+    // cuts and a spread small enough that random network failures cannot
+    // explain it.
     let cut_after_ms = clustered_cut_time(&cut_elapsed, options.timeout_ms);
-    // A single cut plus successes that all finish right at that same moment is
-    // still evidence of a duration cap: the successful samples only survived
-    // because they squeezed in just under the limit.
     let budget = f64::from(options.timeout_ms);
-    // A duration cap only makes sense when that connection was actually moving
-    // bytes; a zero-byte failure is a transport/setup problem, not a time limit.
+    // Such a limit only makes sense when that connection was moving bytes; a
+    // zero-byte failure is a transport/setup problem, not a time limit.
     let single_cut_ms = if cuts == 1 && cut_after_ms.is_none() {
         samples
             .iter()
@@ -104,20 +102,19 @@ pub fn classify_stream(
     } else {
         None
     };
+    // Successes that finish right below the cut moment also point at a limit:
+    // they only survived by squeezing in under it.
     let barely_completed = cut_after_ms.or(single_cut_ms).map_or(false, |limit| {
-        // Count successes that finished in the last 40% of the budget.
         let near = samples
             .iter()
             .filter(|s| s.completed)
             .filter(|s| s.elapsed_ms >= limit * 0.6 && s.elapsed_ms <= limit)
             .count();
-        // One success crowding the limit is already suspicious when a cut
-        // happened at that same moment; require at least that much.
         near >= 1
     });
-    // A single early cut that is clearly NOT the overall budget is already a
-    // duration cap: the node dropped a connection mid-body at a moment it
-    // chose, and every run we observed reproduced exactly that.
+    // A single mid-body cut that is clearly not the overall budget is enough on
+    // its own: the peer dropped us at a moment it chose. Semantic note: this
+    // says "the path stalled", not "the node did it".
     let single_early_cut = cuts == 1 && single_cut_ms.is_some();
     let limited = (cuts >= 2 && cut_after_ms.is_some()) || barely_completed || single_early_cut;
     let effective_cut_ms = if limited {

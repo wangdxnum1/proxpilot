@@ -7,6 +7,7 @@ mod client_config;
 mod clients;
 mod commands;
 mod core_api;
+mod deps;
 mod detect;
 mod diagnose;
 mod diagnostics;
@@ -74,6 +75,7 @@ fn is_command(value: &str) -> bool {
             | "history"
             | "recover"
             | "diagnose"
+            | "deps"
             | "browse"
             | "help"
     )
@@ -178,6 +180,7 @@ pub enum Cmd {
     Recover(RecoveryAction),
     History(bool),
     Diagnose,
+    Deps,
     Browse,
 }
 
@@ -378,13 +381,14 @@ fn parse_args_from(input: impl IntoIterator<Item = String>) -> Result<Args, Stri
                 return Ok(args);
             }
             "check" | "scan" | "fix" | "use" | "watch" | "clients" | "config" | "nodes"
-            | "info" | "recover" | "history" | "diagnose" | "browse"
+            | "info" | "recover" | "history" | "diagnose" | "deps" | "browse"
                 if !command =>
             {
                 command = true;
                 args.cmd = match arg.as_str() {
                     "browse" => Cmd::Browse,
                     "diagnose" => Cmd::Diagnose,
+                    "deps" => Cmd::Deps,
                     "nodes" => Cmd::Nodes,
                     "recover" => Cmd::Recover(RecoveryAction::Inspect),
                     "history" => Cmd::History(false),
@@ -828,6 +832,9 @@ fn print_help() {
     println!("命令:");
     println!("  browse         终端分页/筛选/详情/扫描；切换须确认，默认取消");
     println!("  diagnose       只读匿名诊断；--output <文件>，覆盖需 --overwrite；不测速/上传");
+    println!(
+        "  deps           逐个检查开发工具（npm/pip/cargo/docker/maven/nuget/git）走代理还是直连"
+    );
     println!("  history [clear] 查看最近测量记录或清理本工具历史（无需内核在线）");
     println!("  recover [--retry | --discard]  查看、重试恢复或仅清理恢复记录");
     println!("  clients [--supported]  查看发现的客户端 / 支持的类型");
@@ -881,6 +888,71 @@ fn print_help() {
     println!("  proxpilot watch --interval 180");
     println!("  proxpilot watch --optimize --reopt 7200");
     println!("  proxpilot use \"香港 IEPL 01\"");
+}
+
+fn cmd_deps(args: &Args) -> Result<(), CommandFailure> {
+    // deps needs a proxy endpoint; --proxy wins, otherwise use the saved target
+    // kernel's port when one can be discovered, else the common default.
+    let proxy = args
+        .proxy
+        .clone()
+        .or_else(|| sysproxy::registry_proxy_server())
+        .unwrap_or_else(|| "127.0.0.1:7890".into());
+    // `display_url` needs a scheme; the registry value is bare host:port.
+    let shown = if proxy.contains("://") {
+        ui::display_url(&proxy)
+    } else {
+        proxy.clone()
+    };
+    let timeout_ms = u64::from(args.probe.timeout_ms.max(1000));
+    let report_value = deps::report(&proxy, timeout_ms);
+    report::data(deps::to_json(&report_value));
+    ui::info(&format!("代理出口：{shown}"));
+    if let Some(server) = &report_value.system_proxy {
+        ui::dim(&format!("系统代理：{server}"));
+    } else {
+        ui::dim("系统代理：未开启（依赖系统代理的工具将直连）");
+    }
+    if report_value.environment_proxy {
+        ui::dim("环境变量代理：已设置");
+    } else {
+        ui::dim("环境变量代理：未设置（只认环境变量的工具将直连）");
+    }
+    println!();
+    for probe in &report_value.probes {
+        let route = match probe.proxy_source {
+            deps::ProxySource::System => "系统代理",
+            deps::ProxySource::Environment => "环境变量",
+            deps::ProxySource::OwnConfig => "自有配置",
+            deps::ProxySource::Direct => "直连",
+        };
+        let status = match probe.reach {
+            deps::Reach::Both => "✔ 两条路都通".to_string(),
+            deps::Reach::ViaProxy => "✔ 需经代理".to_string(),
+            deps::Reach::Direct => "✔ 可直连".to_string(),
+            deps::Reach::Unreachable => "✘ 两条路都不通".to_string(),
+        };
+        let via = probe
+            .via_proxy_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".into());
+        let direct = probe
+            .direct_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "  {:<8} {:<22} {:<8} 代理 {:<7} 直连 {:<7}  {}",
+            probe.tool, probe.endpoint, route, via, direct, status
+        );
+        if let Some(config) = &probe.config {
+            ui::dim(&format!("           配置：{config}"));
+        }
+    }
+    println!();
+    ui::dim(
+        "说明：本命令只读探测各工具 registry 端点的可达性，不修改任何工具配置；仅代表端点连通，不代表完整业务可用。",
+    );
+    Ok(())
 }
 
 fn setup(args: &Args) -> Result<(Backend, crate::core_api::CoreApi), i32> {
@@ -1300,26 +1372,28 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
         diagnostics::StreamHealth::Limited => {
             let seconds = stream.cut_after_ms.unwrap_or(0.0) / 1000.0;
             ui::dim(&format!(
-                "多条连接都在约 {:.1} 秒时被切断（断开时刻高度一致，不是随机丢包）",
+                "多条连接都在约 {:.1} 秒时被切断（断开时刻高度一致，不像随机丢包）",
                 seconds
             ));
             if verbose {
                 ui::dim(&format!(
-                    "被切断的连接当时只收到约 {:.0}% 的数据；能完成的连接可以跑更久，说明节点在约 {:.1} 秒处按已传量判断，未达标即断开",
-                    stream.min_received_ratio * 100.0,
-                    seconds
+                    "被切断的连接当时只收到约 {:.0}% 的数据，而完成的连接可以跑更久",
+                    stream.min_received_ratio * 100.0
                 ));
                 ui::dim(
-                    "实际影响：git clone/fetch 一条连接要连续传几十 MB，中途被断开就要整个重来，较大的仓库失败率很高",
+                    "可能原因：出口节点、中间链路或目标站点对该传输施加了限制；本工具只观测到现象，不判断具体责任方",
+                );
+                ui::dim(
+                    "实际影响：git clone/fetch 一条连接要连续传几十 MB，中途被断开就要整个重来，较大的仓库失败率较高",
                 );
             }
             ui::warn(
-                "该节点会中断长时间传输，不适合 git；建议运行 proxpilot fix --git-check 换节点",
+                "该链路在长时间传输时会被中断，对 git 不友好；可换节点后重测，或加 --verbose 查看细节",
             );
         }
         diagnostics::StreamHealth::Cut => {
             ui::dim(&format!(
-                "约 {:.0}% 的连接在传输中途被对端断开",
+                "约 {:.0}% 的连接在传输中途被断开",
                 if requested == 0 {
                     0.0
                 } else {
@@ -1331,13 +1405,13 @@ fn report_stream(stream: &diagnostics::StreamReport, min_throughput_kbps: u64) {
                     "{} 条连接能收完（中位 {:.0} KB/s），速度本身没问题",
                     completed, stream.median_throughput_kbps
                 ));
-                ui::dim("问题不是慢，是连接会被对端提前断开，且断开时刻不固定（更像随机抖动）");
+                ui::dim("断开时刻不固定，更像随机抖动；责任方可能是节点、链路或目标站点");
                 ui::dim(
                     "实际影响：git clone/fetch 用一条连接连续传几十 MB，断开一次就要整个重来，",
                 );
                 ui::dim("所以你会遇到「有时能 clone、有时报 early EOF / curl 56」这种时好时坏");
             }
-            ui::warn("该节点对 git 长连接不友好，建议运行 proxpilot fix --git-check 换节点");
+            ui::warn("该链路的长连接不稳定，建议换节点后重测，或加 --verbose 查看细节");
         }
         diagnostics::StreamHealth::Unknown => {
             if verbose {
@@ -2135,6 +2209,9 @@ fn run_main() {
             CommandFailure::context(ErrorCode::StateUnavailable, Stage::State, detail)
         })),
         Cmd::History(clear) => Some(cmd_history(*clear, args.dry_run).map_err(Into::into)),
+        // Pure network probe of each toolchain's registry; needs no kernel and
+        // changes nothing, so it runs before backend discovery.
+        Cmd::Deps => Some(cmd_deps(&args)),
         Cmd::Recover(action) if args.dry_run => {
             Some(cmd_recovery_preview(*action).map_err(Into::into))
         }
@@ -2198,7 +2275,9 @@ fn run_main() {
         Cmd::Fix => cmd_fix(&be, &agent, &args),
         Cmd::Use(n) => cmd_use(&be, &agent, &args, n),
         Cmd::Watch => cmd_watch(&be, &agent, &args),
-        Cmd::Clients(_) | Cmd::Config(_) | Cmd::History(_) | Cmd::Diagnose => unreachable!(),
+        Cmd::Clients(_) | Cmd::Config(_) | Cmd::History(_) | Cmd::Diagnose | Cmd::Deps => {
+            unreachable!()
+        }
         Cmd::Help => {
             print_help();
             0

@@ -190,6 +190,40 @@ proxpilot watch --optimize --interval 180 --reopt 7200
 
 ---
 
+### `deps` — 开发工具链代理体检
+
+逐个检查本机开发工具的 registry 端点走代理还是直连，用来回答「我的代理到底在帮哪些工具」：
+
+```
+proxpilot deps
+```
+
+输出示例：
+
+```
+  代理出口：127.0.0.1:7890
+  系统代理：127.0.0.1:7890
+  环境变量代理：未设置（只认环境变量的工具将直连）
+
+  npm      registry.npmjs.org     系统代理   代理 6ms    直连 180ms   ✔ 两条路都通
+  pip      pypi.org               系统代理   代理 0ms    直连 38ms    ✔ 两条路都通
+  cargo    rsproxy.cn             自有配置   代理 37ms   直连 34ms    ✔ 两条路都通
+             配置：~/.cargo/config.toml
+  docker   registry-1.docker.io   系统代理   代理 27ms   直连 -       ✔ 需经代理
+  maven    repo.maven.apache.org  直连       代理 141ms  直连 178ms   ✔ 可直连
+  nuget    api.nuget.org          直连       代理 136ms  直连 123ms   ✔ 可直连
+  github   github.com             自有配置   代理 31ms   直连 127ms   ✔ 两条路都通
+             配置：~/.gitconfig
+```
+
+- `proxy_source` 表示该工具**实际会用**的代理来源：`system`（WinINET 系统代理，多数工具默认）、`environment`（`HTTP_PROXY`/`HTTPS_PROXY` 等）、`own_config`（工具自己的配置文件，如 git 的 `http.proxy`、cargo 的镜像）、`direct`（未发现任何代理配置）。
+- `own_config` 只在配置文件**真实存在**时才算数；文件不存在会如实降级为 `direct`，不会假报「自有配置」。
+- `reach` 是代理/直连两条路径的实测结果：`both` 两条路都通、`via_proxy` 只有代理通（**这类工具断代理就会失败**）、`direct` 可直连、`unreachable` 都不通。
+- 只做 TCP 可达性探测，不发送业务请求、不读写任何工具配置，也不代表完整业务可用（例如鉴权、CDN 回源仍可能失败）。
+- 加 `--json` 输出稳定的机器可读结构（`tools` 按工具名索引）。
+
+---
+
 ## 全部参数
 
 | 参数 | 默认值 | 说明 |

@@ -3,6 +3,7 @@
 ## 未发布
 
 - 新增 `LICENSE`（MIT），`Cargo.toml` 补 `license = "MIT"` 字段，README 增加「许可证」章节；发布包在 exe 同级附带本项目 `LICENSE`，第三方依赖许可证仍在 `licenses/` 下，两者互不替代。
+- CI 只保留一个 Rust 版本：去掉 1.98.0/1.99.0 双版本矩阵，统一用 `rust-toolchain.toml` 固定的 1.99.0，与开发、release 构建一致。`Cargo.toml` 的 `rust-version` 同步从 1.98 提到 1.99——不再由 CI 验证的版本不应继续声明为最低支持版本。
 
 ## v0.6.3（2026-11-12）
 

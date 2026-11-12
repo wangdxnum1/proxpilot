@@ -9,12 +9,9 @@ jobs:
   windows:
     runs-on: windows-2025-vs2026
     timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ['1.98.0', '1.99.0']
     env:
-      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+      # One toolchain only: the same one rust-toolchain.toml pins and release builds use.
+      RUSTUP_TOOLCHAIN: '1.99.0'
       NO_COLOR: '1'
       PROXPILOT_SPINNER: '0'
     defaults:
@@ -64,10 +61,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Local package with checksums, licenses and metadata
-        if: matrix.rust == '1.99.0'
         run: ./scripts/release.ps1
       - name: Upload verified package
-        if: matrix.rust == '1.99.0'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: proxpilot-windows-x64

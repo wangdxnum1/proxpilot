@@ -17,7 +17,7 @@ ProxPilot 直接与本机运行的内核 API 通信：并发探测节点 → 逐
 
 ## 编译
 
-Windows x64 开发与 release 固定 **Rust 1.99.0**（`rust-toolchain.toml`；rustup 首次自动安装），最低版本 1.98.0 由 CI 单独验证。需要 **MSVC 14.51.36231 或兼容的更新工具集（Visual Studio 2026，含 Windows SDK）**，不需要安装 CMake、NASM、LLVM 或 libclang。项目内置匹配 `btls-sys 0.5.6` 的 BoringSSL 静态库与预生成 Rust 绑定，普通 `cargo build` 和 `cargo test` 会自动使用它们。更旧的 MSVC 不受此预编译包支持。依赖包随源码直接入库，不使用 Git LFS，也不需额外下载脚本。
+Windows x64 开发、release 与 CI 统一使用 **Rust 1.99.0**（`rust-toolchain.toml` 固定，rustup 首次自动安装）。需要 **MSVC 14.51.36231 或兼容的更新工具集（Visual Studio 2026，含 Windows SDK）**，不需要安装 CMake、NASM、LLVM 或 libclang。项目内置匹配 `btls-sys 0.5.6` 的 BoringSSL 静态库与预生成 Rust 绑定，普通 `cargo build` 和 `cargo test` 会自动使用它们。更旧的 MSVC 不受此预编译包支持。依赖包随源码直接入库，不使用 Git LFS，也不需额外下载脚本。
 
 本地适配及依赖包来源见 [vendor/btls-sys/README.md](vendor/btls-sys/README.md)。浏览器指纹实测能力保留；BoringSSL、SQLite 和 CRT 静态链接进 exe，使用者无需安装。
 
@@ -31,7 +31,7 @@ build.bat
 
 `release.bat` 默认只运行测试、构建并在 `dist` 打包 ZIP、SHA256、版本/提交元数据及依赖许可证信息，不提交或推送代码。`release.bat -PublishDraft` 才会检查干净工作区、版本/CHANGELOG、tag、GitHub 登录及远端，创建并推送版本 tag，然后上传到**草稿** Release。任何失败都会停止；同名 tag 不覆盖。正式发布由维护者检查草稿后完成。
 
-`.github/workflows/ci.yml` 在干净 Windows VS2026 runner 上分别验证 Rust 1.98.0/1.99.0，使用独立 target 目录，禁止调用原生库生产工具，并运行本地假内核、取消/恢复验收和脚本故障注入。Python 只用于开发/CI 测试，exe 运行不依赖它。
+`.github/workflows/ci.yml` 在干净 Windows VS2026 runner 上用固定的 Rust 1.99.0 验证，禁止调用原生库生产工具，并运行本地假内核、取消/恢复验收和脚本故障注入。Python 只用于开发/CI 测试，exe 运行不依赖它。
 
 ## 快速开始
 

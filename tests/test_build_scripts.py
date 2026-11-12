@@ -55,7 +55,7 @@ class BuildScripts(unittest.TestCase):
             source = ROOT / "scripts" / name
             if source.exists(): shutil.copy2(source, self.root / "scripts" / name)
         (self.root / "scripts/check-toolchain.ps1").write_text("'fixture tools'\n")
-        for name in ("Cargo.toml", "CHANGELOG.md"):
+        for name in ("Cargo.toml", "CHANGELOG.md", "LICENSE"):
             shutil.copy2(ROOT / name, self.root / name)
         vendor = self.root / "vendor/btls-sys"
         vendor.mkdir(parents=True)
@@ -115,6 +115,8 @@ class BuildScripts(unittest.TestCase):
         self.assertTrue(list((self.root / "dist").rglob("SHA256SUMS.txt")))
         self.assertTrue(list((self.root / "dist").rglob("build-metadata.json")))
         self.assertTrue(list((self.root / "dist").rglob("LICENSE-BORINGSSL")))
+        # The project's own license ships beside the exe, not only inside licenses/.
+        self.assertTrue(list((self.root / "dist").rglob("LICENSE")))
         self.assertFalse(any(c[0] == "gh" or c[:2] in (["git", "push"], ["git", "tag"]) for c in self.calls()))
 
     def test_test_or_build_failure_prevents_push_and_upload(self):

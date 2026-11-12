@@ -76,6 +76,8 @@ try {
     Invoke-Checked $shell @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'build.ps1'), '-Target', $Target, '-OutputDirectory', $package) | Out-Host
     $licenses = Join-Path $package 'licenses'
     New-Item -ItemType Directory -Path $licenses | Out-Null
+    # The project's own license sits beside the exe; dependency licenses stay in licenses/.
+    Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $package
     Copy-Item -LiteralPath (Join-Path $root 'vendor/btls-sys/LICENSE-MIT') -Destination $licenses
     Copy-Item -LiteralPath (Join-Path $root 'vendor/btls-sys/prebuilt/x86_64-pc-windows-msvc/LICENSE-BORINGSSL') -Destination $licenses
     $metadata = (Invoke-Checked cargo @('metadata', '--locked', '--format-version', '1')) -join "`n" | ConvertFrom-Json

@@ -1,5 +1,9 @@
 # 更新日志
 
+## 未发布
+
+- 新增 `LICENSE`（MIT），`Cargo.toml` 补 `license = "MIT"` 字段，README 增加「许可证」章节；发布包在 exe 同级附带本项目 `LICENSE`，第三方依赖许可证仍在 `licenses/` 下，两者互不替代。
+
 ## v0.6.3（2026-11-12）
 
 - 新增 `lifetime` 子命令：只建立 CONNECT 隧道、**不发送任何字节**，观察每条空闲隧道多久被断开，据此判断链路是否存在「连接存活时间上限」。默认 6 条并发隧道、12 秒观察窗口，通常 3–12 秒出结论；新增 `--lifetime-host`（默认 `www.google.com`）、`--lifetime-samples`（1–16）、`--lifetime-window-ms`（500–60000），支持 `--json`。
